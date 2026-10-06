@@ -1,10 +1,18 @@
-# Arrow, Parquet, DataFusion, and Python update plan
+# Arrow, Parquet, DataFusion, and Python update plan and implementation prompt
+
+This document combines the human-readable assessment and roadmap with the full, copyable Cursor implementation prompt. Read the assessment for context, then use the prompt section when carrying out implementation work.
+
+## Navigation
+
+- [Human-readable plan](#human-readable-plan)
+- [Cursor agent implementation prompt](#cursor-agent-implementation-prompt)
+
+## Human-readable plan
 
 Status: proposal; none of the new APIs below are implemented by this document.
 Prepared October 6, 2026 from the local repositories and official documentation.
-Companion: [Cursor implementation prompt](cursor-arrow-datafusion-prompt.md).
 
-## Recommended outcome
+### Recommended outcome
 
 Make rusty-haystack useful as a Rust and Python analytics connector:
 
@@ -18,7 +26,7 @@ PostgreSQL/TimescaleDB is a separate server-storage track. It should use the sam
 
 This matches Ben's priority and Justin's request to keep DataFusion optional. It also leaves room for SeleneDB or another graph backend without inventing an interface for a project whose implementation has not been inspected.
 
-## What exists today
+### What exists today
 
 Inspection anchors:
 
@@ -28,6 +36,10 @@ Inspection anchors:
 | rusty-bacnet | local `main`, `53bd87d2f0516580d26938a3a3b385e791b756f1` | 0.12.0; pinned toolchain 1.99.0; MSRV 1.93 |
 
 These are checkout findings, not assertions about unretrieved upstream changes.
+
+#### Post-sync baseline note
+
+The source-inspection results in this human-readable plan are historical: they describe the local `dev` checkout at `40f6e0c4e052215e3e4bededbbf94a075d634df7`, before the upstream sync. Statements about that inspected tree refer to this historical baseline unless marked post-sync. Upstream `dev` commit `e1cd8f9ec27a74de86e5c8730eb47024738ddd77` (toolchain/safety #63) is now included. The synced baseline has PyO3 0.29.2 in `Cargo.lock`, an ordinary toolchain pin and MSRV lane of Rust 1.97.1, a separate current-stable gate at Rust 1.98.1, and `unsafe_code = "forbid"` inherited by every workspace crate. These upstream changes are already implemented and are not work to redo. They do not implement the Arrow, Parquet, or DataFusion features proposed here.
 
 | Area | Haystack finding | Consequence |
 |---|---|---|
@@ -47,11 +59,11 @@ Source map for review: `rusty-haystack/src/{lib,client,server,data}.rs`, `rusty-
 
 BACnet's reference implementation is in `crates/rusty-bacnet/src/client/`, `src/py_async/`, its `.pyi`, `py.typed`, `pyproject.toml`, and `docs/python-api.md`. Its useful conventions are awaitable I/O, async context management, typed results, cancellation behavior, and installed-package verification. Its custom Tokio/asyncio bridge includes interpreter-exit handling; copying just the Future creation code would omit essential lifecycle behavior.
 
-### Existing Python documentation drift
+#### Existing Python documentation drift
 
 The current `docs/python.md` says Python 3.8+, whereas packaging requires 3.11+. Some examples call top-level `rh.HaystackClient` / `rh.HaystackServer`, but registration puts these classes in the `client` / `server` submodules. The WebSocket example calls `HaystackClient.connect_ws`, while the wrapper exposes `WsClient.connect`. The mTLS example passes certificate-path keywords, but the wrapper accepts a `TlsConfig` object. Repair these as part of Python parity and test the documented examples against the installed wheel.
 
-## History correctness comes before bulk export
+### History correctness comes before bulk export
 
 The local server's history code has concrete gaps:
 
@@ -70,7 +82,7 @@ The current [Haystack Ops specification](https://project-haystack.org/doc/docHay
 
 Use that standard batch mode when supported. Existing third-party servers may only support single reads, so expose `auto`, `single`, and `batch` modes. In `auto`, use a documented capability result or a narrow cached probe. Auth errors, malformed data, and timeouts are not evidence that batch mode is unsupported.
 
-### Does one request handle lots of history?
+#### Does one request handle lots of history?
 
 Yes, a large single-point read or a supported batch read can carry many samples. One request is not a guarantee of completeness, low memory use, or acceptable server latency.
 
@@ -86,7 +98,7 @@ Inspect the [HTTP incomplete-data metadata](https://project-haystack.org/doc/doc
 
 Zinc already has header/row encoding helpers, but its decode API takes a complete string. Reuse the existing parser and scalar rules when adding incremental decoding; do not split arbitrary incoming chunks on newlines without handling quoted strings, nested values, and partial UTF-8. JSON buffering can remain an explicitly limited fallback until it receives a qualified incremental decoder.
 
-## Architecture and dependency boundaries
+### Architecture and dependency boundaries
 
 Suggested package names are design proposals.
 
@@ -124,7 +136,7 @@ Python extras install Python dependencies; they cannot enable Cargo features ins
 
 Do not pass private Rust structs between independently compiled Python extensions. The provider plugin should construct its own native client from ordinary configuration data or use a separately specified stable interface.
 
-## A stable analytics schema
+### A stable analytics schema
 
 Prefer a long history table: one actual sample per row. It avoids creating a new Arrow schema for each set of points and works with SQL joins.
 
@@ -154,9 +166,9 @@ Export point metadata separately, keyed by `(source, point_id)`, with useful pro
 
 Grouping only by `point_id` can merge unrelated servers. Averaging mixed units can produce meaningless results. Examples should group by source and unit, or explicitly convert compatible units through the existing unit library.
 
-## Three DataFusion experiences
+### Three DataFusion experiences
 
-### 1. In-memory Arrow interoperability
+#### 1. In-memory Arrow interoperability
 
 Proposed API; requires implementation:
 
@@ -180,7 +192,7 @@ finally:
 
 The existing [DataFusion `from_arrow` interface](https://datafusion.apache.org/python/autoapi/datafusion/context/index.html#datafusion.context.SessionContext.from_arrow) accepts Arrow export protocols. Implement `__arrow_c_stream__` on the new batch reader using the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html). This removes per-sample Python object conversion after Rust builds Arrow buffers. It does not make Zinc/JSON parsing zero-copy or prove that DataFusion imports a stream lazily. Qualify the selected consumer's ingestion behavior; use this path for bounded datasets.
 
-### 2. Parquet snapshots: first useful deliverable
+#### 2. Parquet snapshots: first useful deliverable
 
 Proposed Haystack export API; DataFusion calls shown are existing APIs:
 
@@ -217,7 +229,7 @@ Use bounded Arrow batches and bounded Parquet row groups; [ArrowWriter](https://
 
 Start with one valid file plus a manifest and metadata snapshot. Later add partitions by source and UTC date, with bounded point buckets if measured workloads justify them. Avoid creating one tiny file per point/window. Repeated exports should create immutable snapshots; they must not accidentally double-count data on directory scans. A resumable dataset needs a manifest of completed windows/files and a defined correction/deduplication policy.
 
-### 3. Live SQL against Haystack
+#### 3. Live SQL against Haystack
 
 Proposed optional plugin:
 
@@ -246,7 +258,7 @@ Expose the Python provider with [DataFusion's provider export protocol](https://
 
 This is the most complex analytics milestone. It combines remote I/O, streaming, query semantics, cancellation, and an independently versioned FFI boundary.
 
-## Python and build modernization
+### Python and build modernization
 
 Preserve existing synchronous APIs while adding a typed `AsyncHaystackClient` with awaitable I/O and `async with`, following BACnet's user-facing conventions. A sync batch iterator can support ordinary Arrow consumers; async acquisition/iteration needs a separate clear contract. Never block an asyncio loop with the current sync wrapper and call that native async support.
 
@@ -268,7 +280,7 @@ Dependency candidates checked in official documentation, not compiled together d
 
 These are a compatibility starting point, not instructions to install every newest release. Recheck registry metadata, MSRVs, and Python artifact availability at implementation time. A free-threaded rusty-haystack wheel does not establish that PyArrow or DataFusion's Python distribution supports the same interpreter.
 
-## Separate PostgreSQL / TimescaleDB track
+### Separate PostgreSQL / TimescaleDB track
 
 Upgrade the shared history contract first, then implement a backend that:
 
@@ -284,7 +296,7 @@ TimescaleDB can be an optional extension-specific layout, qualified independentl
 
 A Parquet exporter is not a writable `HistoryProvider`. A future Parquet-backed archive would need manifests, write visibility, corrections, compaction, recovery, and retention semantics. Leave that distinction clear in product documentation.
 
-## Suggested implementation issues and acceptance gates
+### Suggested implementation issues and acceptance gates
 
 These are local issue drafts, not filed GitHub issues.
 
@@ -304,10 +316,258 @@ First useful target: A0–A3, plus the narrow Python Arrow/export surface from A
 
 A2 is moderate conversion work. A1/A3/A5 carry the substantial protocol, memory, and query-correctness effort. This is several bounded PRs, not just adding an Arrow dependency or applying a PyO3 version bump.
 
-## Validation and review limits
+### Validation and review limits
 
 Completed during this assessment: inspected both source checkouts, manifests, workflows, stubs, existing tests, and official upstream interfaces; parsed Haystack workspace manifests with `cargo +stable metadata --no-deps --offline --locked`. This checks manifest structure, not dependency compatibility or compilation.
 
-No software implementation, remote-server benchmark, wheel build, Python runtime test, or database qualification was performed. The companion prompt defines the tests implementation must supply. Proposed APIs and dependency combinations must not be presented as working features until those gates pass.
+No software implementation, remote-server benchmark, wheel build, Python runtime test, or database qualification was performed. The implementation prompt below defines the tests implementation must supply. Proposed APIs and dependency combinations must not be presented as working features until those gates pass.
 
 For Justin's review, the useful decisions are: approve the long-table schema; decide whether base Python wheels ship Arrow/Parquet native features; settle support versions and module naming; and agree on the shared history contract before S1. The first analytics export does not depend on choosing a future graph database.
+
+## Cursor agent implementation prompt
+
+This section is the copyable implementation prompt. It describes future work and is not evidence that a proposed API is currently available. Read the [human-readable plan](#human-readable-plan) first.
+
+### Mission and priorities
+
+Implement a shared Rust history analytics pipeline and ergonomic Python bindings. Ben's priority is pulling large `hisRead` datasets from existing Haystack servers into Arrow and Parquet, then querying with DataFusion in either language.
+
+Deliver the snapshot workflow first, then the optional live DataFusion provider. Keep PostgreSQL/TimescaleDB as a separate backend track. Preserve existing ordinary Haystack APIs and authentication behavior.
+
+Work in small, independently testable changes, and continue through the authorized analytics milestones. Do not replace successful validation with a broad rewrite or stop at a scaffold.
+
+This prompt authorizes local analytics implementation and relevant documentation/tests. It does not authorize pushing branches, filing issues, publishing packages, deployments, or migrating external databases. Record backend follow-ups locally unless the user separately asks to implement them.
+
+### Starting context: verify before acting
+
+Assessment baseline: rusty-haystack local `dev` at `40f6e0c4e052215e3e4bededbbf94a075d634df7`; Rust package version 0.9.0, edition 2024, MSRV 1.97. Reference repository: rusty-bacnet at `53bd87d2f0516580d26938a3a3b385e791b756f1`.
+
+The current synced baseline is recorded in the [post-sync baseline note](#post-sync-baseline-note). Upstream dev commit `e1cd8f9ec27a74de86e5c8730eb47024738ddd77` (toolchain/safety #63) is already included; do not redo its PyO3 lock update, toolchain/MSRV lanes, or unsafe-code lint inheritance as part of this roadmap. Arrow, Parquet, and DataFusion remain proposed work in this document.
+
+The original local paths were `/home/ben/Desktop/rusty-haystack` and `/home/ben/Desktop/rusty-bacnet`; discover equivalent paths if this prompt is used elsewhere. Treat BACnet as a read-only reference.
+
+1. Read applicable AGENTS.md instructions and inspect Git status. Preserve existing user work.
+2. Confirm the actual branch/HEAD and refresh this document's findings against current source.
+3. Read the following scopes before designing changes:
+   - `Cargo.toml`, `Cargo.lock`, all relevant package manifests;
+   - `haystack-core/src/kinds/{kind,datetime,tz}.rs`, grid/dict types, Zinc parser/encoder and Codec;
+   - `haystack-client/src/{client,config,error}.rs`, transport traits and HTTP implementation;
+   - `haystack-server/src/{his_provider,his_store,state,app,error}.rs` and `ops/his.rs`;
+   - `rusty-haystack/src/{lib,client,server,data,convert}.rs`, its stubs, packaging and tests;
+   - `.github/workflows/{ci,python,release}.yml`;
+   - BACnet's `docs/python-api.md`, Python crate packaging, stubs, client lifecycle, `src/py_async/`, and Future/interpreter-exit tests.
+4. Capture baseline checks and any environmental failures separately from regressions.
+5. Write a compact current-source map and chosen public contracts in a local work note. Proceed on routine decisions using this plan.
+
+Do not report that Python bindings or typing do not exist. PyO3 and a substantial `.pyi` already exist in the historical baseline. No Arrow, Parquet, DataFusion, or SQL implementation was found in that inspection.
+
+### Milestone 0: usable Python package and build baseline
+
+Expose the Rust `ClientConfig` functionality to Python with coherent keyword arguments and typed configuration. Include SCRAM/Basic auth, verified TLS defaults, optional explicit lab settings, request timeout, wire format, and existing plaintext-Basic opt-in behavior. New analytics requests must reuse those settings.
+
+Repair existing Python docs examples for actual submodule imports, `WsClient.connect`, and `TlsConfig`. The historical Python version requirement is 3.11+, despite the old 3.8+ sentence.
+
+Explicitly package and verify stubs and appropriate typing markers. Test imports and meaningful type checking against an installed wheel outside the source tree. Source presence is not proof of artifact inclusion. Cover dynamic submodules as well as root exports.
+
+Respect the toolchain/MSRV baseline in the [post-sync baseline note](#post-sync-baseline-note); do not redo those already-landed changes. If an analytics dependency requires a different minimum, verify the incompatibility and document the needed change separately. Do not raise MSRV just to match a build pin. Update only dependencies needed for this work, keeping lockfile changes reviewable.
+
+Separate PyO3's extension-module feature used by maturin from Rust test-linking needs if required, following the proven packaging pattern in BACnet.
+
+### Milestone 1: reliable history semantics and batching
+
+Implement from the current [Haystack history specification](https://project-haystack.org/doc/docHaystack/Ops#hisRead). Follow its request/response formats, half-open ranges, point-timezone behavior, and batch timezone rules. Standard batch requests use grid-meta range and row IDs; value columns map back through column metadata. Do not invent a vendor-only multi-ID shape when the standard shape applies.
+
+Fix the baseline server's row-zero-only handler, date-only parsing, UTC date interpretation, inclusive final-second boundary, missing range metadata, and loss of timezone identity. Validate IDs and reject malformed/mixed request shapes.
+
+Use existing Haystack timezone helpers; enable `chrono-tz` in the appropriate server feature/dependency path if needed. Inject a clock in range-resolution tests instead of relying on today's actual date.
+
+Design a shared history domain contract that retains full `HDateTime` information, values, point/source identity, and resolved range metadata. It must permit explicit read/write errors and bounded ordered streams. Keep Arrow and database types out of this lightweight contract. Extract a small crate only if it improves dependency direction; avoid forcing an analytics consumer to depend on the server just to name a history sample.
+
+Preserve the in-memory store's documented replace-on-duplicate semantics. Make its retention policy visible and distinguish a retained dataset from a complete historical archive. Do not silently reuse its million-sample cap as an analytics export limit.
+
+Provide request modes `single`, `batch`, and `auto`. Handle older remote servers using a narrow capability probe or configured capability. Cache it per source/session. Do not interpret auth, timeout, parser, or generic server failures as permission to silently change request mode.
+
+### Milestone 2: shared history → Arrow implementation
+
+Add an optional Rust analytics crate/module with one authoritative conversion implementation shared by Python, Parquet, and DataFusion.
+
+Use the [human-readable plan's long-table v1 schema](#a-stable-analytics-schema):
+`source, point_id, ts, tz, offset_seconds, value_kind, value_num, value_bool, value_str, unit, value_zinc`.
+
+Contract requirements:
+
+- Required identity and timestamp columns; stable nullability and schema metadata.
+- `ts` is UTC nanoseconds with checked range/precision conversion.
+- Retain returned timezone name and UTC offset separately.
+- `unit` is the raw sample-number unit; do not silently substitute point metadata or convert units.
+- Typed numeric/bool/string projections, plus canonical Zinc value serialization for reconstruction.
+- Preserve NA versus Null, signed infinities/NaN, unit-bearing numbers, Refs/display names, Marker/Remove, and supported complex values.
+- No Debug-string serialization, lossy blanket stringification, or automatic Float64 conversion of all values.
+- A batch alignment gap is not a sample. Qualify the upstream Null ambiguity described in the plan; allow single-point retrieval when faithful distinction is required.
+- Schema stays fixed across empty/large/mixed-kind batches and multiple points.
+- Row-size, batch-row, and batch-byte limits are enforced with typed errors.
+- Point metadata export is a separate keyed snapshot, retaining a canonical entity representation.
+
+Do not make generic lossless Arrow conversion of every arbitrary grid a prerequisite for history analytics. If an `HGrid.to_arrow` convenience is added, specify its narrower contract and error on unsupported shapes.
+
+Choose mutually compatible Arrow/PyO3/DataFusion versions. The researched starting family was PyO3 0.29, pyo3-arrow 0.19, Arrow/Parquet 59, DataFusion/FFI 55; verify current compatibility rather than copying the newest unrelated releases. Use workspace version declarations to avoid duplicate Arrow majors.
+
+### Milestone 3: bounded remote ingestion and Parquet exports
+
+Add a history source that yields Arrow batches without building a complete response String/HGrid first.
+
+Primary path: authenticated HTTP Zinc, decoded incrementally using existing lexical/value rules. Add the reqwest streaming feature or equivalent supported body-chunk API as required. Decode request/response Content-Type correctly; retain error-grid handling.
+
+Handle headers, column metadata, partial UTF-8, quoted escapes, nested values, row boundaries, truncated transport bodies, and parse errors. Do not implement a naive newline splitter. Existing Zinc header/row encoders are reusable for server responses.
+
+Bound queued work by bytes and batches, not only rows. Propagate consumer backpressure to decode/fetch. Bound maximum token/value size and point count per standard batch request. Do not allow an upstream `Vec` or background task to accumulate the entire result behind a stream-shaped facade.
+
+Single-request mode should remain available. Windowed fallback should use explicit point/time envelopes, bounded concurrency, deterministic ordering per series, and strict boundary deduplication. Specify read retries separately from writes; no unlimited retries or guessed continuation tokens.
+
+Inspect [incomplete response metadata](https://project-haystack.org/doc/docHaystack/HttpApi#incompleteData). Fail or use a configured smaller-window recovery; never mark an incomplete response complete. If a minimum window still cannot be qualified, return an actionable completeness error.
+
+Expose a Rust Arrow batch stream and a synchronous Python reader with:
+`__arrow_c_stream__`, close/context management, and a documented one-consumer policy. Capsule calls must create correctly owned one-use stream exports or reject repeat use predictably. Release producer tasks/resources on close, exhaustion, consumer errors, and early abandonment. No private Rust ABI handoff between independent extensions.
+
+Implement the Arrow boundary using [the PyCapsule protocol](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), preferably via a compatible maintained bridge. Preserve the workspace's inherited `unsafe_code = "forbid"` policy: do not weaken the lint or add local allow attributes to accommodate FFI. Prefer a maintained bridge with a safe public API and explicit ownership guarantees. If no suitable safe API exists, document the mismatch and get a maintainer decision before changing the policy.
+
+Detach Python around blocking pulls and native work; never hold borrowed Python references or the PyO3 attachment while blocking on callbacks that need Python.
+
+Implement the Parquet writer in Rust and bind it to Python:
+
+- One-file export first; schema must match the Arrow contract.
+- Configurable compression, record-batch ceilings, row-group ceilings, and writer-memory thresholds.
+- Finalize footer successfully, validate summary, then publish a staging file with explicit overwrite behavior.
+- Refuse overwriting existing user data by default.
+- Write a manifest and metadata snapshot with source identity, schema/codec version, requested/resolved range, point IDs, counts, completion state, and file integrity evidence.
+- Redact credentials, bearer tokens, and sensitive URL parameters from metadata and errors.
+- No implicit append to a Parquet file; no duplicate visible snapshots in a recursively scanned dataset.
+- Add partitioned snapshots/resume only after the basic export passes. Use UTC dates and a defined snapshot identity; prevent tiny-file proliferation and define correction handling.
+
+For a first server-side streaming implementation, support the qualified Zinc path and return explicit limits/errors for buffered formats. Do not claim every codec has bounded streaming. Mid-stream errors must invalidate completion and prevent successful artifact publication.
+
+Demonstrate the same exported file in Rust DataFusion and Python DataFusion. SQL examples must keep source identity and units in aggregates, or explicitly convert units.
+
+### Milestone 4: async Python ergonomics and interpreter support
+
+Keep `rusty_haystack.client.HaystackClient` usable for existing synchronous workflows. Add `AsyncHaystackClient` with typed awaitable I/O and `async with`, consistent with BACnet's visible conventions. Decide and document whether native methods return Futures or coroutines; stubs must reflect reality.
+
+Add async history acquisition/iteration and cancellation. Arrow's C stream pull interface is synchronous; do not market its `get_next` as a coroutine. Provide a clear synchronous Arrow reader path and an async API where supported, sharing the Rust source.
+
+Choose a compatible maintained Tokio/asyncio bridge when possible. If using BACnet's custom bridge as a reference, include cancellation, event-loop closure, panic conversion, native unit→Python None, and interpreter-finalization behavior. Do not copy a fragment and claim parity.
+
+No blocking sync `block_on` inside a Python event-loop call or DataFusion Tokio worker. Use owned `Send` data, bounded channels, and a runtime/lifetime design with tested shutdown.
+
+Audit shared/mutable classes, callbacks, lock order, runtime initialization, and stream destruction. [PyO3 0.29 free-threading guidance](https://pyo3.rs/v0.29.0/free-threading.html) already defaults modules to free-threading support; macro decoration alone is not qualification.
+
+Build/test ordinary CPython 3.14 and free-threaded 3.14t wheels separately. Retain 3.11+ unless current project policy chooses otherwise. Check actual optional PyArrow/DataFusion artifact support under each interpreter; report unsupported combinations accurately.
+
+Update existing workflows only as needed for implemented support. Distinguish a test interpreter matrix from a published wheel matrix. Verify installed artifacts rather than import from the repository by accident.
+
+### Milestone 5: optional live DataFusion adapter
+
+Implement a read-only Rust `HaystackHistoryTable` provider in a separate analytics adapter crate and optional Python plugin.
+
+Direct-query contract:
+
+- Constructor receives ordinary URL/auth/TLS configuration, source identity, explicit IDs, and a finite start/end envelope.
+- Schema is fixed and registration does not download history.
+- Planning creates an execution plan; remote reads occur during execution.
+- Execution yields the shared Arrow schema with backpressure and cancellation.
+- Push down point-ID equality/IN and safe timestamp bounds by intersecting with the configured envelope.
+- Preserve unsupported/inexact predicates for engine evaluation; do not report Exact unless source evaluation is proven equivalent.
+- Projection avoids constructing unrequested columns while retaining fields necessary for residual predicates.
+- No unsupported aggregate pushdown, remote SQL eval, or automatic string rewriting into Haystack filters.
+- Do not push SQL LIMIT ahead of a residual filter or claim global ordering from per-series order.
+- Bound concurrency and expose useful fetch/byte/batch metrics.
+- A canceled scan drops pending requests and eventually releases session/client resources.
+
+Use the selected DataFusion version's actual `TableProvider`, `ExecutionPlan`, and stream APIs. Consult [the official provider guide](https://datafusion.apache.org/library-user-guide/custom-table-providers.html). Old copied signatures are not an implementation.
+
+Export the Python provider using [`__datafusion_table_provider__`](https://datafusion.apache.org/python/user-guide/io/table_provider.html) and qualified `datafusion-ffi` capsule/version checks. Its documentation examples can lag current Rust constructors: compile against the chosen versions.
+
+Test direct registration with the user's separately installed `datafusion.SessionContext`. FFI compatibility and ownership must be proven; do not transmute a Rust trait object between wheels. A new plugin client can receive the same configuration data as the base Python package.
+
+Provide two documented paths:
+1. In-memory `ctx.from_arrow(reader)` for bounded data; measure its import behavior.
+2. Lazy `ctx.register_table("history", provider)` for live remote reads.
+
+Neither Arrow C-stream export nor `from_arrow` proves lazy SQL fetches. Do not implement the live provider using a hidden `collect()`/MemTable that downloads everything during registration.
+
+### Optional storage follow-up: define, do not fold into the analytics deliverable
+
+After shared history semantics stabilize, record a concrete S1 plan for a Postgres adapter. Do not implement it in this run unless the user has requested that track.
+
+The adapter needs fallible streamed reads, transactional writes, duplicate/correction policy, migrations, restart durability, pooling, source/point isolation, retention settings, and exact kind/unit/time handling. Preserve nanoseconds/timezone identity separately from Postgres's datetime convenience column. TimescaleDB is optional and needs its own qualified layout.
+
+Entity graph persistence is a separate contract; existing `HistoryProvider` does not wrap `SharedGraph`. A Parquet-backed writable store additionally needs manifests, compaction, correction visibility, and recovery. SeleneDB needs actual API evidence before an adapter is designed.
+
+### Acceptance tests: meaningful evidence
+
+Use deterministic local/mock servers and temporary artifacts. Real Niagara/SkySpark checks can supplement local tests if supplied, but must not be invented.
+
+History and decode:
+- Exact start included, exact end excluded, fractional final-second sample retained.
+- DST skipped/repeated local times and date windows; invalid/reversed/unknown-timezone ranges.
+- Standard single/batch wire fixtures, column-ID mapping, mixed-zone requests, uneven sample timestamps.
+- Batch unsupported fallback distinguished from auth/timeouts; incomplete response and truncated-body rejection.
+- UTF-8, strings, nested scalars, metadata, and rows split across arbitrary byte boundaries.
+- Compare incremental results with the existing full decoder on deterministic accepted fixtures.
+
+Arrow/Parquet:
+- Numeric/bool/string/NA/Null/Ref/unit/timezone fidelity; non-finite floats; checked timestamp range.
+- Fixed schema across chunks and empty results; canonical-value reconstruction.
+- Multi-source identities, variable sample units, metadata snapshot joins.
+- Independent Arrow/Parquet reader and SQL result comparison, not just writer self-comparison.
+- Disk errors, cancellation, and malformed input never publish a successful output.
+- Existing destination remains intact when overwrite is refused.
+- Repeated snapshot/resume policy does not duplicate or lose observations.
+
+Python/package/lifecycle:
+- Installed-wheel typing/imports without source-path assistance.
+- Arrow C-stream import into PyArrow and DataFusion on qualified versions.
+- Buffer lifetimes after producer Python objects are dropped; predictable repeated reader use.
+- Async event-loop progress during native fetch; timeout/cancel/close behavior.
+- Ordinary and free-threaded interpreter import, concurrent calls, iterator mutation policy, and subprocess-exit tests.
+- Optional packages absent: base imports and existing clients still work.
+
+Live DataFusion:
+- Registration and EXPLAIN issue zero history downloads.
+- Actual filtered queries fetch fewer IDs/windows than an unfiltered scan.
+- Query results equal a trusted local fixture for supported and residual filters.
+- LIMIT with residual filter; empty/false predicates; repeated execution semantics.
+- Projection schema, cancellation, FFI version mismatch, and finite-envelope bounds.
+- Validate Rust and Python provider surfaces against the same fixture data.
+
+Performance and dependency isolation:
+- Generate at least 1M deterministic history samples without preloading them all in the producer.
+- Capture time to first batch, total time, peak RSS, request/byte counts, max queued bytes/batches, and writer memory.
+- Compare 100K versus 1M scans at identical limits; explain scaling and bounded queues. Do not promise a particular speedup before measurement.
+- Distinguish remote server buffering from client-side memory guarantees.
+- Verify core/client/server dependency trees do not include DataFusion or Postgres; verify the Parquet path does not require DataFusion.
+
+### Working and completion rules
+
+Run existing formatting/lint/test checks appropriate to touched packages and features. Baseline examples include:
+
+```sh
+cargo fmt --all --check
+cargo test --workspace --exclude rusty-haystack
+cargo test -p rusty-haystack-core --features chrono-tz
+cargo clippy --workspace --exclude rusty-haystack --all-targets -- -D warnings
+```
+
+New adapters may make `--workspace` intentionally heavy; provide explicit default-package and adapter checks. Do not omit analytics crates from qualification merely to retain old command speed.
+
+Build native Python extensions in an isolated venv using the repository's existing toolchain/uv/maturin conventions. Run the existing pytest suite plus new qualified feature tests. Test the built wheel in a fresh environment. Use the selected interpreter explicitly for each wheel profile.
+
+For each milestone, update public docs/stubs/examples affected by the change and record actual commands/results. Keep future APIs labeled future until working. Include fixtures and measured evidence for correctness/performance claims.
+
+Finish with:
+- implemented user workflow and exact examples;
+- files/packages changed and intentional API changes;
+- validation and benchmark evidence with versions;
+- remaining limitations and local issue drafts;
+- separate backend follow-up recommendations.
+
+Do not publish wheels, push, or file external issues as an implicit completion step.
