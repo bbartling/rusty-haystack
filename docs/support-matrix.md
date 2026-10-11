@@ -19,6 +19,7 @@ policy in `scripts/ci/policy.py` rejects an unknown event, target branch, or pro
 | Core minimal and default | Ubuntu | Ubuntu | Package-only Clippy and tests, separately with and without `--no-default-features` |
 | Current stable Rust 1.99.0 | Ubuntu | Ubuntu | Separate named lane with the workspace and `chrono-tz` Clippy/test selections |
 | Python bindings | Ubuntu, CPython 3.12 | Ubuntu, CPython 3.12 | PyO3 Clippy, locked release-mode `maturin develop` with Maturin 1.15.0, then pytest |
+| Schema and generated HTTP client | Ubuntu, Python 3.12 | Ubuntu, Python 3.12 | Locked OpenAPI/JSON Schema validators and unedited openapi-python-client output against a real local fixture; part of the existing Python job |
 | Cargo Deny | Ubuntu | Ubuntu | Locked all-feature dependency advisory, license, ban and source checks |
 | CodeQL | Ubuntu, Rust/Python/Actions | Ubuntu, Rust/Python/Actions | Analysis and upload jobs completed using the existing query filters; the separate alert-results check is described below |
 | CI policy | Ubuntu | Ubuntu | Process-level aggregate and matrix tests, workflow wiring regressions, benchmark capture input/receipt regressions, and artifact provenance/staging regressions |
@@ -77,9 +78,14 @@ configured as a required branch-protection check.
 provenance/staging tests,
 formatting, the same Rust command
 selections on the local host, core minimal/default checks, Python binding checks,
-and Cargo Deny. Python checks require the repository `.venv` with CPython 3.12,
+the locked schema/generated-client proof (uv and Python 3.12),
+and Cargo Deny. Python binding checks require the repository `.venv` with CPython 3.12,
 Maturin 1.15.0 and pytest; the extension is rebuilt before pytest. A missing `.venv`
 is recorded as incomplete, while an existing but invalid environment is a failure.
+The schema tooling uses `scripts/schema-client/uv.lock` and a separate environment;
+missing uv is incomplete, while tooling or HTTP proof failures fail the gate.
+This qualifies one generator and a synthetic loopback fixture, not all clients
+or full Haystack 5 interoperability.
 
 | Exit | Claim |
 |---|---|

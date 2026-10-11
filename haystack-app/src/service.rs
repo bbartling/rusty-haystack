@@ -844,6 +844,51 @@ impl Inner {
         self.bound(observation)
             .map_err(|_| crate::ApiError::Unavailable)
     }
+    fn execute_schema(
+        &self,
+        principal: Principal,
+        input: crate::TypedInvocationInput,
+        selection: crate::registry::Selection,
+        budget: &mut Budget,
+    ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
+        use crate::ApiError;
+        let gzip = crate::typed_http::schema_controls(&input)?;
+        let policy = self.policy.snapshot(&principal)?;
+        if !policy.operation(ReadOperation::Read) {
+            return Err(ApiError::Permission);
+        }
+        let registry = self.capture_registry(budget)?;
+        let document = registry.schema(policy.as_ref(), selection, budget)?;
+        let scope = budget.copy_string(policy.scope_key())?;
+        let policies = self.policy.clone();
+        let graph = self.graph.clone();
+        let observation = registry.observation().clone();
+        let sealed = budget.owner_sealed.clone();
+        // Callbacks run before the short observation read, never under its lock.
+        // Retain only cancellation/session authority, not a completed work lease.
+        budget.command_disclosure = Some(Arc::new(move || {
+            if sealed.as_ref().is_some_and(|token| token.is_cancelled()) {
+                return Err(ApiError::Unavailable);
+            }
+            let current = policies.snapshot(&principal)?;
+            if current.scope_key() != scope || !current.operation(ReadOperation::Read) {
+                return Err(ApiError::Permission);
+            }
+            graph
+                .read_for(std::time::Duration::ZERO, |graph| {
+                    if graph
+                        .activated_catalog()
+                        .is_some_and(|catalog| Arc::ptr_eq(catalog, &observation))
+                    {
+                        Ok(())
+                    } else {
+                        Err(ApiError::Unavailable)
+                    }
+                })
+                .unwrap_or(Err(ApiError::Unavailable))
+        }));
+        crate::typed_http::schema_response(document, budget, gzip)
+    }
     fn execute_typed(
         &self,
         principal: Principal,
@@ -862,6 +907,11 @@ impl Inner {
             .is_some_and(|session| !session.matches(&principal) || !session.is_active())
         {
             return Err(ApiError::Permission);
+        }
+        if input.operation == "rusty-haystack/openapi.json" {
+            return self
+                .execute_schema(principal, input, selection, budget)
+                .map(TypedInvocation::Response);
         }
         // No token lookup can rebind an invocation to a replacement login.
         let envelope = typed_http::envelope(&input, budget)?;

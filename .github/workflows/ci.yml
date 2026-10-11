@@ -162,6 +162,9 @@ jobs:
         run: |
           source .venv/bin/activate
           pytest rusty-haystack/tests -q
+      # Isolated locked tooling; no product PyO3 environment or generated code is reused.
+      - name: Validate schemas and generated client over loopback HTTP
+        run: uv run --locked --project scripts/schema-client --python 3.12 python scripts/schema-client/validate.py
 
   deny:
     name: Cargo Deny

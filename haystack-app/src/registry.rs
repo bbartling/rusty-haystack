@@ -2,6 +2,7 @@
 //! Each graph-published catalog observation supplies the signatures, metadata
 //! and codec contexts those handlers are bound to; a binding never outlives or
 //! mixes observations.
+mod schema;
 use crate::{
     ApiError, BudgetKind, CatalogKind, PolicySnapshot, ReadError, ReadOperation, budget::Budget,
     typed_http::WireProfile,

@@ -163,6 +163,7 @@ class WorkflowContractTests(unittest.TestCase):
         for job in REQUIRED:
             self.assertNotRegex(jobs[job], r"(?m)^    (if|continue-on-error):")
         self.assertIn("types: [opened, synchronize, reopened, edited]", ci)
+        self.assertIn("run: uv run --locked --project scripts/schema-client --python 3.12 python scripts/schema-client/validate.py", jobs["python"])
         self.assertIn("run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v", jobs["ci-policy"])
         self.assertIn('run: python3 scripts/ci/policy.py plan >> "$GITHUB_OUTPUT"', jobs["ci-policy"])
         self.assertIn("CI_EVENT_ACTION: ${{ github.event.action }}", jobs["ci-policy"])

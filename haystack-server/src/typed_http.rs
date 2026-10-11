@@ -62,7 +62,11 @@ fn legacy_selection(request: &Request<Body>) -> bool {
     query_version.unwrap_or_else(|| first.is_none_or(|value| value == "4"))
 }
 pub(crate) fn error(error: ApiError) -> Response {
-    let post_only = matches!(error, ApiError::MethodNotAllowed);
+    let allow = match error {
+        ApiError::MethodNotAllowed => Some("POST"),
+        ApiError::SchemaMethodNotAllowed => Some("GET"),
+        _ => None,
+    };
     let mut response = (
         StatusCode::from_u16(error.status()).expect("fixed status"),
         [
@@ -72,10 +76,10 @@ pub(crate) fn error(error: ApiError) -> Response {
         error.json(),
     )
         .into_response();
-    if post_only {
+    if let Some(allow) = allow {
         response
             .headers_mut()
-            .insert(header::ALLOW, "POST".parse().expect("fixed method"));
+            .insert(header::ALLOW, allow.parse().expect("fixed method"));
     }
     response
 }
@@ -262,6 +266,7 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
             body: Vec::new(),
         }
     };
+    let input_is_schema = input.operation == "rusty-haystack/openapi.json";
     let command_attempt = request
         .extensions()
         .get::<haystack_app::CommandAttempt>()
@@ -314,6 +319,7 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
         .await?;
     response.disclosure.check()?;
     let gzip = response.gzip;
+    let schema = input_is_schema;
     let body = Body::from_stream(futures_util::stream::once(async move {
         response.disclosure.check().map_err(|_| {
             std::io::Error::new(
@@ -340,6 +346,12 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
             .parse()
             .expect("fixed header"),
     );
+    if schema {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            "private, no-store".parse().expect("fixed cache control"),
+        );
+    }
     if gzip {
         response.headers_mut().insert(
             header::CONTENT_ENCODING,

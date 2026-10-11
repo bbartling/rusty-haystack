@@ -184,6 +184,14 @@ else
   skip "clippy (pyo3)" "needs the venv above"
 fi
 
+# Independent schema tooling has its own lock and environment, never the PyO3 venv.
+if command -v uv >/dev/null 2>&1; then
+  run "schema and generated-client HTTP proof" \
+    uv run --locked --project scripts/schema-client --python 3.12 python scripts/schema-client/validate.py  # ci.yml: jobs.python
+else
+  skip "schema and generated-client HTTP proof" "uv is required for the locked Python 3.12 tools"
+fi
+
 # Network-dependent, so opt-in locally. CI runs it on every dev/main push and PR.
 if (( FULL )); then
   # cargo-deny-action@v2 runs `check` with `--locked --all-features` and the root
