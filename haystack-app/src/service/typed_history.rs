@@ -708,6 +708,8 @@ mod tests {
     struct RevokeBeforeCommit {
         store: HisStore,
         session: SubscriptionSession,
+        before_commit: Option<Mutex<std::sync::mpsc::Receiver<()>>>,
+        completed: Mutex<Option<tokio::sync::oneshot::Sender<HistoryWriteOutcome>>>,
     }
     impl HistoryProvider for RevokeBeforeCommit {
         fn open(
@@ -724,18 +726,41 @@ mod tests {
         }
         fn commit_history(&self, prepared: PreparedHistoryMutation) -> HistoryWriteOutcome {
             self.session.close();
-            self.store.commit_history(prepared)
+            if let Some(release) = &self.before_commit {
+                // Dropping the sender also releases the worker if the test
+                // panics, so runtime shutdown cannot hang on this fixture.
+                let _ = release.lock().recv();
+            }
+            let outcome = self.store.commit_history(prepared);
+            let _ = self
+                .completed
+                .lock()
+                .take()
+                .expect("one commit attempt")
+                .send(outcome.clone());
+            outcome
         }
     }
     #[tokio::test]
     async fn provider_cannot_publish_after_synchronous_session_revocation() {
+        revocation_before_commit(false).await;
+    }
+    #[tokio::test]
+    async fn session_revocation_can_return_while_provider_receipt_is_pending() {
+        revocation_before_commit(true).await;
+    }
+    async fn revocation_before_commit(paused: bool) {
         let reads = ReadService::new(graph(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
         let store = HisStore::new();
         let session = SubscriptionSession::trusted("writer", Duration::from_secs(30)).unwrap();
         let principal = session.principal().clone();
+        let (release, before_commit) = std::sync::mpsc::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
         let provider = Arc::new(RevokeBeforeCommit {
             store: store.clone(),
             session: session.clone(),
+            before_commit: paused.then_some(Mutex::new(before_commit)),
+            completed: Mutex::new(Some(completed)),
         });
         let history =
             HistoryService::new(reads.clone(), provider, HistoryLimits::default()).unwrap();
@@ -756,19 +781,47 @@ mod tests {
                 .await
                 .is_err()
         );
-        // The provider's publication checks the session itself, independently
-        // of when the waiting runtime propagates revocation to cancellation.
+        if paused {
+            // A prompt request error does not join its blocking provider. The
+            // reservation and work lease remain live until that attempt ends.
+            assert_eq!(reads.load().admitted, 1);
+            assert_eq!(store.state("p").unwrap().generation, 0);
+            assert!(store.is_empty("p"));
+            assert_eq!(
+                writes
+                    .reconcile(context(principal.clone()), request.identity.clone())
+                    .await
+                    .unwrap(),
+                HistoryWriteOutcome::Unknown {
+                    identity: request.identity.clone(),
+                    cause: HistoryWriteUnknown::Pending,
+                }
+            );
+            release.send(()).unwrap();
+        }
+        // The unpaused case still attempts publication immediately after
+        // closing the session, independently of cancellation propagation. Wait
+        // for that attempt before requiring its receipt to be terminal.
+        let outcome = tokio::time::timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("provider completion")
+            .expect("provider outcome");
         assert_eq!(store.state("p").unwrap().generation, 0);
+        assert!(store.is_empty("p"));
         let receipt = writes
             .reconcile(context(principal), request.identity)
             .await
             .unwrap();
-        assert!(matches!(
-            receipt,
-            HistoryWriteOutcome::Rejected {
-                reason: HistoryWriteRejection::Forbidden | HistoryWriteRejection::Cancelled,
-                ..
-            }
-        ));
+        assert_eq!(receipt, outcome);
+        assert!(
+            matches!(
+                receipt,
+                HistoryWriteOutcome::Rejected {
+                    reason: HistoryWriteRejection::Forbidden | HistoryWriteRejection::Cancelled,
+                    ..
+                }
+            ),
+            "receipt after provider completion: {receipt:?}"
+        );
     }
 }
