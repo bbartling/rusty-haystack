@@ -68,6 +68,9 @@ pub(crate) struct Budget {
     /// the final graph write lock.
     #[cfg(test)]
     pub activation_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Typed history stages retain the observation used for binding. Native
+    /// history calls have no catalog pin; their existing GraphState rules apply.
+    pub typed_catalog: Option<Arc<haystack_core::xeto::catalog::ActivatedCatalog>>,
     pub limits: Arc<ReadLimits>,
     pub deadline: Instant,
     pub cancel: CancellationToken,
@@ -97,6 +100,7 @@ impl Budget {
             typed_lookup_hook: None,
             #[cfg(test)]
             activation_commit_hook: None,
+            typed_catalog: None,
             limits,
             deadline,
             cancel,
@@ -114,6 +118,20 @@ impl Budget {
         self.limits
             .max_retained_bytes
             .saturating_sub(self.usage.lock().retained)
+    }
+    pub fn check_catalog(
+        &self,
+        graph: &haystack_core::graph::EntityGraph,
+    ) -> Result<(), ReadError> {
+        if self.typed_catalog.as_ref().is_some_and(|expected| {
+            !graph
+                .activated_catalog()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+        }) {
+            Err(ReadError::Unavailable)
+        } else {
+            Ok(())
+        }
     }
     pub fn check(&self) -> Result<(), ReadError> {
         if Instant::now() >= self.deadline {

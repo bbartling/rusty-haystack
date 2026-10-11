@@ -68,7 +68,10 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
         );
         assert_eq!(nav.source.path, "src/xeto/ph.api/funcs.xeto");
         assert_eq!(nav.source.sha256, FUNCS_SHA256);
-        assert_eq!(nav.source.declarations, [NAV]);
+        assert_eq!(
+            nav.source.declarations,
+            [NAV, "ph.api::hisRead", "ph.api::hisWrite"]
+        );
 
         let library = catalog
             .libraries()
@@ -78,7 +81,10 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
         assert_eq!(library.version, "5.0.0");
         assert_eq!(library.maturity, "alpha");
         assert_eq!(library.depends, ["sys", "sys.api", "ph"]);
-        assert_eq!(library.declarations, [NAV]);
+        assert_eq!(
+            library.declarations,
+            ["ph.api::hisRead", "ph.api::hisWrite", NAV]
+        );
         let pragma = catalog
             .provenance()
             .files
@@ -91,14 +97,7 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
         );
 
         // The rest of the same upstream file stays outside every selection.
-        for name in [
-            "watchSub",
-            "watchUnsub",
-            "watchPoll",
-            "pointWrite",
-            "hisRead",
-            "hisWrite",
-        ] {
+        for name in ["watchSub", "watchUnsub", "watchPoll", "pointWrite"] {
             assert!(catalog.declaration(&format!("ph.api::{name}")).is_none());
             assert!(catalog.declaration(&format!("sys.api::{name}")).is_none());
         }
@@ -182,7 +181,7 @@ fn nav_fits_a_whole_request_grid_and_a_grid_result() {
 }
 
 #[test]
-fn only_the_op_grid_declaration_passes_a_request_grid_whole() {
+fn only_admitted_op_grid_declarations_pass_a_request_grid_whole() {
     let observation = ActivatedCatalog::new(Catalog::load_http_pinned().unwrap(), None).unwrap();
     let nav = observation.callable(NAV).unwrap();
     assert!(nav.op_grid);
@@ -197,6 +196,12 @@ fn only_the_op_grid_declaration_passes_a_request_grid_whole() {
     assert_eq!(nav.result, "sys::Grid");
     for operation in observation.catalog().operations() {
         let callable = observation.callable(&operation.spec.qname).unwrap();
-        assert_eq!(callable.op_grid, operation.spec.qname == NAV);
+        assert_eq!(
+            callable.op_grid,
+            matches!(
+                operation.spec.qname.as_str(),
+                NAV | "ph.api::hisRead" | "ph.api::hisWrite"
+            )
+        );
     }
 }

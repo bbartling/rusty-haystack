@@ -27,6 +27,8 @@ pub(crate) const BINDINGS: &[(&str, Handler)] = &[
     ("sys.api::libs", Handler::Libs),
     ("sys.api::filetypes", Handler::Filetypes),
     ("ph.api::nav", Handler::Nav),
+    ("ph.api::hisRead", Handler::HisRead),
+    ("ph.api::hisWrite", Handler::HisWrite),
 ];
 
 /// Stable identity supplied to the explicit per-function execution decision.
@@ -62,6 +64,22 @@ pub(crate) enum Handler {
     Filetypes,
     Ops,
     Nav,
+    HisRead,
+    HisWrite,
+}
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Selection {
+    pub history: bool,
+    pub history_mutations: bool,
+}
+impl Selection {
+    fn permits(self, handler: Handler) -> bool {
+        match handler {
+            Handler::HisRead => self.history,
+            Handler::HisWrite => self.history_mutations,
+            _ => true,
+        }
+    }
 }
 impl Handler {
     /// Coarse operation permission a handler needs beyond `Read`, so the
@@ -69,6 +87,7 @@ impl Handler {
     fn operation(self) -> Option<ReadOperation> {
         match self {
             Self::Nav => Some(ReadOperation::Nav),
+            Self::HisRead => Some(ReadOperation::History),
             _ => None,
         }
     }
@@ -84,9 +103,10 @@ pub(crate) struct Entry {
     pub wire: WireProfile,
 }
 impl Entry {
-    fn visible(&self, policy: &dyn PolicySnapshot) -> bool {
-        self.op
-            && policy.operation(ReadOperation::Read)
+    fn visible(&self, policy: &dyn PolicySnapshot, selection: Selection) -> bool {
+        selection.permits(self.handler)
+            && self.op
+            && (self.handler == Handler::HisWrite || policy.operation(ReadOperation::Read))
             && self
                 .handler
                 .operation()
@@ -254,12 +274,26 @@ impl Registry {
     pub fn descriptors(&self) -> impl Iterator<Item = FunctionDescriptor<'_>> {
         self.entries
             .iter()
-            .filter(|entry| entry.op)
+            .filter(|entry| entry.op && Selection::default().permits(entry.handler))
             .map(Entry::descriptor)
     }
-    pub fn resolve(
+    #[cfg(test)]
+    fn resolve(
         &self,
         name: &str,
+        policy: &dyn PolicySnapshot,
+        budget: &mut Budget,
+    ) -> Result<&Entry, ApiError> {
+        self.resolve_selected(name, Selection::default(), policy, budget)
+    }
+    #[cfg(test)]
+    fn ops(&self, policy: &dyn PolicySnapshot, budget: &mut Budget) -> Result<Kind, ApiError> {
+        self.ops_selected(policy, Selection::default(), budget)
+    }
+    pub fn resolve_selected(
+        &self,
+        name: &str,
+        selection: Selection,
         policy: &dyn PolicySnapshot,
         budget: &mut Budget,
     ) -> Result<&Entry, ApiError> {
@@ -277,7 +311,9 @@ impl Registry {
                     .saturating_add(name.len())
                     .saturating_add(1),
             )?;
-            if (entry.identity.qname == name || entry.name == name) && entry.visible(policy) {
+            if (entry.identity.qname == name || entry.name == name)
+                && entry.visible(policy, selection)
+            {
                 if let Some(previous) = found {
                     if candidates.is_empty() {
                         budget.charge(BudgetKind::Retained, 128)?;
@@ -301,7 +337,12 @@ impl Registry {
             None => Err(ApiError::UnknownFunction(budget.copy_string(name)?)),
         }
     }
-    pub fn ops(&self, policy: &dyn PolicySnapshot, budget: &mut Budget) -> Result<Kind, ApiError> {
+    pub fn ops_selected(
+        &self,
+        policy: &dyn PolicySnapshot,
+        selection: Selection,
+        budget: &mut Budget,
+    ) -> Result<Kind, ApiError> {
         let mut rows = Vec::new();
         for entry in &self.entries {
             // All inspected entries, including denied entries, count. Copied
@@ -311,7 +352,7 @@ impl Registry {
                 BudgetKind::Work,
                 entry.identity.qname.len().saturating_add(1),
             )?;
-            if !entry.visible(policy) {
+            if !entry.visible(policy, selection) {
                 continue;
             }
             if rows.len() >= budget.limits.max_rows {
@@ -450,6 +491,21 @@ fn validate_binding(declaration: &AdmittedSpec, handler: Handler) -> Result<(), 
                         Some("sys.api::FiletypeInfo"),
                     )])
             }
+            Handler::HisRead | Handler::HisWrite => {
+                declaration.spec.qname
+                    == if handler == Handler::HisRead {
+                        "ph.api::hisRead"
+                    } else {
+                        "ph.api::hisWrite"
+                    }
+                    && declaration.spec.meta.get("opGrid") == Some(&Kind::Marker)
+                    && (declaration.spec.meta.get("noSideEffects") == Some(&Kind::Marker))
+                        == (handler == Handler::HisRead)
+                    && shape(&[
+                        ("req", "sys::Grid", false, false, None),
+                        ("returns", "sys::Grid", false, false, None),
+                    ])
+            }
             Handler::Nav => {
                 // ph.api::nav: the opGrid request grid is the single parameter.
                 declaration.spec.qname == "ph.api::nav"
@@ -566,7 +622,12 @@ mod tests {
     // Synthetic lookup fixtures exercise collision and metadata decisions;
     // they are never admitted as an upstream library or executable handler.
     fn fixture_entry(qname: &str) -> Entry {
-        let mut entry = Registry::pinned().unwrap().entries.remove(1);
+        let mut entry = Registry::pinned()
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|entry| entry.handler == Handler::ReadById)
+            .unwrap();
         entry.identity.qname = qname.into();
         entry.name = qname.rsplit("::").next().unwrap().into();
         entry
@@ -715,7 +776,7 @@ mod tests {
         let read_all = catalog.declaration("sys.api::readAll").unwrap();
         assert!(validate_binding(read_all, Handler::Nav).is_err());
         // The tenth fixed binding is discoverable, GET-capable and whole-grid.
-        assert_eq!(BINDINGS.len(), 10);
+        assert_eq!(BINDINGS.len(), 12);
         assert!(
             crate::ReadService::supported_functions().any(|pair| pair == ("nav", "ph.api::nav"))
         );
@@ -733,7 +794,10 @@ mod tests {
             registry
                 .entries
                 .iter()
-                .filter(|entry| entry.handler != Handler::Nav)
+                .filter(|entry| !matches!(
+                    entry.handler,
+                    Handler::Nav | Handler::HisRead | Handler::HisWrite
+                ))
                 .all(|entry| !entry.wire.op_grid)
         );
     }
@@ -777,7 +841,12 @@ mod tests {
                 )
                 .is_err()
         );
-        registry.entries[0].doc = Some("x".repeat(100_000));
+        registry
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handler == Handler::Nav)
+            .unwrap()
+            .doc = Some("x".repeat(100_000));
         assert!(
             registry
                 .ops(

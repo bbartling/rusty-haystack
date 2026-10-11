@@ -446,9 +446,13 @@ pub fn decode_legacy_request(
     codec: &dyn Codec,
 ) -> Result<HistoryReadRequest, TypedPayloadError> {
     allowed(codec)?;
-    let mut grid = codec
+    let grid = codec
         .decode_grid(preflight(bytes, true)?)
         .map_err(|_| invalid())?;
+    legacy_request_from_grid(grid)
+}
+/// Native single-point request adapter with the same shape as legacy H4.
+pub fn legacy_request_from_grid(mut grid: HGrid) -> Result<HistoryReadRequest, TypedPayloadError> {
     if !grid.meta.is_empty() {
         return Err(invalid());
     }

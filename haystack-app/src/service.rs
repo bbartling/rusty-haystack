@@ -1,6 +1,7 @@
 mod activation;
 mod nav;
 mod system;
+mod typed_history;
 use crate::{
     budget::Budget,
     lifecycle::{ApplicationError, Lifecycle, WorkGuard},
@@ -397,19 +398,77 @@ impl ReadAdmission {
         Ok(())
     }
     pub async fn invoke_wire(
-        mut self,
+        self,
         input: crate::TypedInvocationInput,
     ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
+        self.invoke_wire_with_history(input, None, None).await
+    }
+    /// Invoke with the exact owned history selection. These handles are trusted
+    /// transport configuration; request arguments cannot select a provider.
+    pub async fn invoke_wire_with_history(
+        mut self,
+        input: crate::TypedInvocationInput,
+        history: Option<crate::HistoryService>,
+        mutations: Option<crate::HistoryMutationService>,
+    ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
+        if history
+            .as_ref()
+            .is_some_and(|service| !self.belongs_to(service.read_service()))
+            || mutations.as_ref().is_some_and(|service| {
+                !self.belongs_to(service.read_service())
+                    || !history
+                        .as_ref()
+                        .is_some_and(|history| history.same_selection(service.history_service()))
+            })
+        {
+            return Err(crate::ApiError::Unavailable);
+        }
+        let selection = crate::registry::Selection {
+            history: history.is_some(),
+            history_mutations: mutations.is_some(),
+        };
         let inner = self.inner.clone();
-        let session = self.session.take();
-        let response = self
+        let session = self.session.clone();
+        let stage = self.stage()?;
+        let prepared = stage
             .run_task(move |principal, budget| {
-                Ok(inner.execute_typed(principal, session, input, budget))
+                Ok(inner.execute_typed(principal, session, input, selection, budget))
             })
             .await
             .map_err(crate::ApiError::from)??;
+        let response = match prepared {
+            typed_history::Invocation::Response(response) => {
+                // This stage finished the request; do not cancel its disclosure.
+                self.budget.take();
+                response
+            }
+            typed_history::Invocation::History(prepared) => {
+                prepared.execute(self, history, mutations).await?
+            }
+        };
         response.disclosure.check()?;
         Ok(response)
+    }
+    /// A stage shares the original admission rather than acquiring another
+    /// permit or renewing its deadline. Both owners retain the work lease.
+    fn stage(&mut self) -> Result<Self, ReadError> {
+        let bytes = self
+            .principal
+            .as_ref()
+            .expect("live admission")
+            .bytes()
+            .saturating_add(256);
+        self.budget_mut().charge(BudgetKind::Retained, bytes)?;
+        self.budget_mut().charge(BudgetKind::Work, bytes)?;
+        self.retain_work()?;
+        Ok(Self {
+            inner: self.inner.clone(),
+            principal: self.principal.clone(),
+            session: self.session.clone(),
+            budget: self.budget.clone(),
+            permit: None,
+            guard: None,
+        })
     }
     pub fn deadline(&self) -> Instant {
         self.budget.as_ref().expect("live admission").deadline
@@ -508,9 +567,9 @@ impl ReadAdmission {
             Forbidden,
             Owner,
         }
-        let mut budget = self.budget.take().expect("live admission");
+        self.retain_work()?;
+        let budget = self.budget.take().expect("live admission");
         let principal = self.principal.take().expect("live admission");
-        let permit = self.permit.take().expect("live admission");
         let cancel = budget.cancel.clone();
         let deadline = budget.deadline;
         let owner_cancel = budget.owner_cancel.clone();
@@ -521,10 +580,6 @@ impl ReadAdmission {
         };
         budget.check()?;
         let inner = self.inner.clone();
-        budget.lease = Some(Arc::new(WorkLease {
-            _permit: permit,
-            _guard: self.guard.take(),
-        }));
         // The worker and awaiting caller share the same registration through
         // completion handoff. Otherwise the worker can make drain observe zero
         // work and signal owner stop before its ready result reaches the caller.
@@ -726,8 +781,9 @@ impl Inner {
         principal: Principal,
         session: Option<crate::SubscriptionSession>,
         input: crate::TypedInvocationInput,
+        selection: crate::registry::Selection,
         budget: &mut Budget,
-    ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
+    ) -> Result<typed_history::Invocation, crate::ApiError> {
         use crate::{ApiError, typed_http};
         if principal.bytes() > budget.limits.max_input_bytes {
             return Err(ApiError::InvalidArgs);
@@ -743,7 +799,9 @@ impl Inner {
         let envelope = typed_http::envelope(&input, budget)?;
         let policy = self.policy.snapshot(&principal)?;
         budget.check()?;
-        if !policy.operation(ReadOperation::Read) {
+        if !matches!(envelope.operation.as_str(), "hisWrite" | "ph.api::hisWrite")
+            && !policy.operation(ReadOperation::Read)
+        {
             return Err(ApiError::Permission);
         }
         // One retained observation serves resolution, discovery, argument
@@ -754,7 +812,8 @@ impl Inner {
         if let Some(hook) = &budget.typed_lookup_hook {
             hook();
         }
-        let entry = registry.resolve(&envelope.operation, policy.as_ref(), budget)?;
+        let entry =
+            registry.resolve_selected(&envelope.operation, selection, policy.as_ref(), budget)?;
         entry.permits_method(input.post)?;
         let request = typed_http::decode(&input, &entry.wire, envelope, budget)?;
         // Reserve native binding copies before the binder constructs immutable
@@ -776,8 +835,34 @@ impl Inner {
             .catalog()
             .fit_arguments(&entry.identity.qname, &request.args)
             .map_err(|_| ApiError::InvalidArgs)?;
+        if matches!(
+            entry.handler,
+            crate::registry::Handler::HisRead | crate::registry::Handler::HisWrite
+        ) {
+            loop {
+                if let Some(result) = self.graph.read_for(budget.wait_quantum()?, |graph| {
+                    current_observation(graph, &registry)
+                }) {
+                    result?;
+                    break;
+                }
+            }
+            let prepared = typed_history::Prepared::new(
+                registry.clone(),
+                entry.handler,
+                request,
+                args.values(),
+                budget,
+            )?;
+            return Ok(typed_history::Invocation::History(prepared));
+        }
         let value = match entry.handler {
-            crate::registry::Handler::Ops => registry.ops(policy.as_ref(), budget)?,
+            crate::registry::Handler::HisRead | crate::registry::Handler::HisWrite => {
+                return Err(ApiError::Internal);
+            }
+            crate::registry::Handler::Ops => {
+                registry.ops_selected(policy.as_ref(), selection, budget)?
+            }
             crate::registry::Handler::About => self.about(&registry, &principal, budget)?,
             crate::registry::Handler::Libs => self.libraries(&registry, policy.as_ref(), budget)?,
             crate::registry::Handler::Filetypes => self.filetypes(request.version, budget)?,
@@ -794,14 +879,20 @@ impl Inner {
             | crate::registry::Handler::Read
             | crate::registry::Handler::ReadAll) => {
                 match self.system_read(&registry, handler, args.values(), policy.as_ref(), budget) {
-                    Err(ApiError::UnknownEntity) => return typed_http::missing(&request, budget),
+                    Err(ApiError::UnknownEntity) => {
+                        return typed_http::missing(&request, budget)
+                            .map(typed_history::Invocation::Response);
+                    }
                     value => value?,
                 }
             }
             crate::registry::Handler::ReadById => {
                 let checked = matches!(args.values().get("checked"), Some(Kind::Bool(true)));
                 match args.values().get("id") {
-                    Some(Kind::Null) if checked => return typed_http::missing(&request, budget),
+                    Some(Kind::Null) if checked => {
+                        return typed_http::missing(&request, budget)
+                            .map(typed_history::Invocation::Response);
+                    }
                     Some(Kind::Null) => Kind::Null,
                     Some(Kind::Ref(id)) => loop {
                         let wait = budget.wait_quantum()?;
@@ -821,7 +912,10 @@ impl Inner {
                                         Arc::try_unwrap(row).map_err(|_| ApiError::Internal)?,
                                     ));
                                 }
-                                None if checked => return typed_http::missing(&request, budget),
+                                None if checked => {
+                                    return typed_http::missing(&request, budget)
+                                        .map(typed_history::Invocation::Response);
+                                }
                                 None => break Kind::Null,
                             }
                         }
@@ -844,7 +938,7 @@ impl Inner {
                 .close()?;
         }
         budget.check()?;
-        Ok(response)
+        Ok(typed_history::Invocation::Response(response))
     }
     fn execute(
         &self,

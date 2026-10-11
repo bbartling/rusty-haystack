@@ -3,7 +3,7 @@
 //! every allocating request stage shares the original read admission.
 use crate::{BudgetKind, H4Codec, OutputProfile, ReadError, ReadOutput, budget::Budget, output};
 use haystack_core::{
-    codecs::{codec_for, jeto},
+    codecs::{codec_for, jeto, zinc},
     data::HDict,
     kinds::Kind,
 };
@@ -655,9 +655,17 @@ pub(crate) fn decode(
                             return Err(ApiError::InvalidArgs);
                         }
                     }
-                    let grid = codec_for(codec.mime())
-                        .ok_or(ApiError::Internal)?
-                        .decode_grid(text)
+                    let grid =
+                        if codec == H4Codec::Zinc && profile.function == "ph.api::hisWrite" {
+                            // Preserve every cell and scalar boundary before the
+                            // native mutation adapter binds canonical intent. The
+                            // legacy decoder intentionally ignores surplus input.
+                            zinc::decode_grid_complete_rows(text)
+                        } else {
+                            codec_for(codec.mime())
+                                .ok_or(ApiError::Internal)?
+                                .decode_grid(text)
+                        }
                         .map_err(|_| ApiError::InvalidArgs)?;
                     if profile.op_grid {
                         // sys::Spec `opGrid`: a grid body is the request grid

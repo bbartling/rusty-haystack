@@ -427,12 +427,14 @@
           33
         ],
         [
-          229,
+          151,
           229
         ]
       ],
       "declarations": [
-        "ph.api::nav"
+        "ph.api::nav",
+        "ph.api::hisRead",
+        "ph.api::hisWrite"
       ]
     }
   ]

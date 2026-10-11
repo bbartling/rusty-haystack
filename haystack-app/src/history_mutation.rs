@@ -478,6 +478,7 @@ impl HistoryMutationInner {
             cancel: budget.cancel.clone(),
             owner_cancel: budget.owner_cancel.clone(),
             owner_sealed: budget.owner_sealed.clone(),
+            session: budget.session.clone(),
             policy: self.policy.clone(),
             generation: policy.generation.clone(),
             _lease: budget.lease.clone(),
@@ -516,6 +517,7 @@ impl HistoryMutationInner {
         let (schema, observed) = loop {
             if let Some(result) =
                 graph.read_for(budget.wait_quantum().map_err(read_reason)?, |graph| {
+                    budget.check_catalog(graph).map_err(read_reason)?;
                     let row = graph
                         .get(&request.identity.point)
                         .ok_or(HistoryWriteRejection::Invalid)?;
@@ -754,6 +756,7 @@ pub struct PreparedHistoryMutation {
     cancel: CancellationToken,
     owner_cancel: Option<CancellationToken>,
     owner_sealed: Option<CancellationToken>,
+    session: Option<crate::budget::SessionFence>,
     policy: Arc<RwLock<PolicyVersion>>,
     generation: Arc<()>,
     _lease: Option<Arc<crate::service::WorkLease>>,
@@ -779,6 +782,12 @@ impl PreparedHistoryMutation {
                 .is_some_and(CancellationToken::is_cancelled)
         {
             Some(HistoryWriteRejection::Cancelled)
+        } else if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.check().is_err())
+        {
+            Some(HistoryWriteRejection::Forbidden)
         } else {
             None
         }
