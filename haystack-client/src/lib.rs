@@ -27,9 +27,13 @@
 //! # }
 //! ```
 //!
+//! Read-only Xeto 5 metadata and exact library downloads use the separate
+//! [`repository::RepositoryClient`]. Downloaded artifacts remain inert until a
+//! caller separately validates, admits and activates their source.
+//!
 //! ## Error Handling
 //!
-//! All operations return `Result<_, ClientError>`. See [`ClientError`] for the
+//! H4 client operations return `Result<_, ClientError>`. See [`ClientError`] for the
 //! error variants covering authentication, transport, codec, and timeout failures.
 
 pub mod auth;
@@ -39,6 +43,7 @@ pub mod entity;
 pub mod error;
 pub mod history;
 pub mod history_mutation;
+pub mod repository;
 pub mod subscription;
 pub mod tls;
 pub mod transport;

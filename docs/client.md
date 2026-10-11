@@ -354,3 +354,9 @@ automatic resubmission. First-party HTTP clients disable retries/redirects and
 bound the complete response body. The legacy `his_write` helper supplies no
 operation control and fails closed on scoped servers. See
 [history mutation contracts](history-mutations.md).
+
+## Xeto repository downloads
+
+The separate [`RepositoryClient`](repository-client.md) supports read-only metadata,
+version discovery, and exact bounded library downloads. Downloaded bytes and digest
+provenance remain inert until a caller separately validates and admits their source.
