@@ -60,6 +60,7 @@ fn selected_system_functions_and_complete_keyed_timezone_are_admitted() {
             "ph.api::hisRead",
             "ph.api::hisWrite",
             "ph.api::nav",
+            "ph.api::pointWrite",
             "ph.api::watchPoll",
             "ph.api::watchSub",
             "ph.api::watchUnsub",

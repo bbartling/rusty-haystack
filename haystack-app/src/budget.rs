@@ -70,6 +70,8 @@ pub(crate) struct Budget {
     pub activation_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Typed history stages retain the observation used for binding. Native
     /// history calls have no catalog pin; their existing GraphState rules apply.
+    pub command_disclosure: Option<Arc<dyn Fn() -> Result<(), crate::ApiError> + Send + Sync>>,
+    pub command_attempt: Option<crate::CommandAttempt>,
     pub typed_catalog: Option<Arc<haystack_core::xeto::catalog::ActivatedCatalog>>,
     pub limits: Arc<ReadLimits>,
     pub deadline: Instant,
@@ -100,6 +102,8 @@ impl Budget {
             typed_lookup_hook: None,
             #[cfg(test)]
             activation_commit_hook: None,
+            command_disclosure: None,
+            command_attempt: None,
             typed_catalog: None,
             limits,
             deadline,

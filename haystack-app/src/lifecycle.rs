@@ -159,6 +159,7 @@ impl ApplicationBuilder {
                     history: Arc::new(Mutex::new(None)),
                     history_mutations: Arc::new(Mutex::new(None)),
                     subscriptions: Arc::new(Mutex::new(None)),
+                    commands: Arc::new(Mutex::new(None)),
                 },
                 resources: vec![],
                 history_resource: None,
@@ -203,6 +204,23 @@ impl ApplicationBuilder {
         let mut selected = app.mutations.lock();
         if selected.is_some() {
             return Err(ReadError::InvalidQuery("mutation service already selected"));
+        }
+        *selected = Some(service);
+        drop(selected);
+        Ok(self)
+    }
+    /// Select one local simulator and transfer its bounded expiry work to this owner.
+    pub fn simulated_commands(
+        self,
+        service: crate::SimulatedCommandService,
+    ) -> Result<Self, ReadError> {
+        let app = &self.parts.as_ref().expect("unconsumed builder").application;
+        if !service.read_service().same_service(&app.reads) {
+            return Err(ReadError::Forbidden);
+        }
+        let mut selected = app.commands.lock();
+        if selected.is_some() {
+            return Err(ReadError::InvalidQuery("simulator already selected"));
         }
         *selected = Some(service);
         drop(selected);
@@ -311,6 +329,9 @@ impl ApplicationBuilder {
         }
         let mut parts = self.parts.take().expect("unconsumed builder");
         parts.application.reads.start_system_clock();
+        if let Some(commands) = parts.application.command_service() {
+            parts.resources.insert(0, Box::new(commands.resource()));
+        }
         if let Some(subscriptions) = parts.application.subscription_service() {
             parts
                 .resources
@@ -376,8 +397,12 @@ pub struct ApplicationHandle {
     history: Arc<Mutex<Option<HistoryService>>>,
     history_mutations: Arc<Mutex<Option<crate::HistoryMutationService>>>,
     subscriptions: Arc<Mutex<Option<crate::StateSubscriptionService>>>,
+    commands: Arc<Mutex<Option<crate::SimulatedCommandService>>>,
 }
 impl ApplicationHandle {
+    pub fn command_service(&self) -> Option<crate::SimulatedCommandService> {
+        self.commands.lock().clone()
+    }
     pub fn subscription_service(&self) -> Option<crate::StateSubscriptionService> {
         self.subscriptions.lock().clone()
     }

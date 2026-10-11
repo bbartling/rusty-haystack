@@ -30,6 +30,7 @@ pub struct AppState {
     /// SCRAM authentication manager.
     pub auth: AuthManager,
     /// One application owner shared by HTTP and every WebSocket attachment.
+    pub command_service: Option<haystack_app::SimulatedCommandService>,
     pub subscription_service: Option<haystack_app::StateSubscriptionService>,
     /// Action dispatch registry for the `invokeAction` op.
     pub actions: ActionRegistry,

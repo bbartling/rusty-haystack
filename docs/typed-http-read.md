@@ -6,7 +6,7 @@ and qualified `/api/` name. Select version 5 to use typed dispatch on names
 shared with legacy H4 routes, or use the qualified name explicitly. The tenth
 binding, [`ph.api::nav`](#navigation), is served only at `/api/ph.api::nav`:
 `/api/nav` remains the scoped H4 navigation route for every version.
-The fifteen production handlers (including the selected history and watch functions below) are a fixed application inventory; routes derive
+The sixteen production handlers (including the selected history, watch, and local command functions below) are a fixed application inventory; routes derive
 from it, never from a parsed catalog. Their admitted signatures, codec contexts,
 selected library versions and source provenance come from the graph's current
 `ActivatedCatalog` observation. Binding rejects duplicate qname/version bindings
@@ -17,12 +17,12 @@ discovery, argument decoding/defaults/fitting, metadata and result encoding; it
 verifies that observation is still current before any graph evaluation and
 otherwise fails with `UnavailableErr`. An owned result already produced may
 encode with its retained context. `ReadService::typed_functions()` returns an
-owned retained view of the bindings that need only that read service. History and watch availability is selected per invocation from the exact owned services; watches additionally require a scoped session. The bootstrap profile and its
+owned retained view of the bindings that need only that read service. History, watch, and command availability is selected per invocation from the exact owned services; watches and commands additionally require a scoped session. The bootstrap profile and its
 expanded HTTP closure remain explicit subsets of `sys` and `sys.api`; the HTTP
-closure also admits `ph.api` as a partial library identity holding `nav`, `watchSub`, `watchUnsub`, `watchPoll`, `hisRead` and `hisWrite`,
+closure also admits `ph.api` as a partial library identity holding `nav`, `watchSub`, `watchUnsub`, `watchPoll`, `hisRead`, `hisWrite`, and `pointWrite`,
 with `ph` and `sys.refs` as dependency-only identities. None claims complete
 library admission. Because the managed namespace is derived from the admitted
-selection, scoped H4 `specs`/`spec` reads list those six declarations and typed `libs`
+selection, scoped H4 `specs`/`spec` reads list those seven declarations and typed `libs`
 lists `ph.api`; H4 `libs` (definition libraries) is unchanged. The shared
 [contextual Jeto codec](jeto.md) handles admitted native values.
 
@@ -181,7 +181,7 @@ cannot preserve.
 `noSideEffects:Marker?` are optional. Signatures are descriptive, not a client
 schema. Empty grids fit, while wrong native kinds, missing required row fields
 and incorrectly typed optional fields fail fitting. Structural row specifications
-remain compatible with contextual Jeto. The production entries are the fifteen functions listed above, subject to caller policy and owned service selection.
+remain compatible with contextual Jeto. The production entries are the sixteen functions listed above, subject to caller policy and owned service selection.
 
 A null, missing or denied id is indistinguishable: `checked=false` returns null;
 `checked=true` produces the same UnknownEntity error for both. Version-4
@@ -302,8 +302,8 @@ existence oracle; version 4 receives an ordinary empty grid, not an error grid.
 Truncation applies to rows only; the request budgets still bind, and any
 budget failure is one atomic `InvalidArgsErr` with no partial rows. The root
 scans every entity in id order at one candidate each, from what remains of
-`max_candidates` after function resolution spends one per fixed binding (fifteen
-today, so 9,985 entities at the default 10,000), but copies a record through
+`max_candidates` after function resolution spends one per fixed binding (sixteen
+today, so 9,984 entities at the default 10,000), but copies a record through
 the masked View only when its raw form has `site` and the policy allows the
 entity and its `site` tag. Masking
 only removes tags, so this skip changes no result; it keeps non-site records
@@ -334,7 +334,7 @@ Result fitting precedes encoding. Exact Jeto output boxes the `id` Ref, so
 version 4 bridge needs no legacy projection: native Grid results now keep their
 own metadata through the H4 grid bridge, so nav's `complete` marker reaches
 H4 clients, while the bridge grid synthesized for Dict, null and None results
-still omits it. `pointWrite` from the same pinned file remains unadmitted and unbound.
+still omits it. The selected `pointWrite` binding is described below.
 
 ## Single-point history (M2-PR10)
 
@@ -543,3 +543,105 @@ Local fixtures cover HTTP dispatch, membership/fence behavior, masking and exact
 sessions, terminal recovery, bounded owner storage, and prepublication failures.
 The pinned Xeto and Haxall sources are contract evidence; no upstream server was
 executed, and full H5 conformance or durable watch recovery is not claimed.
+
+
+## Local point command simulation (M2-PR12)
+
+The pinned `ph.api::pointWrite` declaration has required `id: Ref` and nullable
+`level: Number?`, `val: Obj?`, `who: Str?`, and `duration: Number?`, returning
+`Grid`. It has `op`, with neither `opGrid` nor `noSideEffects`: every action,
+including inspection, requires POST. Qualified routes support versions 4 and 5;
+the simple `/api/pointWrite` alias selects this typed path with version 5.
+The legacy unqualified version-4 route keeps its existing behavior.
+
+An application explicitly constructs `SimulatedCommandService` from its exact
+`ReadService`, an independent `CommandPolicy`, a mode, and `CommandLimits`, then
+selects it with `ApplicationBuilder::simulated_commands`. Duplicate selection
+and a foreign read-service owner are rejected. No selection hides the binding
+from invocation/discovery. `InspectOnly` selection permits inspection and rejects
+mutation with `NotImplementedErr`; writable selection is an explicit opt-in.
+The simulator has one owned expiry task, initialized before listeners and joined
+at owner shutdown. It never writes graph `curVal` or talks to equipment.
+
+Native callers use `CommandRequest::inspect`, `set`, or `relinquish` and
+`SimulatedCommandService::submit` with their `ReadContext` and exact scoped
+`SubscriptionSession`. Native outcomes distinguish `Inspection`, `Accepted`,
+`Rejected`, and `Unknown`. HTTP likewise requires an authenticated scoped session;
+an anonymous transport cannot mint simulator authority. Trusted embeddings may
+explicitly construct a trusted scoped session. Transport `read` is required for
+inspection and transport `write` for set/relinquish, independently. Command
+policy authorizes the action and point; read policy independently controls
+function/catalog visibility, point/schema visibility, and result disclosure.
+A denied point has the same terminal envelope as a missing point.
+
+Omitted/null level means inspect. Otherwise level must be a finite, unitless,
+integral Number in 1–17. Omitted/null value relinquishes that explicit level;
+a nonnull value sets it. Writable points must carry `point` and `writable`
+markers and kind `Bool`, `Number`, or `Str`. Values must match that kind. In Jeto,
+bare numeric `val` remains Int/Float because its parameter type is Obj, and is
+rejected for a Number point; supply a boxed `sys::Number`. Bare booleans and
+strings already retain their types. Numeric values must be finite. A unitless
+Number inherits the point unit, which is stored explicitly; a supplied unit must
+have the same known unit identity (aliases are accepted, conversion between
+different units is not). Zinc arguments use exactly one complete row; extra rows,
+cells, or scalar suffixes are rejected before dispatch.
+
+There are 17 slots. First nonnull value in ascending priority wins; level 17
+starts with the validated `writeDef`, or null. All slots null means effective
+null at level 17. Accepted writes return an empty Grid. Inspection returns 17
+rows and the `level`, `levelDis`, `val`, and `who` columns. Null cells use the
+codec's normal missing-cell representation. `who` is caller-supplied attribution,
+never authorization; its local default is the trusted principal subject. It
+records the last controller independently of the slot value: explicit
+relinquishment records the relinquishing caller's attribution, and automatic
+expiry retains the previous attribution. Retained attribution counts toward
+the store's byte limit even when the slot value is null.
+Inspection masks all four fields through current tag policy, keeping the four
+column names. No effective-value, expiry, or other metadata bypasses that masking.
+
+Duration is accepted only for a nonnull level-8 set. It must be a finite positive
+Number with a known time unit, checked conversion to a nonzero duration, and the
+configured upper bound. Nanosecond through year units are recognized; the pinned
+reference's month/year conventions are 30 and 365 days, respectively. Unitless
+or unrelated units fail. Replacing or renewing a slot resets its deadline;
+relinquishment or an untimed replacement removes it. One monotonic clock drives
+both acceptance and expiry. `SimulatorClock::manual` is a trusted local fixture
+handle with checked advancement; there is no HTTP clock control. Expiry runs at
+or after the deadline, and inspection also applies due expiries. Expiry selection
+and clearing share a lock, so an old expiry cannot clear a replacement. Session
+revocation does not undo an accepted command or stop its expiry.
+
+Local defaults bound selection to 128 points, 32 pending operations, 16 MiB of
+retained state, 4096-byte values/IDs, 256-byte attribution, one-hour overrides,
+and a 100 ms maintenance interval. Validated configuration ceilings are 4096
+points, 1024 pending operations, 512 MiB retained, 65536-byte values, 1024-byte
+attribution, 24-hour overrides, and a one-second maintenance interval. These are
+simulator restrictions, not upstream conformance claims. Retained schema and
+identity are conservative: incompatible kind/unit/writeDef or point/writable
+changes, delete/recreate, graph/catalog replacement, or lost changelog continuity
+reject subsequent commands until a fresh simulator selection. Intervening schema
+changes remain disqualifying even if later restored. Accepted slots are retained;
+rejection does not claim they were undone. Pending requests also fence changed
+catalog, schema, graph identity and authorization before dispatch. After any
+store wait or failed graph acquisition, the worker refreshes both immutable
+policy snapshots against the original command and read scopes, including the
+typed binding scope. The final store and graph acquisitions never wait, and
+policy callbacks run outside both guards. This follows the policy providers'
+versioned immutable-snapshot contract; it does not provide an atomic revocation
+transaction across independently managed external policy providers.
+
+A request-local atomic fence separates preparation, dispatch, and abandonment.
+Before possible dispatch, cancellation, deadline, shutdown, or validation failure
+is a rejection and wins against any later dispatch. After dispatch, loss of an
+acknowledgment, worker panic, deadline, cancellation, encoding failure, or lost
+disclosure authority is `Unknown`; HTTP uses pinned `sys.api::TimeoutErr` status
+504 with `dis: "Command outcome unknown"`. That classification survives the
+blocking worker, typed invocation, final response check, and outer owner-stop
+middleware. The original request permit and owner work registration stay with
+queued/running work through actual exit. Owned socket shutdown may close a connection before its final error envelope;
+that missing acknowledgment also remains unknown. After headers, failed body
+disclosure terminates the stream without protected values; the transport outcome
+is unknown.
+There is no client operation ID, receipt, automatic retry, reconciliation, or
+claim of rollback. Even `Accepted` confirms only in-process simulator state,
+never physical effect, durability, upstream runtime behavior, or full H5 support.

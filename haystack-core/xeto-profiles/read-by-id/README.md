@@ -134,9 +134,9 @@ transport policy separately from core admission.
 
 ## Selected navigation function (M2-PR05)
 
-Both `http-manifest.json` and `protocol-manifest.json` select navigation, three watch, and two history declarations
+Both `http-manifest.json` and `protocol-manifest.json` select navigation, three watch, two history, and pointWrite declarations
 from the unchanged `src/xeto/ph.api/funcs.xeto` (230 lines, SHA-256
-`15a30e0c…3c1b`), lines 1-114 and 151-229 (including history documentation and the closing brace):
+`15a30e0c…3c1b`), lines 1-229 (including every selected function and the closing brace):
 
 ```xeto
 +Funcs {
@@ -146,15 +146,16 @@ from the unchanged `src/xeto/ph.api/funcs.xeto` (230 lines, SHA-256
   watchPoll: Func <op> { watchId: Str, refresh: Marker?, curValSub: Marker?, returns: Grid }
   hisRead: Func <op, opGrid, noSideEffects> { req: Grid, returns: Grid }
   hisWrite: Func <op, opGrid> { req: Grid, returns: Grid }
+  pointWrite: Func <op> { id: Ref, level: Number?, val: Obj?, who: Str?, duration: Number?, returns: Grid }
 }
 ```
 
-The manifest entry names all six selected declarations.
-Admission requires the parsed `+Funcs` members to equal it exactly, so
-`pointWrite` from the same file stays unadmitted and unadvertised. The declaring
+The manifest entry names all seven selected declarations.
+Admission requires the parsed `+Funcs` members to equal it exactly. Execution of
+`pointWrite` additionally requires the explicitly selected local simulator. The declaring
 `ph.api/lib.xeto` (SHA-256 `061cb812…9b21`) is admitted as a **partial library
 identity**: its library view reports `complete: false`, version `5.0.0`,
-dependencies `sys`, `sys.api` and `ph`, and the six selected declarations shown above. In the HTTP closure `ph` and its own `sys.refs` dependency are
+dependencies `sys`, `sys.api` and `ph`, and the seven selected declarations shown above. In the HTTP closure `ph` and its own `sys.refs` dependency are
 dependency-only identities (verified bytes, no declarations, not advertised);
 the protocol closure already admits `ph` as a library.
 

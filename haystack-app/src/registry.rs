@@ -29,6 +29,7 @@ pub(crate) const BINDINGS: &[(&str, Handler)] = &[
     ("ph.api::nav", Handler::Nav),
     ("ph.api::hisRead", Handler::HisRead),
     ("ph.api::hisWrite", Handler::HisWrite),
+    ("ph.api::pointWrite", Handler::PointWrite),
     ("ph.api::watchSub", Handler::WatchSub),
     ("ph.api::watchUnsub", Handler::WatchUnsub),
     ("ph.api::watchPoll", Handler::WatchPoll),
@@ -69,6 +70,7 @@ pub(crate) enum Handler {
     Nav,
     HisRead,
     HisWrite,
+    PointWrite,
     WatchSub,
     WatchUnsub,
     WatchPoll,
@@ -78,12 +80,14 @@ pub(crate) struct Selection {
     pub history: bool,
     pub history_mutations: bool,
     pub watches: bool,
+    pub commands: bool,
 }
 impl Selection {
     fn permits(self, handler: Handler) -> bool {
         match handler {
             Handler::HisRead => self.history,
             Handler::HisWrite => self.history_mutations,
+            Handler::PointWrite => self.commands,
             Handler::WatchSub | Handler::WatchUnsub | Handler::WatchPoll => self.watches,
             _ => true,
         }
@@ -117,7 +121,8 @@ impl Entry {
     fn visible(&self, policy: &dyn PolicySnapshot, selection: Selection) -> bool {
         selection.permits(self.handler)
             && self.op
-            && (self.handler == Handler::HisWrite || policy.operation(ReadOperation::Read))
+            && (matches!(self.handler, Handler::HisWrite | Handler::PointWrite)
+                || policy.operation(ReadOperation::Read))
             && self
                 .handler
                 .operation()
@@ -531,6 +536,19 @@ fn validate_binding(declaration: &AdmittedSpec, handler: Handler) -> Result<(), 
                         ("returns", "sys::Grid", false, false, None),
                     ])
             }
+            Handler::PointWrite => {
+                declaration.spec.qname == "ph.api::pointWrite"
+                    && !declaration.spec.meta.contains_key("opGrid")
+                    && !declaration.spec.meta.contains_key("noSideEffects")
+                    && shape(&[
+                        ("id", "sys::Ref", false, false, None),
+                        ("level", "sys::Number", true, false, None),
+                        ("val", "sys::Obj", true, false, None),
+                        ("who", "sys::Str", true, false, None),
+                        ("duration", "sys::Number", true, false, None),
+                        ("returns", "sys::Grid", false, false, None),
+                    ])
+            }
             Handler::WatchPoll => {
                 declaration.spec.qname == "ph.api::watchPoll"
                     && !declaration.spec.meta.contains_key("opGrid")
@@ -812,7 +830,7 @@ mod tests {
         let read_all = catalog.declaration("sys.api::readAll").unwrap();
         assert!(validate_binding(read_all, Handler::Nav).is_err());
         // The tenth fixed binding is discoverable, GET-capable and whole-grid.
-        assert_eq!(BINDINGS.len(), 15);
+        assert_eq!(BINDINGS.len(), 16);
         assert!(
             crate::ReadService::supported_functions().any(|pair| pair == ("nav", "ph.api::nav"))
         );

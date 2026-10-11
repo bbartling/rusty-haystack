@@ -25,6 +25,7 @@ pub(crate) fn selected(request: &Request<Body>) -> bool {
             | "/api/close"
             | "/api/hisRead"
             | "/api/hisWrite"
+            | "/api/pointWrite"
             | "/api/watchSub"
             | "/api/watchUnsub"
             | "/api/watchPoll"
@@ -195,7 +196,11 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
             } else {
                 "read"
             };
-        if !AuthManager::check_permission(&user, permission) {
+        let command =
+            wire_equal(operation, b"pointWrite") || wire_equal(operation, b"ph.api::pointWrite");
+        if !(AuthManager::check_permission(&user, permission)
+            || (command && AuthManager::check_permission(&user, "write")))
+        {
             return Err(ApiError::Permission);
         }
         let can_write_history = AuthManager::check_permission(&user, "write");
@@ -257,6 +262,11 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
             body: Vec::new(),
         }
     };
+    let command_attempt = request
+        .extensions()
+        .get::<haystack_app::CommandAttempt>()
+        .cloned()
+        .ok_or(ApiError::Unavailable)?;
     let mut stream = request.into_body().into_data_stream();
     loop {
         let chunk = tokio::select! {
@@ -286,7 +296,7 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
         input.body.extend_from_slice(&chunk);
     }
     let response = admission
-        .invoke_wire_with_services(
+        .invoke_wire_with_commands(
             input,
             state.history_service.clone(),
             // Discovery and invocation share the authenticated transport's
@@ -298,6 +308,8 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
                 None
             },
             state.subscription_service.clone(),
+            state.command_service.clone(),
+            command_attempt,
         )
         .await?;
     response.disclosure.check()?;

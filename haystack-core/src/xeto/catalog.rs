@@ -36,7 +36,7 @@ const PROTOCOL_MANIFEST: &str =
 /// The selected `ph.api` navigation closure shared by the HTTP and protocol
 /// profiles: its library metadata, the dependency-only `ph`/`sys.refs`
 /// identities it requires, and the unchanged function source. Navigation, typed watches and single-point history are
-/// selected from that file; pointWrite stays unadmitted.
+/// selected from that file, including local pointWrite simulation.
 const NAV_RAW: &[(&str, &str)] = &[
     (
         "src/xeto/ph/lib.xeto",
@@ -64,6 +64,7 @@ const PH_API_FUNCTIONS: &[&str] = &[
     "watchPoll",
     "hisRead",
     "hisWrite",
+    "pointWrite",
 ];
 const PROTOCOL_RAW: &[(&str, &str)] = &[
     (
@@ -1751,6 +1752,7 @@ fn validate_closure(
                 &["req", "returns"]
             }
             "ph.api::watchPoll" if http => &["watchId", "refresh", "curValSub", "returns"],
+            "ph.api::pointWrite" if http => &["id", "level", "val", "who", "duration", "returns"],
             "sys.api::read" if http => &["filter", "checked", "returns"],
             "sys.api::readAll" if http => &["filter", "opts", "returns"],
             "sys.api::AboutInfo" if http => &[
@@ -2516,7 +2518,7 @@ mod tests {
 
     #[test]
     fn ph_api_selection_is_exact_and_excludes_other_functions() {
-        // The retained selection admits exactly navigation, watches and history.
+        // The retained selection admits navigation, watches, history and pointWrite.
         let nav = nav_altered("nav:", "nav:").unwrap();
         let declaration = nav.declaration("ph.api::nav").unwrap();
         assert_eq!(
@@ -2527,10 +2529,11 @@ mod tests {
                 "ph.api::watchUnsub",
                 "ph.api::watchPoll",
                 "ph.api::hisRead",
-                "ph.api::hisWrite"
+                "ph.api::hisWrite",
+                "ph.api::pointWrite"
             ]
         );
-        assert!(nav.declaration("ph.api::pointWrite").is_none());
+        assert!(nav.declaration("ph.api::pointWrite").is_some());
         // A renamed or additional member no longer matches the manifest
         // selection, even when that member exists upstream.
         for (before, after) in [
