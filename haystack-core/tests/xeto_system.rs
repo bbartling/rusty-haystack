@@ -56,6 +56,9 @@ fn selected_system_functions_and_complete_keyed_timezone_are_admitted() {
             .map(|s| s.spec.qname.as_str())
             .collect::<Vec<_>>(),
         [
+            // Selected from ph.api/funcs.xeto:199,227; see xeto_history.rs.
+            "ph.api::hisRead",
+            "ph.api::hisWrite",
             "ph.api::nav",
             "sys.api::about",
             "sys.api::close",

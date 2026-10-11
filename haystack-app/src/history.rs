@@ -155,6 +155,22 @@ impl HistoryService {
         request: HistoryReadRequest,
         wire: bool,
     ) -> Result<HistoryReadSession, ReadError> {
+        self.open_collector(admission, request, wire, false).await
+    }
+    pub(crate) async fn open_typed(
+        &self,
+        admission: ReadAdmission,
+        request: HistoryReadRequest,
+    ) -> Result<HistoryReadSession, ReadError> {
+        self.open_collector(admission, request, true, true).await
+    }
+    async fn open_collector(
+        &self,
+        admission: ReadAdmission,
+        request: HistoryReadRequest,
+        wire: bool,
+        typed: bool,
+    ) -> Result<HistoryReadSession, ReadError> {
         if !admission.belongs_to(&self.reads) {
             return Err(ReadError::Forbidden);
         }
@@ -216,7 +232,9 @@ impl HistoryService {
         let service = self.clone();
         runtime.spawn(async move {
             service
-                .coordinate(principal, request, budget, receiver, terminal, ready, wire)
+                .coordinate(
+                    principal, request, budget, receiver, terminal, ready, wire, typed,
+                )
                 .await;
             // Only actual provider/session completion releases these leases.
             drop(lease);
@@ -231,6 +249,7 @@ impl HistoryService {
             done: done_rx,
             cancel,
             pending: None,
+            cancel_on_drop: true,
         })
     }
     /// One bounded H4 collector. Decode and encoding keep the original work
@@ -336,6 +355,7 @@ impl HistoryService {
         terminal_tx: watch::Sender<Option<HistoryTerminal>>,
         ready: oneshot::Sender<Result<HistoryMetadata, ReadError>>,
         wire: bool,
+        typed: bool,
     ) {
         let observation = self.observe(&principal, &request.id, &mut budget).await;
         let (schema, graph, scope) = match observation {
@@ -349,6 +369,18 @@ impl HistoryService {
             let _ = ready.send(Err(error));
             return;
         }
+        // H4 construction is already covered by source reservations. Typed
+        // fitting/encoding is additionally metered, so protect a separate
+        // share of the remaining cumulative allowance before source pulls.
+        // No counters are reset or refunded; the final stage spends this
+        // headroom through the same Budget. Source row reservations (32x work,
+        // 64x storage) make the equal-sized encoder share conservative for the
+        // admitted scalar-only history shape, including boxed values.
+        let headroom = if typed {
+            (budget.work_remaining() / 2, budget.retained_remaining() / 2)
+        } else {
+            (0, 0)
+        };
         let now = self.clock.now();
         let (start, end) = match parse_range(&request.range, &schema.timezone, now) {
             Ok(value) => value,
@@ -357,7 +389,7 @@ impl HistoryService {
                 return;
             }
         };
-        let pull_budget = self.pull_budget(&budget, 0, 0, 0, wire);
+        let pull_budget = self.pull_budget(&budget, 0, 0, 0, wire, headroom);
         let mut open = self
             .provider
             .open(request.id.clone(), start.dt, end.dt, pull_budget);
@@ -424,7 +456,7 @@ impl HistoryService {
                 finish(reply, &terminal_tx, vec![], terminal);
                 break;
             }
-            let pull_budget = self.pull_budget(&budget, rows, bytes, work, wire);
+            let pull_budget = self.pull_budget(&budget, rows, bytes, work, wire, headroom);
             let limited = if pull_budget.max_rows == 0 {
                 Some(HistoryReason::Rows)
             } else if pull_budget.max_bytes == 0 {
@@ -652,6 +684,7 @@ impl HistoryService {
         bytes: usize,
         work: usize,
         wire: bool,
+        headroom: (usize, usize),
     ) -> HistoryPullBudget {
         HistoryPullBudget {
             max_rows: self.limits.batch_rows.min(
@@ -669,13 +702,19 @@ impl HistoryService {
                         .min(budget.limits.max_output_bytes.saturating_sub(128 * 1024) / 6)
                         .saturating_sub(bytes),
                 )
-                .min(budget.retained_remaining() / if wire { WIRE_SAMPLE_RETAINED } else { 1 }),
+                .min(
+                    budget.retained_remaining().saturating_sub(headroom.1)
+                        / if wire { WIRE_SAMPLE_RETAINED } else { 1 },
+                ),
             max_work: self
                 .limits
                 .total_work
                 .min(budget.limits.max_work)
                 .saturating_sub(work)
-                .min(budget.work_remaining() / if wire { WIRE_SAMPLE_WORK } else { 1 }),
+                .min(
+                    budget.work_remaining().saturating_sub(headroom.0)
+                        / if wire { WIRE_SAMPLE_WORK } else { 1 },
+                ),
             deadline: budget.deadline,
             cancellation: budget.cancel.clone(),
         }
@@ -705,6 +744,7 @@ impl HistoryService {
                 }
             }
             if let Some(result) = graph.read_for(std::time::Duration::ZERO, |graph| {
+                budget.check_catalog(graph)?;
                 let row = graph.get(id).ok_or(ReadError::Unavailable)?;
                 let schema = crate::history_admission::schema(row, budget)?;
                 Ok((
@@ -930,6 +970,7 @@ pub struct HistoryReadSession {
     done: watch::Receiver<bool>,
     cancel: CancellationToken,
     pending: Option<oneshot::Receiver<HistoryBatch>>,
+    cancel_on_drop: bool,
 }
 impl HistoryReadSession {
     /// Exactly one requested batch, with no speculative fetch. `&mut self`
@@ -976,10 +1017,17 @@ impl HistoryReadSession {
             }
         }
     }
+    /// A terminal collection has finished provider work. Preserve the original
+    /// request token for a subsequent typed encoding/disclosure stage.
+    pub(crate) fn release_completed(&mut self) {
+        if self.terminal.borrow().is_some() {
+            self.cancel_on_drop = false;
+        }
+    }
     pub async fn collect(mut self) -> Result<HistoryReadResult, ReadError> {
         self.collect_borrowed().await
     }
-    async fn collect_borrowed(&mut self) -> Result<HistoryReadResult, ReadError> {
+    pub(crate) async fn collect_borrowed(&mut self) -> Result<HistoryReadResult, ReadError> {
         let mut samples = Vec::new();
         loop {
             let mut batch = self.next().await;
@@ -996,6 +1044,8 @@ impl HistoryReadSession {
 }
 impl Drop for HistoryReadSession {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        if self.cancel_on_drop {
+            self.cancel.cancel();
+        }
     }
 }

@@ -18,7 +18,13 @@ pub(crate) fn selected(request: &Request<Body>) -> bool {
     let path = request.uri().path();
     if matches!(
         path,
-        "/api/ops" | "/api/about" | "/api/read" | "/api/libs" | "/api/close"
+        "/api/ops"
+            | "/api/about"
+            | "/api/read"
+            | "/api/libs"
+            | "/api/close"
+            | "/api/hisRead"
+            | "/api/hisWrite"
     ) {
         return !legacy_selection(request);
     }
@@ -147,7 +153,7 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
         return Err(ApiError::InvalidArgs);
     }
     let v5 = v5_hint(&request);
-    let (principal, session) = if state.auth.is_enabled() {
+    let (principal, session, can_write_history) = if state.auth.is_enabled() {
         let mut headers = request.headers().get_all(header::AUTHORIZATION).iter();
         let first = headers.next();
         let malformed = if v5 {
@@ -176,15 +182,27 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
         } else {
             ApiError::AuthRequired
         })?;
-        if !AuthManager::check_permission(&user, "read") {
+        // History publication is the first typed write binding. Read/write
+        // permissions are independent; function and mutation authorization
+        // still follow resolution under the admitted request budget.
+        let operation = request.uri().path().strip_prefix("/api/").unwrap_or("");
+        let permission =
+            if wire_equal(operation, b"hisWrite") || wire_equal(operation, b"ph.api::hisWrite") {
+                "write"
+            } else {
+                "read"
+            };
+        if !AuthManager::check_permission(&user, permission) {
             return Err(ApiError::Permission);
         }
+        let can_write_history = AuthManager::check_permission(&user, "write");
         (
             Principal::authenticated(user.username, user.permissions),
             Some(session),
+            can_write_history,
         )
     } else {
-        (Principal::Anonymous, None)
+        (Principal::Anonymous, None, true)
     };
     let context = ReadContext::new(
         principal,
@@ -264,7 +282,20 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
         }
         input.body.extend_from_slice(&chunk);
     }
-    let response = admission.invoke_wire(input).await?;
+    let response = admission
+        .invoke_wire_with_history(
+            input,
+            state.history_service.clone(),
+            // Discovery and invocation share the authenticated transport's
+            // effective write permission. Trusted anonymous embeddings retain
+            // their selected service and its application mutation policy.
+            if can_write_history {
+                state.history_mutation_service.clone()
+            } else {
+                None
+            },
+        )
+        .await?;
     response.disclosure.check()?;
     let gzip = response.gzip;
     let body = Body::from_stream(futures_util::stream::once(async move {

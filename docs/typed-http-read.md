@@ -6,7 +6,7 @@ and qualified `/api/` name. Select version 5 to use typed dispatch on names
 shared with legacy H4 routes, or use the qualified name explicitly. The tenth
 binding, [`ph.api::nav`](#navigation), is served only at `/api/ph.api::nav`:
 `/api/nav` remains the scoped H4 navigation route for every version.
-The ten production handlers are a fixed application inventory; routes derive
+The twelve production handlers (including the two selected history functions below) are a fixed application inventory; routes derive
 from it, never from a parsed catalog. Their admitted signatures, codec contexts,
 selected library versions and source provenance come from the graph's current
 `ActivatedCatalog` observation. Binding rejects duplicate qname/version bindings
@@ -17,12 +17,12 @@ discovery, argument decoding/defaults/fitting, metadata and result encoding; it
 verifies that observation is still current before any graph evaluation and
 otherwise fails with `UnavailableErr`. An owned result already produced may
 encode with its retained context. `ReadService::typed_functions()` returns an
-owned retained view of the current bindings. The bootstrap profile and its
+owned retained view of the bindings that need only that read service. History availability is selected per invocation from the exact owned services. The bootstrap profile and its
 expanded HTTP closure remain explicit subsets of `sys` and `sys.api`; the HTTP
-closure also admits `ph.api` as a partial library identity holding only `nav`,
+closure also admits `ph.api` as a partial library identity holding `nav`, `hisRead` and `hisWrite`,
 with `ph` and `sys.refs` as dependency-only identities. None claims complete
 library admission. Because the managed namespace is derived from the admitted
-selection, scoped H4 `specs`/`spec` reads now list `ph.api::nav` and typed `libs`
+selection, scoped H4 `specs`/`spec` reads list those three declarations and typed `libs`
 lists `ph.api`; H4 `libs` (definition libraries) is unchanged. The shared
 [contextual Jeto codec](jeto.md) handles admitted native values.
 
@@ -128,7 +128,7 @@ bare `application/json` as Hayson; version 5 interprets it as Jeto.
 version. `text/zinc` accepts grid arguments. `text/jeto` is accepted in version 5.
 Grid input uses only the first row's declared arguments; null cells apply the
 parameter's own default just as absent cells do. The exception is an `opGrid`
-function (`ph.api::nav`), whose grid body binds whole as its single Grid
+functions (`ph.api::nav`, `ph.api::hisRead`, `ph.api::hisWrite`), whose grid body binds whole as its single Grid
 parameter. `ops`, `about`, `close`, `libs`,
 and `filetypes` have zero arguments:
 undeclared names, including `returns`, are rejected before null-to-absence
@@ -180,7 +180,7 @@ cannot preserve.
 `noSideEffects:Marker?` are optional. Signatures are descriptive, not a client
 schema. Empty grids fit, while wrong native kinds, missing required row fields
 and incorrectly typed optional fields fail fitting. Structural row specifications
-remain compatible with contextual Jeto. The production entries are the ten functions listed above, subject to caller policy.
+remain compatible with contextual Jeto. The production entries are the twelve functions listed above, subject to caller policy and owned service selection.
 
 A null, missing or denied id is indistinguishable: `checked=false` returns null;
 `checked=true` produces the same UnknownEntity error for both. Version-4
@@ -192,8 +192,7 @@ AmbiguousFuncErr includes only bounded visible candidates.
 This bounded error path remains available after a request budget or deadline
 is exhausted. Unsupported methods, including HEAD, return 501. GET requires the
 exact `noSideEffects` marker on the executable entry; absence of a side-effects
-flag or read permission cannot grant GET. `close` requires POST; the other nine
-bindings carry the marker. The dispatcher rejects GET with
+flag or read permission cannot grant GET. `close` and `hisWrite` require POST; the other ten bindings carry the marker. The dispatcher rejects GET with
 `MethodNotAllowedErr` before executing a binding without that marker. No typed
 watchPoll binding is installed.
 
@@ -303,8 +302,8 @@ existence oracle; version 4 receives an ordinary empty grid, not an error grid.
 Truncation applies to rows only; the request budgets still bind, and any
 budget failure is one atomic `InvalidArgsErr` with no partial rows. The root
 scans every entity in id order at one candidate each, from what remains of
-`max_candidates` after function resolution spends one per fixed binding (ten
-today, so 9,990 entities at the default 10,000), but copies a record through
+`max_candidates` after function resolution spends one per fixed binding (twelve
+today, so 9,988 entities at the default 10,000), but copies a record through
 the masked View only when its raw form has `site` and the policy allows the
 entity and its `site` tag. Masking
 only removes tags, so this skip changes no result; it keeps non-site records
@@ -335,8 +334,70 @@ Result fitting precedes encoding. Exact Jeto output boxes the `id` Ref, so
 version 4 bridge needs no legacy projection: native Grid results now keep their
 own metadata through the H4 grid bridge, so nav's `complete` marker reaches
 H4 clients, while the bridge grid synthesized for Dict, null and None results
-still omits it. Watches, `pointWrite`, `hisRead` and `hisWrite` from the same
-pinned file are not admitted or bound.
+still omits it. Watches and `pointWrite` from the same pinned file are not admitted or bound.
+
+## Single-point history (M2-PR10)
+
+The pinned declarations are `ph.api::hisRead: Func <op, opGrid, noSideEffects>
+{ req: Grid, returns: Grid }` and `ph.api::hisWrite: Func <op, opGrid>
+{ req: Grid, returns: Grid }`. Qualified routes use typed dispatch; the simple
+`hisRead`/`hisWrite` routes select it with version 5 and retain their existing
+H4 behavior otherwise. Grid media binds the entire Grid as `req`. Named Jeto
+uses `{ "req": <Grid> }`; GET accepts a structured `req` for reads only.
+Discovery and resolution hide functions whose owned service is not selected.
+The mutation service must share the exact selected history provider and read
+admission. A parsed declaration cannot install a provider or authorize writes.
+
+Read requests contain one `id` Ref and `range` Str row. Unmarked requests return
+an ordinary timestamp/value Grid only when collection is `Complete`. A provider
+failure or incomplete plain read is an explicit error. The existing
+`bounded-history-v1` Str metadata control opts into results carrying actual
+coverage, returned samples, range, generation observations and terminal reason;
+a bounded partial result never masquerades as a complete page. The original
+absolute deadline, cancellation, session fence and cumulative budget cover
+transport, binding, provider pulls, fitting and encoding. Typed collectors
+retain the binding catalog observation through each stage and check it under
+the graph lock used for read observation or write schema preparation. Publication
+rechecks the prepared graph state and the exact session fence. A catalog change
+after publication is reconciled as uncertainty rather than a no-effect rejection.
+Typed collectors protect final encoder headroom before pulls; default limits can produce a
+`Limited` result before the configured 1,000-row maximum. This does not assert
+an atomic entity/history snapshot or completeness beyond retained history.
+
+Writes require the existing `history-write-v1` submit control in `historyWrite`
+Str metadata, an `id` Ref, and ordered `ts`/`val` samples. This is a project
+extension within the generic upstream Grid signature. The empty outcome Grid
+contains the same explicit committed/rejected/unknown control as scoped H4.
+No-control writes and multipoint shapes reject. Original duplicate order,
+number bits, unit and timestamp spelling are retained for intent binding;
+identical authorized retries resolve the retained outcome and changed intent
+conflicts. Last duplicate instant wins within one accepted point batch.
+
+History storage remains Bool/Number/Str plus NA. Null or missing values,
+Int/Float, None/Remove and richer values are not coerced. Supported structural
+column `of` context is checked before removing it for the existing strict
+history decoder: Ref/Str for read id/range, DateTime for ts, and
+Number/Bool/Str for val. Arbitrary column metadata and unsupported contexts
+reject. Reads convert valid explicit cross-zone range boundaries to the point
+zone and use an exclusive end; writes require exact point-zone spelling and
+valid historical offsets. Existing H4 admission restrictions still apply.
+
+Before submission the adapter reserves and encodes an identity-only Unknown
+fallback under the same budget. A later fitting, encoding or compression failure
+cannot imply that publication failed. Revoked/expired sessions still fail final
+disclosure, including the Unknown envelope; callers retain their submitted
+identity and use the existing reauthorized `hisReceipt` operation to reconcile.
+There is no `ph.api::hisReceipt`, automatic replay, multipoint transaction,
+equipment command, or disk/restart durability claim. See
+[history mutation receipts](history-mutations.md) for the retained authority and
+qualification boundaries.
+
+Authenticated typed reads require coarse `read` permission. Typed history
+writes require independent coarse `write` permission, even with
+`AllowAllHistoryMutations`; write-only users can invoke writes without acquiring
+read access. Per-function/catalog visibility and the selected mutation policy
+remain additional checks. Final response loss remains uncertainty for the
+caller regardless of a locally completed response.
 
 ## Authentication and ownership
 
