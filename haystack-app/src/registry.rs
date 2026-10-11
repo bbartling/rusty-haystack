@@ -29,6 +29,9 @@ pub(crate) const BINDINGS: &[(&str, Handler)] = &[
     ("ph.api::nav", Handler::Nav),
     ("ph.api::hisRead", Handler::HisRead),
     ("ph.api::hisWrite", Handler::HisWrite),
+    ("ph.api::watchSub", Handler::WatchSub),
+    ("ph.api::watchUnsub", Handler::WatchUnsub),
+    ("ph.api::watchPoll", Handler::WatchPoll),
 ];
 
 /// Stable identity supplied to the explicit per-function execution decision.
@@ -66,17 +69,22 @@ pub(crate) enum Handler {
     Nav,
     HisRead,
     HisWrite,
+    WatchSub,
+    WatchUnsub,
+    WatchPoll,
 }
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Selection {
     pub history: bool,
     pub history_mutations: bool,
+    pub watches: bool,
 }
 impl Selection {
     fn permits(self, handler: Handler) -> bool {
         match handler {
             Handler::HisRead => self.history,
             Handler::HisWrite => self.history_mutations,
+            Handler::WatchSub | Handler::WatchUnsub | Handler::WatchPoll => self.watches,
             _ => true,
         }
     }
@@ -88,6 +96,9 @@ impl Handler {
         match self {
             Self::Nav => Some(ReadOperation::Nav),
             Self::HisRead => Some(ReadOperation::History),
+            Self::WatchSub | Self::WatchUnsub | Self::WatchPoll => {
+                Some(ReadOperation::Subscriptions)
+            }
             _ => None,
         }
     }
@@ -506,6 +517,31 @@ fn validate_binding(declaration: &AdmittedSpec, handler: Handler) -> Result<(), 
                         ("returns", "sys::Grid", false, false, None),
                     ])
             }
+            Handler::WatchSub | Handler::WatchUnsub => {
+                declaration.spec.qname
+                    == if handler == Handler::WatchSub {
+                        "ph.api::watchSub"
+                    } else {
+                        "ph.api::watchUnsub"
+                    }
+                    && declaration.spec.meta.get("opGrid") == Some(&Kind::Marker)
+                    && !declaration.spec.meta.contains_key("noSideEffects")
+                    && shape(&[
+                        ("req", "sys::Grid", false, false, None),
+                        ("returns", "sys::Grid", false, false, None),
+                    ])
+            }
+            Handler::WatchPoll => {
+                declaration.spec.qname == "ph.api::watchPoll"
+                    && !declaration.spec.meta.contains_key("opGrid")
+                    && !declaration.spec.meta.contains_key("noSideEffects")
+                    && shape(&[
+                        ("watchId", "sys::Str", false, false, None),
+                        ("refresh", "sys::Marker", true, false, None),
+                        ("curValSub", "sys::Marker", true, false, None),
+                        ("returns", "sys::Grid", false, false, None),
+                    ])
+            }
             Handler::Nav => {
                 // ph.api::nav: the opGrid request grid is the single parameter.
                 declaration.spec.qname == "ph.api::nav"
@@ -776,7 +812,7 @@ mod tests {
         let read_all = catalog.declaration("sys.api::readAll").unwrap();
         assert!(validate_binding(read_all, Handler::Nav).is_err());
         // The tenth fixed binding is discoverable, GET-capable and whole-grid.
-        assert_eq!(BINDINGS.len(), 12);
+        assert_eq!(BINDINGS.len(), 15);
         assert!(
             crate::ReadService::supported_functions().any(|pair| pair == ("nav", "ph.api::nav"))
         );
@@ -796,7 +832,11 @@ mod tests {
                 .iter()
                 .filter(|entry| !matches!(
                     entry.handler,
-                    Handler::Nav | Handler::HisRead | Handler::HisWrite
+                    Handler::Nav
+                        | Handler::HisRead
+                        | Handler::HisWrite
+                        | Handler::WatchSub
+                        | Handler::WatchUnsub
                 ))
                 .all(|entry| !entry.wire.op_grid)
         );

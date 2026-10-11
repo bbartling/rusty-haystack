@@ -2,6 +2,7 @@ mod activation;
 mod nav;
 mod system;
 mod typed_history;
+mod typed_watch;
 use crate::{
     budget::Budget,
     lifecycle::{ApplicationError, Lifecycle, WorkGuard},
@@ -348,6 +349,12 @@ pub struct ReadAdmission {
     permit: Option<OwnedSemaphorePermit>,
     guard: Option<WorkGuard>,
 }
+enum TypedInvocation {
+    Response(crate::TypedInvocationResponse),
+    History(typed_history::Prepared),
+    Watch(typed_watch::Prepared),
+}
+
 /// Shared execution ownership, also retained by a provider-held mutation plan.
 /// The original registration transfers here without an untracked handoff gap.
 pub(crate) struct WorkLease {
@@ -406,10 +413,22 @@ impl ReadAdmission {
     /// Invoke with the exact owned history selection. These handles are trusted
     /// transport configuration; request arguments cannot select a provider.
     pub async fn invoke_wire_with_history(
+        self,
+        input: crate::TypedInvocationInput,
+        history: Option<crate::HistoryService>,
+        mutations: Option<crate::HistoryMutationService>,
+    ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
+        self.invoke_wire_with_services(input, history, mutations, None)
+            .await
+    }
+    /// Invoke with the selected owned services. A watch additionally requires
+    /// the exact session already bound by the trusted authentication adapter.
+    pub async fn invoke_wire_with_services(
         mut self,
         input: crate::TypedInvocationInput,
         history: Option<crate::HistoryService>,
         mutations: Option<crate::HistoryMutationService>,
+        subscriptions: Option<crate::StateSubscriptionService>,
     ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
         if history
             .as_ref()
@@ -420,12 +439,20 @@ impl ReadAdmission {
                         .as_ref()
                         .is_some_and(|history| history.same_selection(service.history_service()))
             })
+            || subscriptions
+                .as_ref()
+                .is_some_and(|service| !self.belongs_to(service.read_service()))
         {
             return Err(crate::ApiError::Unavailable);
         }
         let selection = crate::registry::Selection {
             history: history.is_some(),
             history_mutations: mutations.is_some(),
+            watches: subscriptions.is_some()
+                && self
+                    .session
+                    .as_ref()
+                    .is_some_and(crate::SubscriptionSession::scoped),
         };
         let inner = self.inner.clone();
         let session = self.session.clone();
@@ -437,14 +464,15 @@ impl ReadAdmission {
             .await
             .map_err(crate::ApiError::from)??;
         let response = match prepared {
-            typed_history::Invocation::Response(response) => {
+            TypedInvocation::Response(response) => {
                 // This stage finished the request; do not cancel its disclosure.
                 self.budget.take();
                 response
             }
-            typed_history::Invocation::History(prepared) => {
+            TypedInvocation::History(prepared) => {
                 prepared.execute(self, history, mutations).await?
             }
+            TypedInvocation::Watch(prepared) => prepared.execute(self, subscriptions).await?,
         };
         response.disclosure.check()?;
         Ok(response)
@@ -783,7 +811,7 @@ impl Inner {
         input: crate::TypedInvocationInput,
         selection: crate::registry::Selection,
         budget: &mut Budget,
-    ) -> Result<typed_history::Invocation, crate::ApiError> {
+    ) -> Result<TypedInvocation, crate::ApiError> {
         use crate::{ApiError, typed_http};
         if principal.bytes() > budget.limits.max_input_bytes {
             return Err(ApiError::InvalidArgs);
@@ -854,10 +882,32 @@ impl Inner {
                 args.values(),
                 budget,
             )?;
-            return Ok(typed_history::Invocation::History(prepared));
+            return Ok(TypedInvocation::History(prepared));
+        }
+        if matches!(
+            entry.handler,
+            crate::registry::Handler::WatchSub
+                | crate::registry::Handler::WatchUnsub
+                | crate::registry::Handler::WatchPoll
+        ) {
+            let session = session.ok_or(ApiError::AuthRequired)?;
+            let prepared = typed_watch::Prepared::new(
+                registry.clone(),
+                entry.handler,
+                request,
+                args.values(),
+                session,
+                policy.scope_key(),
+                budget,
+            )?;
+            return Ok(TypedInvocation::Watch(prepared));
         }
         let value = match entry.handler {
-            crate::registry::Handler::HisRead | crate::registry::Handler::HisWrite => {
+            crate::registry::Handler::HisRead
+            | crate::registry::Handler::HisWrite
+            | crate::registry::Handler::WatchSub
+            | crate::registry::Handler::WatchUnsub
+            | crate::registry::Handler::WatchPoll => {
                 return Err(ApiError::Internal);
             }
             crate::registry::Handler::Ops => {
@@ -881,7 +931,7 @@ impl Inner {
                 match self.system_read(&registry, handler, args.values(), policy.as_ref(), budget) {
                     Err(ApiError::UnknownEntity) => {
                         return typed_http::missing(&request, budget)
-                            .map(typed_history::Invocation::Response);
+                            .map(TypedInvocation::Response);
                     }
                     value => value?,
                 }
@@ -891,7 +941,7 @@ impl Inner {
                 match args.values().get("id") {
                     Some(Kind::Null) if checked => {
                         return typed_http::missing(&request, budget)
-                            .map(typed_history::Invocation::Response);
+                            .map(TypedInvocation::Response);
                     }
                     Some(Kind::Null) => Kind::Null,
                     Some(Kind::Ref(id)) => loop {
@@ -914,7 +964,7 @@ impl Inner {
                                 }
                                 None if checked => {
                                     return typed_http::missing(&request, budget)
-                                        .map(typed_history::Invocation::Response);
+                                        .map(TypedInvocation::Response);
                                 }
                                 None => break Kind::Null,
                             }
@@ -938,7 +988,7 @@ impl Inner {
                 .close()?;
         }
         budget.check()?;
-        Ok(typed_history::Invocation::Response(response))
+        Ok(TypedInvocation::Response(response))
     }
     fn execute(
         &self,
