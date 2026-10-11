@@ -339,6 +339,13 @@ pub struct Catalog {
     pragmas: Pragmas,
     marker_bindings: BTreeMap<String, String>,
     compiled: BTreeMap<String, strict::CompiledType>,
+    package_identities: BTreeMap<
+        String,
+        (
+            super::repository::LibraryPin,
+            super::repository::Sha256Digest,
+        ),
+    >,
 }
 
 impl Catalog {
@@ -1251,6 +1258,7 @@ impl Catalog {
             pragmas: retained_pragmas,
             marker_bindings: BTreeMap::new(),
             compiled: BTreeMap::new(),
+            package_identities: BTreeMap::new(),
         };
         profile.compiled = profile.compile()?;
         for entry in profile.specs.values() {

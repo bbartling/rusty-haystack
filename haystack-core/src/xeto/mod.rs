@@ -8,6 +8,7 @@ pub mod fitting;
 pub mod lexer;
 pub mod loader;
 pub mod parser;
+pub mod repository;
 pub mod resolver;
 pub mod spec;
 

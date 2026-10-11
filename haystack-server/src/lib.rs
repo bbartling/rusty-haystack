@@ -38,6 +38,7 @@ pub mod demo;
 pub mod error;
 pub mod ops;
 mod owned_io;
+mod repository;
 pub mod state;
 mod typed_http;
 pub mod ws;
