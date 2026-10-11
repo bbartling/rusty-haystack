@@ -88,6 +88,7 @@ Python coverage is described in [Python bindings](docs/python.md) and tested sep
 
 ## Documentation and validation
 
+- [Xeto repository downloads](docs/repository-client.md)
 - [Architecture](docs/architecture.md), [Getting started](docs/getting-started.md), [CLI](docs/cli.md), [Client](docs/client.md), and [Server API](docs/server-api.md)
 - [Typed values](docs/typed-values.md), [Jeto](docs/jeto.md), [Typed HTTP](docs/typed-http-read.md), and [Schema export](docs/schema-export.md)
 - [Entity mutations](docs/entity-mutations.md), [History reads](docs/history-reads.md), [History mutations](docs/history-mutations.md), and [State subscriptions](docs/state-subscriptions.md)
