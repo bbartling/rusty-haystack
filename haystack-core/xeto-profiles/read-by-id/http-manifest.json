@@ -330,10 +330,6 @@
       "lines": [
         [
           1,
-          114
-        ],
-        [
-          151,
           229
         ]
       ],
@@ -343,7 +339,8 @@
         "ph.api::watchUnsub",
         "ph.api::watchPoll",
         "ph.api::hisRead",
-        "ph.api::hisWrite"
+        "ph.api::hisWrite",
+        "ph.api::pointWrite"
       ]
     }
   ]

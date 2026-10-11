@@ -31,6 +31,7 @@ pub enum ApiError {
     AuthRejected,
     AuthMalformed,
     Timeout,
+    CommandUnknown,
     Unavailable,
     Internal,
 }
@@ -48,7 +49,7 @@ impl ApiError {
             Self::NotAcceptable => 406,
             Self::UnsupportedMediaType => 415,
             Self::NotImplemented => 501,
-            Self::Timeout => 504,
+            Self::Timeout | Self::CommandUnknown => 504,
             Self::Unavailable => 503,
             Self::Internal => 500,
         }
@@ -108,6 +109,9 @@ impl ApiError {
             Self::AuthMalformed => {
                 r#"{"spec":"sys.api::AuthErr","status":400,"dis":"Malformed authorization"}"#
             }
+            Self::CommandUnknown => {
+                r#"{"spec":"sys.api::TimeoutErr","status":504,"dis":"Command outcome unknown"}"#
+            }
             Self::Timeout => {
                 r#"{"spec":"sys.api::TimeoutErr","status":504,"dis":"Request deadline exceeded"}"#
             }
@@ -159,7 +163,28 @@ pub struct InvocationDisclosure {
 }
 impl InvocationDisclosure {
     pub fn check(&self) -> Result<(), ApiError> {
-        self.budget.check().map_err(ApiError::from)
+        let result = self.budget.check().map_err(ApiError::from).and_then(|()| {
+            if let Some(check) = &self.budget.command_disclosure {
+                check()?;
+            }
+            if self.budget.command_attempt.is_some()
+                && self
+                    .budget
+                    .owner_sealed
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+            {
+                Err(ApiError::Unavailable)
+            } else {
+                Ok(())
+            }
+        });
+        result.map_err(|e| {
+            self.budget
+                .command_attempt
+                .as_ref()
+                .map_or(e.clone(), |attempt| attempt.classify(e))
+        })
     }
 }
 pub struct TypedInvocationResponse {
@@ -659,6 +684,7 @@ pub(crate) fn decode(
                         && matches!(
                             profile.function.as_str(),
                             "ph.api::hisWrite"
+                                | "ph.api::pointWrite"
                                 | "ph.api::watchSub"
                                 | "ph.api::watchUnsub"
                                 | "ph.api::watchPoll"
@@ -693,6 +719,9 @@ pub(crate) fn decode(
                         let name = profile.parameters.keys().next().ok_or(ApiError::Internal)?;
                         args.set(name, Kind::Grid(Box::new(grid)));
                     } else {
+                        if profile.function == "ph.api::pointWrite" && grid.rows.len() != 1 {
+                            return Err(ApiError::InvalidArgs);
+                        }
                         if !grid.rows.is_empty()
                             && profile.strict_arguments
                             && grid

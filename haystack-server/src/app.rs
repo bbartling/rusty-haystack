@@ -351,6 +351,10 @@ impl HaystackServer {
             .as_ref()
             .and_then(|app| app.subscription_service());
         let state: SharedState = Arc::new(AppState {
+            command_service: self
+                .application
+                .as_ref()
+                .and_then(|app| app.command_service()),
             subscription_service,
             mutation_service,
             history_service,
@@ -564,10 +568,12 @@ async fn lifecycle_middleware(
         }
     };
     let cancellation = guard.cancellation();
+    let command_attempt = haystack_app::CommandAttempt::default();
+    request.extensions_mut().insert(command_attempt.clone());
     request.extensions_mut().insert(guard.clone());
     tokio::select! {
         biased;
-        _ = cancellation.cancelled() => if typed { crate::typed_http::error(haystack_app::ApiError::Unavailable) } else { crate::error::HaystackError::new("application stopping", StatusCode::SERVICE_UNAVAILABLE).into_response() },
+        _ = cancellation.cancelled() => if typed { crate::typed_http::error(command_attempt.classify(haystack_app::ApiError::Unavailable)) } else { crate::error::HaystackError::new("application stopping", StatusCode::SERVICE_UNAVAILABLE).into_response() },
         response = next.run(request) => response,
     }
 }

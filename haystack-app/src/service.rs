@@ -1,6 +1,7 @@
 mod activation;
 mod nav;
 mod system;
+mod typed_command;
 mod typed_history;
 mod typed_watch;
 use crate::{
@@ -350,6 +351,7 @@ pub struct ReadAdmission {
     guard: Option<WorkGuard>,
 }
 enum TypedInvocation {
+    Command(typed_command::Prepared),
     Response(crate::TypedInvocationResponse),
     History(typed_history::Prepared),
     Watch(typed_watch::Prepared),
@@ -424,11 +426,32 @@ impl ReadAdmission {
     /// Invoke with the selected owned services. A watch additionally requires
     /// the exact session already bound by the trusted authentication adapter.
     pub async fn invoke_wire_with_services(
+        self,
+        input: crate::TypedInvocationInput,
+        history: Option<crate::HistoryService>,
+        mutations: Option<crate::HistoryMutationService>,
+        subscriptions: Option<crate::StateSubscriptionService>,
+    ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
+        self.invoke_wire_with_commands(
+            input,
+            history,
+            mutations,
+            subscriptions,
+            None,
+            crate::CommandAttempt::default(),
+        )
+        .await
+    }
+    /// Invoke with an explicitly selected local simulator and request-local
+    /// dispatch fence shared with the transport's final cancellation seam.
+    pub async fn invoke_wire_with_commands(
         mut self,
         input: crate::TypedInvocationInput,
         history: Option<crate::HistoryService>,
         mutations: Option<crate::HistoryMutationService>,
         subscriptions: Option<crate::StateSubscriptionService>,
+        commands: Option<crate::SimulatedCommandService>,
+        attempt: crate::CommandAttempt,
     ) -> Result<crate::TypedInvocationResponse, crate::ApiError> {
         if history
             .as_ref()
@@ -439,13 +462,21 @@ impl ReadAdmission {
                         .as_ref()
                         .is_some_and(|history| history.same_selection(service.history_service()))
             })
+            || commands
+                .as_ref()
+                .is_some_and(|service| !self.belongs_to(service.read_service()))
             || subscriptions
                 .as_ref()
                 .is_some_and(|service| !self.belongs_to(service.read_service()))
         {
             return Err(crate::ApiError::Unavailable);
         }
-        let selection = crate::registry::Selection {
+        let mut selection = crate::registry::Selection {
+            commands: commands.is_some()
+                && self
+                    .session
+                    .as_ref()
+                    .is_some_and(crate::SubscriptionSession::scoped),
             history: history.is_some(),
             history_mutations: mutations.is_some(),
             watches: subscriptions.is_some()
@@ -457,8 +488,13 @@ impl ReadAdmission {
         let inner = self.inner.clone();
         let session = self.session.clone();
         let stage = self.stage()?;
+        let selected_commands = commands.clone();
         let prepared = stage
             .run_task(move |principal, budget| {
+                selection.commands = selection.commands
+                    && selected_commands
+                        .as_ref()
+                        .is_some_and(|service| service.available(&principal));
                 Ok(inner.execute_typed(principal, session, input, selection, budget))
             })
             .await
@@ -473,6 +509,10 @@ impl ReadAdmission {
                 prepared.execute(self, history, mutations).await?
             }
             TypedInvocation::Watch(prepared) => prepared.execute(self, subscriptions).await?,
+            TypedInvocation::Command(prepared) => {
+                self.budget_mut().command_attempt = Some(attempt);
+                prepared.execute(self, commands).await?
+            }
         };
         response.disclosure.check()?;
         Ok(response)
@@ -827,8 +867,10 @@ impl Inner {
         let envelope = typed_http::envelope(&input, budget)?;
         let policy = self.policy.snapshot(&principal)?;
         budget.check()?;
-        if !matches!(envelope.operation.as_str(), "hisWrite" | "ph.api::hisWrite")
-            && !policy.operation(ReadOperation::Read)
+        if !matches!(
+            envelope.operation.as_str(),
+            "hisWrite" | "ph.api::hisWrite" | "pointWrite" | "ph.api::pointWrite"
+        ) && !policy.operation(ReadOperation::Read)
         {
             return Err(ApiError::Permission);
         }
@@ -884,6 +926,17 @@ impl Inner {
             )?;
             return Ok(TypedInvocation::History(prepared));
         }
+        if entry.handler == crate::registry::Handler::PointWrite {
+            let prepared = typed_command::Prepared::new(
+                registry.clone(),
+                request,
+                args.values(),
+                session.ok_or(ApiError::AuthRequired)?,
+                policy.scope_key(),
+                budget,
+            )?;
+            return Ok(TypedInvocation::Command(prepared));
+        }
         if matches!(
             entry.handler,
             crate::registry::Handler::WatchSub
@@ -903,7 +956,8 @@ impl Inner {
             return Ok(TypedInvocation::Watch(prepared));
         }
         let value = match entry.handler {
-            crate::registry::Handler::HisRead
+            crate::registry::Handler::PointWrite
+            | crate::registry::Handler::HisRead
             | crate::registry::Handler::HisWrite
             | crate::registry::Handler::WatchSub
             | crate::registry::Handler::WatchUnsub

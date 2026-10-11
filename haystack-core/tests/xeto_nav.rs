@@ -76,7 +76,8 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
                 "ph.api::watchUnsub",
                 "ph.api::watchPoll",
                 "ph.api::hisRead",
-                "ph.api::hisWrite"
+                "ph.api::hisWrite",
+                "ph.api::pointWrite"
             ]
         );
 
@@ -94,6 +95,7 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
                 "ph.api::hisRead",
                 "ph.api::hisWrite",
                 NAV,
+                "ph.api::pointWrite",
                 "ph.api::watchPoll",
                 "ph.api::watchSub",
                 "ph.api::watchUnsub"
@@ -110,8 +112,8 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
             ("library", LIB_SHA256)
         );
 
-        // The rest of the same upstream file stays outside every selection.
-        assert!(catalog.declaration("ph.api::pointWrite").is_none());
+        // The whole pinned function file is selected; it adds no sys.api alias.
+        assert!(catalog.declaration("ph.api::pointWrite").is_some());
         assert!(catalog.declaration("sys.api::pointWrite").is_none());
         let op_grid = catalog
             .metadata()
