@@ -200,7 +200,7 @@ impl ActivationControl for Control<'_> {
 /// Final authority check after the last lock wait. `Budget::check` covers the
 /// deadline, caller/owner cancellation and session revocation, but not owner
 /// sealing; an activation prepared before close began must not publish after.
-fn publish_check(budget: &Budget) -> Result<(), ReadError> {
+pub(super) fn publish_check(budget: &Budget) -> Result<(), ReadError> {
     budget.check()?;
     if budget
         .owner_sealed
@@ -260,12 +260,21 @@ impl ReadAdmission {
         catalog: Catalog,
         limits: CatalogActivationLimits,
     ) -> Result<CatalogActivation, CatalogActivationError> {
+        self.activate_catalog_expected(catalog, limits, None).await
+    }
+
+    pub(super) async fn activate_catalog_expected(
+        self,
+        catalog: Catalog,
+        limits: CatalogActivationLimits,
+        expected: Option<Arc<ActivatedCatalog>>,
+    ) -> Result<CatalogActivation, CatalogActivationError> {
         limits.validate().map_err(ActivationError::Control)?;
         let inner = self.inner.clone();
         let fence = Arc::new(CommitFence::new());
         let worker_fence = fence.clone();
         self.run_task_fenced(Some(fence), move |principal, budget| {
-            Ok(inner.activate(principal, catalog, limits, worker_fence, budget))
+            Ok(inner.activate(principal, catalog, limits, worker_fence, budget, expected))
         })
         .await
         .map_err(ActivationError::Control)?
@@ -280,21 +289,26 @@ impl Inner {
         limits: CatalogActivationLimits,
         fence: Arc<CommitFence>,
         budget: &mut Budget,
+        expected: Option<Arc<ActivatedCatalog>>,
     ) -> Result<CatalogActivation, CatalogActivationError> {
         if !matches!(principal, Principal::TrustedEmbedding { .. }) {
             return Err(ActivationError::Control(ReadError::Forbidden));
         }
         publish_check(budget).map_err(ActivationError::Control)?;
-        let expected = loop {
-            let wait = budget.wait_quantum().map_err(ActivationError::Control)?;
-            if let Some(current) = self
-                .graph
-                .read_for(wait, |graph| graph.activated_catalog().cloned())
-            {
-                break current;
+        let expected = if let Some(expected) = expected {
+            expected
+        } else {
+            loop {
+                let wait = budget.wait_quantum().map_err(ActivationError::Control)?;
+                if let Some(current) = self
+                    .graph
+                    .read_for(wait, |graph| graph.activated_catalog().cloned())
+                {
+                    break current;
+                }
             }
-        }
-        .ok_or(ActivationError::Unmanaged)?;
+            .ok_or(ActivationError::Unmanaged)?
+        };
         let mut control = Control {
             budget,
             limits,

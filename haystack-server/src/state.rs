@@ -14,6 +14,8 @@ pub type SharedState = Arc<AppState>;
 
 /// Shared application state injected into every Axum handler via `State`.
 pub struct AppState {
+    /// Explicit optional public immutable package repository.
+    pub repository: Option<Arc<haystack_core::xeto::repository::LibraryRepository>>,
     /// Application lifetime for requests and upgraded connections.
     pub application: Option<haystack_app::ApplicationHandle>,
     /// Thread-safe entity graph.

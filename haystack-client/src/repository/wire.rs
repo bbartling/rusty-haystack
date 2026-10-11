@@ -464,7 +464,7 @@ fn record(v: &Value, l: &RepositoryLimits) -> Result<RepoLibVersion, RepositoryE
         doc: opt_text(o, "doc")?,
         depends,
         digest: optional(o, "digest")
-            .map(|v| string(v)?.parse())
+            .map(|v| Ok::<_, RepositoryError>(string(v)?.parse()?))
             .transpose()?,
     })
 }

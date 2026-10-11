@@ -117,3 +117,9 @@ its [HTTP API](https://github.com/Project-Haystack/xeto/blob/873b922451d3ef4c0c9
 and its [library version grammar](https://github.com/Project-Haystack/xeto/blob/873b922451d3ef4c0c9c08ef3daa542f352d69f3/src/xeto/sys/libmeta.xeto).
 The exact-byte digest representation is corroborated by
 [Haxall aded2799](https://github.com/haxall/haxall/blob/aded27993c2d4834eca4b44ca55671417a1a7ea2/src/core/xetom/fan/util/XetoCrypto.fan).
+
+For optional local serving and the separate bounded admission/activation path,
+see [Read-only repositories and explicit package admission](repository-serving-admission.md).
+Shared library/version/dependency/digest values are defined in core and re-exported
+here; observed HTTP provenance remains owned by this client. Download does not
+implicitly call the package validator or application activation APIs.

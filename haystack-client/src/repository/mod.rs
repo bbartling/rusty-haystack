@@ -71,6 +71,15 @@ pub enum RepositoryError {
         kind: RepoErrorKind,
     },
 }
+impl From<haystack_core::xeto::repository::RepositoryValueError> for RepositoryError {
+    fn from(error: haystack_core::xeto::repository::RepositoryValueError) -> Self {
+        use haystack_core::xeto::repository::RepositoryValueError;
+        match error {
+            RepositoryValueError::InvalidInput(message) => Self::InvalidInput(message),
+            RepositoryValueError::InvalidDigest => Self::InvalidDigest,
+        }
+    }
+}
 /// Typed API errors are recognized only from structured error metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepoErrorKind {
@@ -476,7 +485,7 @@ impl RepositoryClient {
             }
             return Ok(Response {
                 bytes,
-                digest: hash.map(|hash| Sha256Digest(hash.finalize().into())),
+                digest: hash.map(|hash| Sha256Digest::from_bytes(hash.finalize().into())),
                 source: RepositorySource {
                     request_url,
                     final_url: url,

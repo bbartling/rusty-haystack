@@ -68,6 +68,9 @@ pub(crate) struct Budget {
     /// the final graph write lock.
     #[cfg(test)]
     pub activation_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Package preparation after observation capture, outside graph locks.
+    #[cfg(test)]
+    pub package_prepare_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Typed history stages retain the observation used for binding. Native
     /// history calls have no catalog pin; their existing GraphState rules apply.
     pub command_disclosure: Option<Arc<dyn Fn() -> Result<(), crate::ApiError> + Send + Sync>>,
@@ -102,6 +105,8 @@ impl Budget {
             typed_lookup_hook: None,
             #[cfg(test)]
             activation_commit_hook: None,
+            #[cfg(test)]
+            package_prepare_hook: None,
             command_disclosure: None,
             command_attempt: None,
             typed_catalog: None,

@@ -31,6 +31,8 @@ parking_lot.workspace = true
 indexmap.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 sha2.workspace = true
+flate2.workspace = true
+crc32fast.workspace = true
 hmac.workspace = true
 pbkdf2 = { workspace = true, features = ["hmac"] }
 base64.workspace = true

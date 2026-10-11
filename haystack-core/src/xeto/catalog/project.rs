@@ -66,6 +66,7 @@ impl Catalog {
             ));
         }
         let mut result = self.clone();
+        result.package_identities.remove(library);
         if result
             .pragmas
             .get(library)
@@ -294,10 +295,51 @@ impl Catalog {
             digest.update(qname.as_bytes());
             digest.update([0]);
         }
+        for (name, (pin, archive)) in &self.package_identities {
+            digest.update(b"package\0");
+            digest.update(name.as_bytes());
+            digest.update([0]);
+            digest.update(pin.version().to_string().as_bytes());
+            digest.update([0]);
+            digest.update(archive.to_string().as_bytes());
+            digest.update([0]);
+        }
         digest
             .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+    pub(crate) fn library_pragma(&self, name: &str) -> Option<&LibPragma> {
+        self.pragmas.get(name).map(|(pragma, _)| pragma)
+    }
+    pub(crate) fn package_identity(
+        &self,
+        name: &str,
+    ) -> Option<&(
+        super::super::repository::LibraryPin,
+        super::super::repository::Sha256Digest,
+    )> {
+        self.package_identities.get(name)
+    }
+    pub(crate) fn record_package(
+        &mut self,
+        pin: super::super::repository::LibraryPin,
+        digest: super::super::repository::Sha256Digest,
+        maturity: super::super::repository::Maturity,
+    ) {
+        if let Some(library) = self.libraries.get_mut(pin.lib()) {
+            library.maturity = match maturity {
+                super::super::repository::Maturity::Alpha => "alpha",
+                super::super::repository::Maturity::Beta => "beta",
+                super::super::repository::Maturity::Stable => "stable",
+            }
+            .into();
+        }
+        self.package_identities
+            .insert(pin.lib().into(), (pin, digest));
+    }
+    pub(crate) fn package_marker(&self, marker: &str) -> Option<&str> {
+        self.marker_bindings.get(marker).map(String::as_str)
     }
 }

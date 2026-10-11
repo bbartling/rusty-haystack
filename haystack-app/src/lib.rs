@@ -60,8 +60,8 @@ pub use lifecycle::{
 };
 pub use policy::{AllowAll, PolicySnapshot, ReadPolicy};
 pub use service::{
-    CatalogActivation, CatalogActivationError, CatalogActivationLimits, ReadAdmission, ReadLoad,
-    ReadService,
+    ApplicationPackageError, CatalogActivation, CatalogActivationError, CatalogActivationLimits,
+    PackagePreparationLimits, PreparedPackageAdmission, ReadAdmission, ReadLoad, ReadService,
 };
 pub use tokio_util::sync::CancellationToken;
 pub use types::*;

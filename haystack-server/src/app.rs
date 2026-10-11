@@ -23,6 +23,7 @@ use haystack_app::HisStore;
 
 /// Builder for the Haystack HTTP server.
 pub struct HaystackServer {
+    repository: Option<Arc<haystack_core::xeto::repository::LibraryRepository>>,
     graph: SharedGraph,
     namespace: Option<DefNamespace>,
     read_service: Option<haystack_app::ReadService>,
@@ -43,6 +44,7 @@ impl HaystackServer {
     pub fn new(graph: SharedGraph) -> Self {
         Self {
             graph,
+            repository: None,
             namespace: None,
             read_service: None,
             application: None,
@@ -56,6 +58,17 @@ impl HaystackServer {
             port: 8080,
             host: "127.0.0.1".to_string(),
         }
+    }
+
+    /// Explicitly expose this immutable repository publicly at `/repo/`.
+    /// GET-only metadata and exact bytes share this server's application lifetime.
+    /// No upload, catalog admission, publication or authentication API is enabled.
+    pub fn with_public_repository(
+        mut self,
+        repository: haystack_core::xeto::repository::LibraryRepository,
+    ) -> Self {
+        self.repository = Some(Arc::new(repository));
+        self
     }
 
     /// Set the ontology namespace for def/spec operations.
@@ -351,6 +364,7 @@ impl HaystackServer {
             .as_ref()
             .and_then(|app| app.subscription_service());
         let state: SharedState = Arc::new(AppState {
+            repository: self.repository,
             command_service: self
                 .application
                 .as_ref()
@@ -425,6 +439,15 @@ impl HaystackServer {
         let mut app = core_router
             .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
             .with_state(state.clone());
+
+        if state.repository.is_some() {
+            app = app.nest(
+                "/repo",
+                Router::new()
+                    .fallback(crate::repository::handle)
+                    .with_state(state.clone()),
+            );
+        }
 
         if let Some(custom) = self.custom_router {
             app = custom.with_state(state.clone()).merge(app);
@@ -550,7 +573,9 @@ async fn lifecycle_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let typed = crate::typed_http::selected(&request);
+    let typed = crate::typed_http::selected(&request)
+        || (state.repository.is_some()
+            && (request.uri().path() == "/repo" || request.uri().path().starts_with("/repo/")));
     let Some(application) = &state.application else {
         return next.run(request).await;
     };
