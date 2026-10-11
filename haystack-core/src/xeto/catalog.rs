@@ -35,8 +35,8 @@ const PROTOCOL_MANIFEST: &str =
     include_str!("../../xeto-profiles/read-by-id/protocol-manifest.json");
 /// The selected `ph.api` navigation closure shared by the HTTP and protocol
 /// profiles: its library metadata, the dependency-only `ph`/`sys.refs`
-/// identities it requires, and the unchanged function source. Only navigation and single-point history are
-/// selected from that file; watches and pointWrite stay unadmitted.
+/// identities it requires, and the unchanged function source. Navigation, typed watches and single-point history are
+/// selected from that file; pointWrite stays unadmitted.
 const NAV_RAW: &[(&str, &str)] = &[
     (
         "src/xeto/ph/lib.xeto",
@@ -57,7 +57,14 @@ const NAV_RAW: &[(&str, &str)] = &[
 ];
 /// Function members admitted from `ph.api`; the rest of that augmentation is
 /// outside every selection.
-const PH_API_FUNCTIONS: &[&str] = &["nav", "hisRead", "hisWrite"];
+const PH_API_FUNCTIONS: &[&str] = &[
+    "nav",
+    "watchSub",
+    "watchUnsub",
+    "watchPoll",
+    "hisRead",
+    "hisWrite",
+];
 const PROTOCOL_RAW: &[(&str, &str)] = &[
     (
         "src/xeto/ph.protocols/lib.xeto",
@@ -353,7 +360,7 @@ impl Catalog {
     }
 
     /// Admit the reachable HTTP error and ops closures alongside readById, plus
-    /// the selected navigation/history declarations. Every library remains an explicit
+    /// the selected navigation/history/watch declarations. Every library remains an explicit
     /// subset; `ph` and `sys.refs` are dependency-only identities here.
     pub fn load_http_pinned() -> Result<Self, ProfileError> {
         let provenance = serde_json::from_str(HTTP_MANIFEST)
@@ -1737,7 +1744,13 @@ fn validate_closure(
                 &["returns"]
             }
             "sys.api::readByIds" if http => &["ids", "checked", "returns"],
-            "ph.api::nav" | "ph.api::hisRead" | "ph.api::hisWrite" if http => &["req", "returns"],
+            "ph.api::nav" | "ph.api::hisRead" | "ph.api::hisWrite" | "ph.api::watchSub"
+            | "ph.api::watchUnsub"
+                if http =>
+            {
+                &["req", "returns"]
+            }
+            "ph.api::watchPoll" if http => &["watchId", "refresh", "curValSub", "returns"],
             "sys.api::read" if http => &["filter", "checked", "returns"],
             "sys.api::readAll" if http => &["filter", "opts", "returns"],
             "sys.api::AboutInfo" if http => &[
@@ -2503,16 +2516,21 @@ mod tests {
 
     #[test]
     fn ph_api_selection_is_exact_and_excludes_other_functions() {
-        // The retained selection admits exactly navigation and history.
+        // The retained selection admits exactly navigation, watches and history.
         let nav = nav_altered("nav:", "nav:").unwrap();
         let declaration = nav.declaration("ph.api::nav").unwrap();
         assert_eq!(
             declaration.source.declarations,
-            ["ph.api::nav", "ph.api::hisRead", "ph.api::hisWrite"]
+            [
+                "ph.api::nav",
+                "ph.api::watchSub",
+                "ph.api::watchUnsub",
+                "ph.api::watchPoll",
+                "ph.api::hisRead",
+                "ph.api::hisWrite"
+            ]
         );
-        for unadmitted in ["watchSub", "watchUnsub", "watchPoll", "pointWrite"] {
-            assert!(nav.declaration(&format!("ph.api::{unadmitted}")).is_none());
-        }
+        assert!(nav.declaration("ph.api::pointWrite").is_none());
         // A renamed or additional member no longer matches the manifest
         // selection, even when that member exists upstream.
         for (before, after) in [

@@ -25,6 +25,9 @@ pub(crate) fn selected(request: &Request<Body>) -> bool {
             | "/api/close"
             | "/api/hisRead"
             | "/api/hisWrite"
+            | "/api/watchSub"
+            | "/api/watchUnsub"
+            | "/api/watchPoll"
     ) {
         return !legacy_selection(request);
     }
@@ -283,7 +286,7 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
         input.body.extend_from_slice(&chunk);
     }
     let response = admission
-        .invoke_wire_with_history(
+        .invoke_wire_with_services(
             input,
             state.history_service.clone(),
             // Discovery and invocation share the authenticated transport's
@@ -294,6 +297,7 @@ async fn execute(state: SharedState, request: Request<Body>) -> Result<Response,
             } else {
                 None
             },
+            state.subscription_service.clone(),
         )
         .await?;
     response.disclosure.check()?;

@@ -2,6 +2,7 @@
 //! Records never retain ordinary read permits. Every active operation captures
 //! its authorized graph view under one graph guard and publishes by record CAS.
 mod adapters;
+pub(crate) mod watch;
 use crate::{
     ApplicationResource, BudgetKind, EphemeralMutationStore, PolicySnapshot, Principal,
     ReadAdmission, ReadContext, ReadError, ReadOperation, ReadService, ReadyInfo, ResourceContext,
@@ -114,6 +115,7 @@ struct Entry {
     base_reservation: usize,
     reservation: AtomicUsize,
     legacy: bool,
+    typed_watch: bool,
     connection: Option<[u8; 16]>,
     active: AtomicBool,
     state: Mutex<Record>,
@@ -127,8 +129,18 @@ struct Record {
 enum Status {
     Preparing,
     Live(Live),
+    Watch(watch::Live),
     Closed,
     Resync(SubscriptionResync),
+}
+impl Status {
+    fn lease_until(&self) -> Option<Instant> {
+        match self {
+            Self::Live(live) => Some(live.lease_until),
+            Self::Watch(live) => Some(live.lease_until),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone)]
 struct Live {
@@ -163,6 +175,7 @@ struct Capture {
     graph: GraphState,
     policy: Arc<str>,
     projection: Arc<Projection>,
+    watch: Option<watch::Captured>,
 }
 enum CaptureError {
     Read(ReadError),
@@ -500,6 +513,7 @@ impl SubscriptionInner {
                     base_reservation,
                     reservation: AtomicUsize::new(reserve),
                     legacy,
+                    typed_watch: false,
                     connection,
                     active: AtomicBool::new(true),
                     state: Mutex::new(Record {
@@ -531,6 +545,7 @@ impl SubscriptionInner {
             if entry.identity != *watch
                 || !entry.session.same_session(session)
                 || entry.legacy != legacy
+                || entry.typed_watch
             {
                 return Ok(SubscriptionOutcome::Rejected(
                     SubscriptionRejection::Forbidden,
@@ -565,6 +580,7 @@ impl SubscriptionInner {
                 }
                 Status::Preparing => None,
                 Status::Live(live) => Some(live),
+                Status::Watch(_) => return Err(ReadError::Forbidden),
             };
             if let Err(error) = budget.charge(BudgetKind::Work, 1) {
                 if live.is_some() && execution_overflow(&error) {
@@ -702,8 +718,22 @@ impl SubscriptionInner {
         previous: Option<&Live>,
         budget: &mut Budget,
     ) -> Result<Capture, CaptureError> {
+        self.capture_watch(principal, ids, previous, None, budget)
+    }
+    fn capture_watch(
+        &self,
+        principal: &Principal,
+        ids: &[String],
+        previous: Option<&Live>,
+        watch: Option<&watch::CaptureContext<'_>>,
+        budget: &mut Budget,
+    ) -> Result<Capture, CaptureError> {
         let policy = self.reads.policy_snapshot(principal)?;
-        if !policy.operation(ReadOperation::Subscriptions) || !policy.operation(ReadOperation::Read)
+        // Typed binding and record capture must use one coherent policy scope,
+        // including initial creation, which has no previous watch scope yet.
+        if watch.is_some_and(|context| !context.matches_policy(policy.as_ref()))
+            || !policy.operation(ReadOperation::Subscriptions)
+            || !policy.operation(ReadOperation::Read)
         {
             return Err(CaptureError::Resync(SubscriptionResync::Policy));
         }
@@ -720,6 +750,13 @@ impl SubscriptionInner {
                 budget.wait_quantum()?,
                 |graph| -> Result<Capture, CaptureError> {
                     let observed = graph.state();
+                    // Existing watches terminalize their own observation
+                    // mismatch; initial typed creation still checks its pin
+                    // under this same guard before reading any entities.
+                    if previous.is_none() {
+                        budget.check_catalog(graph)?;
+                    }
+                    let mut watching = watch.map(|_| watch::Captured::default());
                     if let Some(previous) = previous {
                         if observed.incarnation != previous.graph.incarnation {
                             return Err(CaptureError::Resync(SubscriptionResync::Incarnation));
@@ -727,6 +764,7 @@ impl SubscriptionInner {
                         if observed.catalog_generation != previous.graph.catalog_generation {
                             return Err(CaptureError::Resync(SubscriptionResync::Catalog));
                         }
+                        budget.check_catalog(graph)?;
                         let from = previous
                             .prepared
                             .as_ref()
@@ -741,6 +779,11 @@ impl SubscriptionInner {
                             }
                             diffs += unit.len();
                             budget.charge(BudgetKind::Work, unit.len().saturating_add(1))?;
+                            if let (Some(context), Some(watching)) = (watch, &mut watching) {
+                                for diff in unit.diffs() {
+                                    context.observe(diff, watching, budget)?;
+                                }
+                            }
                         }
                         for id in previous.ids.iter() {
                             budget.charge(BudgetKind::Work, id.len() + 1)?;
@@ -762,7 +805,13 @@ impl SubscriptionInner {
                     for id in ids {
                         budget.charge(BudgetKind::Work, id.len() + 1)?;
                         if !policy.entity(id) || !policy.tag(id, "id") {
+                            if watch.is_some_and(|context| !context.existing(id)) {
+                                continue;
+                            }
                             return Err(CaptureError::Resync(SubscriptionResync::Policy));
+                        }
+                        if let Some(watching) = &mut watching {
+                            watching.authorized.insert(budget.copy_string(id)?);
                         }
                         let before = budget.retained_remaining();
                         let row = sanitize::View {
@@ -796,6 +845,7 @@ impl SubscriptionInner {
                         graph: observed,
                         policy: policy_key.clone(),
                         projection: Arc::new(projection),
+                        watch: watching,
                     })
                 },
             );
@@ -1076,7 +1126,7 @@ impl SubscriptionInner {
         entry: &Entry,
         revision: u64,
         observed: GraphState,
-        next: Record,
+        mut next: Record,
         session: &SubscriptionSession,
         budget: &Budget,
     ) -> Result<Publication, ReadError> {
@@ -1112,8 +1162,10 @@ impl SubscriptionInner {
                 if let Some(reason) = session.reason() {
                     return Ok(Publication::Stopped(reason));
                 }
-                if let Status::Live(live) = &record.status
-                    && Instant::now() >= live.lease_until
+                if record
+                    .status
+                    .lease_until()
+                    .is_some_and(|until| Instant::now() >= until)
                 {
                     return Ok(Publication::Retry);
                 }
@@ -1122,6 +1174,9 @@ impl SubscriptionInner {
                     Status::Live(live) => entry
                         .base_reservation
                         .saturating_add(membership_bytes(&live.ids)),
+                    Status::Watch(live) => entry
+                        .base_reservation
+                        .saturating_add(live.membership_bytes()),
                     _ => reserved,
                 };
                 let growth = required.saturating_sub(reserved);
@@ -1133,13 +1188,17 @@ impl SubscriptionInner {
                 {
                     return Ok(Publication::Capacity);
                 }
+                if let Status::Watch(live) = &mut next.status {
+                    live.renew_at_publication(session);
+                }
                 table.reserved_bytes += growth;
                 entry
                     .reservation
                     .store(reserved + growth, Ordering::Relaxed);
-                entry
-                    .active
-                    .store(matches!(next.status, Status::Live(_)), Ordering::Release);
+                entry.active.store(
+                    matches!(next.status, Status::Live(_) | Status::Watch(_)),
+                    Ordering::Release,
+                );
                 *record = next;
                 Ok(Publication::Done)
             })
@@ -1160,14 +1219,16 @@ impl SubscriptionInner {
             let Some(mut record) = entry.state.try_lock() else {
                 continue;
             };
-            if let Status::Live(live) = &record.status
-                && Instant::now() >= live.lease_until
+            if record
+                .status
+                .lease_until()
+                .is_some_and(|until| Instant::now() >= until)
             {
                 record.status = Status::Resync(SubscriptionResync::LeaseExpired);
                 record.revision = record.revision.saturating_add(1);
                 entry.active.store(false, Ordering::Release);
             }
-            if entry.legacy && !entry.active.load(Ordering::Acquire) {
+            if (entry.legacy || entry.typed_watch) && !entry.active.load(Ordering::Acquire) {
                 remove.push(*id);
             }
         }

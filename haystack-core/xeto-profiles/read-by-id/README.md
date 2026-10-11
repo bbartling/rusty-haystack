@@ -2,7 +2,7 @@
 
 The native bootstrap profile admits readById and its required type/metadata
 closure; the HTTP profile adds the selected nine read/system functions and their reachable types/errors,
-plus `ph.api` navigation (M2-PR05) and history (M2-PR10), from
+plus `ph.api` navigation (M2-PR05), history (M2-PR10), and watches (M2-PR11), from
 [Project-Haystack/xeto at 873b922451d3ef4c0c9c08ef3daa542f352d69f3](https://github.com/Project-Haystack/xeto/tree/873b922451d3ef4c0c9c08ef3daa542f352d69f3).
 It is a bootstrap subset of `sys`, `sys.api` and `ph.api`, **not complete upstream libraries**.
 The pinned build properties say version `5.0.0`, maturity `alpha`, and dependency
@@ -37,7 +37,7 @@ original Spec wrapper only to parse its chosen fields; it does not admit `Spec`.
 Verify all retained bytes and reproduce source selections locally:
 
 The script also checks that a function source naming its selected declarations
-(the `ph.api` navigation/history selection) reproduces exactly those `Func` members.
+(the `ph.api` navigation/history/watch selection) reproduces exactly those `Func` members.
 
 ```sh
 python3 haystack-core/xeto-profiles/read-by-id/verify.py
@@ -134,26 +134,27 @@ transport policy separately from core admission.
 
 ## Selected navigation function (M2-PR05)
 
-Both `http-manifest.json` and `protocol-manifest.json` select navigation and two history declarations
+Both `http-manifest.json` and `protocol-manifest.json` select navigation, three watch, and two history declarations
 from the unchanged `src/xeto/ph.api/funcs.xeto` (230 lines, SHA-256
-`15a30e0c…3c1b`), lines 1-33 and 151-229 (including history documentation and the closing brace):
+`15a30e0c…3c1b`), lines 1-114 and 151-229 (including history documentation and the closing brace):
 
 ```xeto
 +Funcs {
   nav: Func <op, opGrid, noSideEffects> { req: Grid, returns: Grid }
+  watchSub: Func <op, opGrid> { req: Grid, returns: Grid }
+  watchUnsub: Func <op, opGrid> { req: Grid, returns: Grid }
+  watchPoll: Func <op> { watchId: Str, refresh: Marker?, curValSub: Marker?, returns: Grid }
   hisRead: Func <op, opGrid, noSideEffects> { req: Grid, returns: Grid }
   hisWrite: Func <op, opGrid> { req: Grid, returns: Grid }
 }
 ```
 
-The manifest entry names that selection (`ph.api::nav`, `ph.api::hisRead`, `ph.api::hisWrite`).
+The manifest entry names all six selected declarations.
 Admission requires the parsed `+Funcs` members to equal it exactly, so
-`watchSub`, `watchUnsub`, `watchPoll` and `pointWrite`
-from the same file stay unadmitted and unadvertised. The declaring
+`pointWrite` from the same file stays unadmitted and unadvertised. The declaring
 `ph.api/lib.xeto` (SHA-256 `061cb812…9b21`) is admitted as a **partial library
 identity**: its library view reports `complete: false`, version `5.0.0`,
-dependencies `sys`, `sys.api` and `ph`, and the three selected declarations
-`ph.api::nav`, `ph.api::hisRead`, `ph.api::hisWrite`. In the HTTP closure `ph` and its own `sys.refs` dependency are
+dependencies `sys`, `sys.api` and `ph`, and the six selected declarations shown above. In the HTTP closure `ph` and its own `sys.refs` dependency are
 dependency-only identities (verified bytes, no declarations, not advertised);
 the protocol closure already admits `ph` as a library.
 
@@ -162,10 +163,15 @@ The referenced declarations are already admitted: `sys::Func`, `sys::Funcs` and
 `sys/spec.xeto:149-153`. Any declaration carrying `opGrid` must be a
 `sys::Funcs` op deriving from `sys::Func` with exactly one parameter of type
 `sys::Grid`; its callable codec context reports `op_grid`, which tells the HTTP
-adapter to pass a request grid whole as that parameter. `fit_arguments`
+adapter to pass a request grid whole as that parameter. For navigation, subscribe, unsubscribe, and history, `fit_arguments`
 requires `req` (no default, not nullable) and rejects every other name,
 including `navId`; `fit_result` accepts any native Grid. The native readById
-profile is unchanged.
+profile is unchanged. WatchPoll uses modeled arguments instead: its required Str
+watchId and nullable Marker flags are independently checked against upstream
+lines 114 and 73/88 for the two Grid operations. Missing flags bind null, with
+no Bool defaults. These declarations do not grant native explicit-ACK semantics;
+the [typed watch profile](../../../docs/typed-http-read.md#typed-compatibility-watches-m2-pr11)
+defines the selected application behavior and qualification limits.
 
 ## Selected protocol-metadata closure (M2-PR07)
 

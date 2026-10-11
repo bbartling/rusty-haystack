@@ -1495,7 +1495,7 @@ impl ReadPolicy for ReadByIdOnly {
 
 #[tokio::test]
 async fn resolver_candidate_limit_counts_hidden_entries_before_a_null_read() {
-    for max_candidates in [1, 11, 12] {
+    for max_candidates in [1, 14, 15] {
         let f = Fixture::with_policy(
             true,
             ReadLimits {
@@ -1506,7 +1506,7 @@ async fn resolver_candidate_limit_counts_hidden_entries_before_a_null_read() {
         )
         .await;
         // An absent nullable id with checked=false does no graph lookup. Only
-        // all twelve registry entries, including policy- and capability-hidden entries, spend candidates.
+        // all fifteen registry entries, including policy- and capability-hidden entries, spend candidates.
         let response = f
             .get("/readById?checked=false")
             .header("Xeto-Version", "5")
@@ -1514,8 +1514,8 @@ async fn resolver_candidate_limit_counts_hidden_entries_before_a_null_read() {
             .send()
             .await
             .unwrap();
-        let value = json_response(response, if max_candidates < 12 { 400 } else { 200 }).await;
-        if max_candidates < 12 {
+        let value = json_response(response, if max_candidates < 15 { 400 } else { 200 }).await;
+        if max_candidates < 15 {
             assert_eq!(
                 value,
                 serde_json::json!({

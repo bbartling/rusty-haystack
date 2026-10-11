@@ -70,7 +70,14 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
         assert_eq!(nav.source.sha256, FUNCS_SHA256);
         assert_eq!(
             nav.source.declarations,
-            [NAV, "ph.api::hisRead", "ph.api::hisWrite"]
+            [
+                NAV,
+                "ph.api::watchSub",
+                "ph.api::watchUnsub",
+                "ph.api::watchPoll",
+                "ph.api::hisRead",
+                "ph.api::hisWrite"
+            ]
         );
 
         let library = catalog
@@ -83,7 +90,14 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
         assert_eq!(library.depends, ["sys", "sys.api", "ph"]);
         assert_eq!(
             library.declarations,
-            ["ph.api::hisRead", "ph.api::hisWrite", NAV]
+            [
+                "ph.api::hisRead",
+                "ph.api::hisWrite",
+                NAV,
+                "ph.api::watchPoll",
+                "ph.api::watchSub",
+                "ph.api::watchUnsub"
+            ]
         );
         let pragma = catalog
             .provenance()
@@ -97,10 +111,8 @@ fn nav_signature_metadata_and_partial_library_identity_match_the_pin() {
         );
 
         // The rest of the same upstream file stays outside every selection.
-        for name in ["watchSub", "watchUnsub", "watchPoll", "pointWrite"] {
-            assert!(catalog.declaration(&format!("ph.api::{name}")).is_none());
-            assert!(catalog.declaration(&format!("sys.api::{name}")).is_none());
-        }
+        assert!(catalog.declaration("ph.api::pointWrite").is_none());
+        assert!(catalog.declaration("sys.api::pointWrite").is_none());
         let op_grid = catalog
             .metadata()
             .find(|field| field.slot.name == "opGrid")
@@ -200,7 +212,10 @@ fn only_admitted_op_grid_declarations_pass_a_request_grid_whole() {
             callable.op_grid,
             matches!(
                 operation.spec.qname.as_str(),
-                NAV | "ph.api::hisRead" | "ph.api::hisWrite"
+                NAV | "ph.api::hisRead"
+                    | "ph.api::hisWrite"
+                    | "ph.api::watchSub"
+                    | "ph.api::watchUnsub"
             )
         );
     }

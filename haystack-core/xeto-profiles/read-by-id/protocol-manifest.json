@@ -424,7 +424,7 @@
       "lines": [
         [
           1,
-          33
+          114
         ],
         [
           151,
@@ -433,6 +433,9 @@
       ],
       "declarations": [
         "ph.api::nav",
+        "ph.api::watchSub",
+        "ph.api::watchUnsub",
+        "ph.api::watchPoll",
         "ph.api::hisRead",
         "ph.api::hisWrite"
       ]

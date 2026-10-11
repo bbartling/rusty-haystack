@@ -49,6 +49,9 @@ fn pinned_ops_closure_retains_identity_and_zero_argument_contract() {
             "ph.api::hisWrite",
             // Selected from ph.api/funcs.xeto:33 (M2-PR05); see xeto_nav.rs.
             "ph.api::nav",
+            "ph.api::watchPoll",
+            "ph.api::watchSub",
+            "ph.api::watchUnsub",
             "sys.api::about",
             "sys.api::close",
             "sys.api::filetypes",

@@ -6,7 +6,7 @@ and qualified `/api/` name. Select version 5 to use typed dispatch on names
 shared with legacy H4 routes, or use the qualified name explicitly. The tenth
 binding, [`ph.api::nav`](#navigation), is served only at `/api/ph.api::nav`:
 `/api/nav` remains the scoped H4 navigation route for every version.
-The twelve production handlers (including the two selected history functions below) are a fixed application inventory; routes derive
+The fifteen production handlers (including the selected history and watch functions below) are a fixed application inventory; routes derive
 from it, never from a parsed catalog. Their admitted signatures, codec contexts,
 selected library versions and source provenance come from the graph's current
 `ActivatedCatalog` observation. Binding rejects duplicate qname/version bindings
@@ -17,12 +17,12 @@ discovery, argument decoding/defaults/fitting, metadata and result encoding; it
 verifies that observation is still current before any graph evaluation and
 otherwise fails with `UnavailableErr`. An owned result already produced may
 encode with its retained context. `ReadService::typed_functions()` returns an
-owned retained view of the bindings that need only that read service. History availability is selected per invocation from the exact owned services. The bootstrap profile and its
+owned retained view of the bindings that need only that read service. History and watch availability is selected per invocation from the exact owned services; watches additionally require a scoped session. The bootstrap profile and its
 expanded HTTP closure remain explicit subsets of `sys` and `sys.api`; the HTTP
-closure also admits `ph.api` as a partial library identity holding `nav`, `hisRead` and `hisWrite`,
+closure also admits `ph.api` as a partial library identity holding `nav`, `watchSub`, `watchUnsub`, `watchPoll`, `hisRead` and `hisWrite`,
 with `ph` and `sys.refs` as dependency-only identities. None claims complete
 library admission. Because the managed namespace is derived from the admitted
-selection, scoped H4 `specs`/`spec` reads list those three declarations and typed `libs`
+selection, scoped H4 `specs`/`spec` reads list those six declarations and typed `libs`
 lists `ph.api`; H4 `libs` (definition libraries) is unchanged. The shared
 [contextual Jeto codec](jeto.md) handles admitted native values.
 
@@ -75,8 +75,9 @@ coarse read permission, catalog visibility and the explicit
 `PolicySnapshot::function(&FunctionIdentity)` execution decision must all allow it.
 `FunctionIdentity` binds qname, selected library version, catalog/revision and
 source path/hash. `AllowAll` explicitly permits the function decision; other
-policies must implement it. A fresh immutable policy snapshot is obtained once
-per invocation. A successful discovery does not grant later execution authority.
+policies must implement it. Every invocation obtains a fresh immutable policy
+snapshot for function resolution. A successful discovery does not grant later
+execution authority.
 Qualified names are unambiguous; simple names resolve only among visible
 executable entries, and visible collisions return `AmbiguousFuncErr` without
 including denied candidates. Non-op and unsupported declarations are not callable.
@@ -180,7 +181,7 @@ cannot preserve.
 `noSideEffects:Marker?` are optional. Signatures are descriptive, not a client
 schema. Empty grids fit, while wrong native kinds, missing required row fields
 and incorrectly typed optional fields fail fitting. Structural row specifications
-remain compatible with contextual Jeto. The production entries are the twelve functions listed above, subject to caller policy and owned service selection.
+remain compatible with contextual Jeto. The production entries are the fifteen functions listed above, subject to caller policy and owned service selection.
 
 A null, missing or denied id is indistinguishable: `checked=false` returns null;
 `checked=true` produces the same UnknownEntity error for both. Version-4
@@ -192,9 +193,8 @@ AmbiguousFuncErr includes only bounded visible candidates.
 This bounded error path remains available after a request budget or deadline
 is exhausted. Unsupported methods, including HEAD, return 501. GET requires the
 exact `noSideEffects` marker on the executable entry; absence of a side-effects
-flag or read permission cannot grant GET. `close` and `hisWrite` require POST; the other ten bindings carry the marker. The dispatcher rejects GET with
-`MethodNotAllowedErr` before executing a binding without that marker. No typed
-watchPoll binding is installed.
+flag or read permission cannot grant GET. `close`, `hisWrite`, `watchSub`, `watchUnsub` and `watchPoll` require POST; the other ten bindings carry the marker. The dispatcher rejects GET with
+`MethodNotAllowedErr` before executing a binding without that marker. All typed watch aliases enforce this POST requirement.
 
 ## System functions
 
@@ -302,8 +302,8 @@ existence oracle; version 4 receives an ordinary empty grid, not an error grid.
 Truncation applies to rows only; the request budgets still bind, and any
 budget failure is one atomic `InvalidArgsErr` with no partial rows. The root
 scans every entity in id order at one candidate each, from what remains of
-`max_candidates` after function resolution spends one per fixed binding (twelve
-today, so 9,988 entities at the default 10,000), but copies a record through
+`max_candidates` after function resolution spends one per fixed binding (fifteen
+today, so 9,985 entities at the default 10,000), but copies a record through
 the masked View only when its raw form has `site` and the policy allows the
 entity and its `site` tag. Masking
 only removes tags, so this skip changes no result; it keeps non-site records
@@ -334,7 +334,7 @@ Result fitting precedes encoding. Exact Jeto output boxes the `id` Ref, so
 version 4 bridge needs no legacy projection: native Grid results now keep their
 own metadata through the H4 grid bridge, so nav's `complete` marker reaches
 H4 clients, while the bridge grid synthesized for Dict, null and None results
-still omits it. Watches and `pointWrite` from the same pinned file are not admitted or bound.
+still omits it. `pointWrite` from the same pinned file remains unadmitted and unbound.
 
 ## Single-point history (M2-PR10)
 
@@ -460,3 +460,86 @@ existence check. Dropping or cancelling the waiting future does not release a
 running encoder's slot or owner registration. Those remain with the worker
 until it actually exits. Encoded response bytes leave that worker only after
 successful fitting and bounded encoding.
+
+
+## Typed compatibility watches (M2-PR11)
+
+The selected `ph.api::watchSub`, `ph.api::watchUnsub` and `ph.api::watchPoll`
+bindings use the application's owned `StateSubscriptionService`. Qualified
+routes accept versions 4 and 5; simple `/api/watchSub`, `/api/watchUnsub` and
+`/api/watchPoll` select these bindings only with version 5. Their existing H4
+routes retain their separate compatibility behavior. All three typed functions
+require POST because none has `noSideEffects`. Discovery and invocation require
+both `Subscriptions` and `Read` policy decisions, function/catalog visibility,
+and an actual scoped authenticated or trusted session. Authentication-disabled
+anonymous requests do not advertise or execute these typed bindings. A watch
+belongs to its exact login session; a new login with the same username cannot
+use it. Typed, native explicit-ACK, and legacy watch identities cannot cross
+these owner profiles.
+
+The pinned signatures are `watchSub` and `watchUnsub: Func <op, opGrid> { req:
+Grid, returns: Grid }`, and `watchPoll: Func <op> { watchId: Str, refresh:
+Marker?, curValSub: Marker?, returns: Grid }`. Grid media supplies the whole
+subscribe/unsubscribe request. Version-5 Jeto supplies named `req`; poll takes
+named arguments with a Str watchId and optional Markers, never Bool flags.
+Qualified version-4 watchPoll reads these arguments from **grid metadata** and
+requires no rows. Its successful grid retains `watchId` metadata. Zinc parsing
+checks every cell and scalar boundary for all three typed watch operations;
+malformed poll input cannot consume pending changes or renew the lease.
+
+Subscribe uses `watchDis: Str` metadata to create or `watchId: Str` to add to an
+existing watch. Its rows have one `id` Ref column. Optional `lease` metadata is
+a Number with a duration unit: the local policy rejects zero, negative,
+nonfinite, unitless, or incompatible values. Assignment defaults to 60 seconds,
+is capped by the owner's `max_lease` (300 seconds by default), and is bounded
+by the remaining session lifetime. Response metadata reports the opaque watchId
+and actual assigned lease in seconds. Requested ordering and duplicate positions
+are preserved; missing or newly denied records return all-null positions, with
+an `id` column even when every row is null. Duplicate IDs consume one membership.
+New denied IDs are omitted from membership. Authorized missing IDs remain
+inactive members and count against capacity. Later creation and repeated add
+can return their current row but do not activate that old membership: remove
+and re-add to activate it. Empty add is accepted and renews the lease.
+
+The first ordinary poll returns all active members. Later polls return active
+members changed since the last successful poll; refresh returns all active
+members. Poll output is in entity-ID order. Add and remove renew the lease but
+preserve that global poll fence, including when an existing member is added
+again. A new member changed after that fence may therefore also appear in the
+next poll. Each member's enrollment revision excludes deletions before enrollment
+from terminal-deletion detection. `curValSub` narrows already authorized rows to
+exactly `id`, `curVal`, and `curStatus` columns; it cannot restore masked values.
+Successful poll, refresh, add, and remove renew the assigned lease at publication.
+
+Unsubscribe requires watchId metadata, removes its listed IDs, and returns an
+empty grid. Empty removal renews without closing; a `close` Marker explicitly
+closes. Repeated cleanup of a missing, expired, closed, or terminal identity is
+an empty idempotent success. A retained identity belonging to another exact
+session is rejected before cleanup. Active members losing authorization are
+terminal. Deletion (including delete/recreate), changelog gap/overflow, catalog
+or policy change, graph incarnation change, session revocation, expiry and
+owner shutdown require recreation; refresh cannot revive a terminal identity.
+Terminal poll/add typically reports `UnavailableErr`; permission loss reports
+`PermissionErr`. There are no invented tombstones or resync markers on this wire.
+Deletion terminality is a selected local difference from Haxall's silent omission.
+
+The adapter retains one request admission, catalog observation, binding policy
+scope and cumulative budget through authorized capture, result fitting, and full
+output encoding. Capture rejects a different policy scope before copying records;
+subsequent checks retain that scope through publication and cleanup. Function
+permission from one scope cannot combine with record permission from another.
+It prepares output before publishing membership, lease or implicit poll-fence
+changes. Known representation or output-budget failure therefore publishes no
+successful transition. Graph/record conflicts recapture and re-encode under the
+same budget. Terminal safety transitions can still invalidate a watch on an
+error. A transport loss or cancellation after publication has an unknown outcome:
+there is no creation key, automatic retry, explicit ACK, or replay guarantee.
+After a lost poll, explicitly refresh a still-active identity and replace client
+state. After lost initial creation, recreation may leave the unknown old watch
+until expiry. Sharing the native owner does not give these compatibility calls
+the native M1 explicit-ACK recovery contract.
+
+Local fixtures cover HTTP dispatch, membership/fence behavior, masking and exact
+sessions, terminal recovery, bounded owner storage, and prepublication failures.
+The pinned Xeto and Haxall sources are contract evidence; no upstream server was
+executed, and full H5 conformance or durable watch recovery is not claimed.

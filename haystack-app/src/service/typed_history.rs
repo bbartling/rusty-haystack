@@ -10,10 +10,6 @@ use haystack_core::{
     data::HGrid,
 };
 
-pub(super) enum Invocation {
-    Response(TypedInvocationResponse),
-    History(Prepared),
-}
 enum Operation {
     Read {
         request: history::HistoryReadRequest,
