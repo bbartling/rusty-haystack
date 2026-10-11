@@ -25,6 +25,7 @@ pub enum ApiError {
         candidates: Vec<String>,
     },
     MethodNotAllowed,
+    SchemaMethodNotAllowed,
     UnknownEntity,
     Permission,
     AuthRequired,
@@ -42,7 +43,7 @@ impl ApiError {
             | Self::UnsupportedVersion
             | Self::AuthMalformed
             | Self::AmbiguousFunction { .. } => 400,
-            Self::MethodNotAllowed => 405,
+            Self::MethodNotAllowed | Self::SchemaMethodNotAllowed => 405,
             Self::AuthRequired => 401,
             Self::AuthRejected | Self::Permission => 403,
             Self::InvalidPath | Self::UnknownEntity | Self::UnknownFunction(_) => 404,
@@ -72,6 +73,9 @@ impl ApiError {
                     return Self::InvalidPath.json();
                 }
                 return std::borrow::Cow::Owned(serde_json::json!({"spec":"sys.api::AmbiguousFuncErr","status":400,"dis":"Ambiguous function","funcName":name,"candidates":candidates}).to_string());
+            }
+            Self::SchemaMethodNotAllowed => {
+                r#"{"spec":"sys.api::MethodNotAllowedErr","status":405,"dis":"Schema export requires GET","allow":["GET"]}"#
             }
             Self::MethodNotAllowed => {
                 r#"{"spec":"sys.api::MethodNotAllowedErr","status":405,"dis":"Function requires POST","allow":["POST"]}"#
@@ -841,6 +845,85 @@ pub(crate) fn encode(
     };
     finish(body, request, budget, request.version)
 }
+/// Project-owned document controls deliberately do not share Func argument parsing.
+pub(crate) fn schema_controls(input: &TypedInvocationInput) -> Result<bool, ApiError> {
+    if input.post {
+        return Err(ApiError::SchemaMethodNotAllowed);
+    }
+    if input.versions.len() != 1 || input.versions[0] != "5" {
+        return Err(ApiError::UnsupportedVersion);
+    }
+    if !input.query.is_empty() || !input.body.is_empty() || input.content_encoded {
+        return Err(ApiError::InvalidArgs);
+    }
+    if input
+        .accepts
+        .iter()
+        .any(|value| !matches!(value.as_str(), "application/json" | "*/*"))
+    {
+        return Err(ApiError::NotAcceptable);
+    }
+    accepts_gzip(&input.accept_encodings)
+}
+pub(crate) fn schema_response(
+    document: Value,
+    budget: &mut Budget,
+    gzip: bool,
+) -> Result<TypedInvocationResponse, ApiError> {
+    struct Writer<'a> {
+        bytes: Vec<u8>,
+        budget: &'a mut Budget,
+        failure: Option<ApiError>,
+    }
+    impl std::io::Write for Writer<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let result = (|| {
+                if self.bytes.len().saturating_add(bytes.len())
+                    > self.budget.limits.max_output_bytes
+                {
+                    return Err(ApiError::from(ReadError::Budget(BudgetKind::Output)));
+                }
+                self.budget.charge(BudgetKind::Work, bytes.len())?;
+                self.budget
+                    .charge(BudgetKind::Retained, bytes.len().saturating_mul(2))?;
+                self.bytes.extend_from_slice(bytes);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.failure = Some(error);
+                return Err(std::io::Error::other("schema output budget"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    if let Some(hook) = &budget.typed_encode_hook {
+        hook();
+    }
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        budget,
+        failure: None,
+    };
+    if serde_json::to_writer(&mut writer, &document).is_err() {
+        return Err(writer.failure.unwrap_or(ApiError::Internal));
+    }
+    let body = writer.bytes;
+    finish(
+        body,
+        &Request {
+            args: HDict::new(),
+            version: "5",
+            output: Media::Jeto(jeto::Boxing::None),
+            gzip,
+        },
+        budget,
+        "5",
+    )
+}
 fn legacy_metadata(value: &mut Kind, function: &str, budget: &mut Budget) -> Result<(), ApiError> {
     if function == "sys.api::about"
         && let Kind::Dict(info) = value
@@ -1026,6 +1109,7 @@ mod tests {
                 candidates: vec!["a::same".into(), "b::same".into()],
             },
             ApiError::MethodNotAllowed,
+            ApiError::SchemaMethodNotAllowed,
             ApiError::UnknownEntity,
             ApiError::Permission,
             ApiError::AuthRequired,

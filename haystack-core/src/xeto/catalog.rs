@@ -16,6 +16,7 @@ use crate::kinds::{HRef, Kind};
 mod activation;
 mod callable;
 mod project;
+pub mod schema;
 mod strict;
 pub use activation::{ActivatedCatalog, ActivationControl, ActivationError, ActivationRejection};
 pub use callable::{ARGUMENTS, CallableContext};

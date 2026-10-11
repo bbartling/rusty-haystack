@@ -65,3 +65,6 @@ pub use service::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use types::*;
+
+#[cfg(test)]
+mod schema_tests;

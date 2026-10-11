@@ -32,9 +32,9 @@ pub enum FitError<E> {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct Constraints {
-    patterns: Vec<Regex>,
-    min: Option<i64>,
-    max: Option<i64>,
+    pub(super) patterns: Vec<Regex>,
+    pub(super) min: Option<i64>,
+    pub(super) max: Option<i64>,
 }
 impl Constraints {
     /// `qname` is the constrained type; `located` names the declaration (and
@@ -113,7 +113,7 @@ impl Constraints {
 #[derive(Debug, Clone)]
 pub(super) struct CompiledSlot {
     pub(super) slot: Slot,
-    constraints: Constraints,
+    pub(super) constraints: Constraints,
 }
 #[derive(Debug, Clone, Default)]
 pub(super) struct CompiledType {

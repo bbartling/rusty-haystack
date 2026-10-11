@@ -6,8 +6,7 @@
   `rust-toolchain.toml`. It is also the CI MSRV lane for the workspace's declared
   `rust-version = "1.99"`. A separate Ubuntu lane pins current stable Rust 1.99.0; both
   pins currently coincide and move only through reviewed changes.
-- **[uv](https://docs.astral.sh/uv/)** and **Python 3.12**, only if you touch the Python
-  bindings. CI pins the interpreter version deliberately — `pyo3` is configured without
+- **[uv](https://docs.astral.sh/uv/)** and **Python 3.12**, for the Python bindings and the full schema/client validation stage. CI pins the interpreter version deliberately — `pyo3` is configured without
   `abi3`, so every build is interpreter-specific.
 
 ## Dependency baseline
@@ -92,6 +91,13 @@ commands, including the `chrono-tz` feature surface in both the MSRV and current
 lanes (currently Rust 1.99.0). It rebuilds the Python extension before testing it and
 lints the PyO3 crate. Builds, lints and tests use `--locked` to validate the checked-in
 graph. The policy tests require `python3` and only use its standard library.
+
+The gate also runs `uv run --locked --project scripts/schema-client --python 3.12
+python scripts/schema-client/validate.py`. This isolated, locked environment validates
+the complete schema export and an unedited generated Python client against a managed
+loopback fixture. It does not reuse the product PyO3 environment. Missing uv makes
+the gate incomplete; a failing install, validator, generator or HTTP assertion fails
+the gate. See [Schema export](docs/schema-export.md) for the exact qualification.
 
 **Read the exit status, not just the last line.** A check that could not run is never
 reported as one that passed:
