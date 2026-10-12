@@ -565,7 +565,10 @@ async fn reservation_hit_reauthorizes_retained_intent_before_outcome_or_conflict
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
 async fn snapshot_pages_and_reference_traversal_share_sql_view_and_release_capacity() {
-    let config = fixture("snapshot");
+    let mut config = fixture("snapshot");
+    // This case accounts for snapshot-owned resources exactly. The separate
+    // periodic ownership case below exercises overlapping refresh connections.
+    config.limits.refresh_interval = Duration::from_secs(60);
     let owner = open(config.clone()).await;
     let handle = owner.handle();
     let entities = handle.mutation_service().unwrap();
@@ -657,6 +660,59 @@ async fn snapshot_pages_and_reference_traversal_share_sql_view_and_release_capac
         "dropped snapshot left no server transaction"
     );
     close(owner).await;
+    cleanup(&config).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
+async fn periodic_refresh_owns_a_separate_connection_and_joins_before_owner_close() {
+    let mut config = fixture("snapshot_periodic_owner");
+    config.limits.refresh_interval = Duration::from_millis(100);
+    let owner = open(config.clone()).await;
+    let reads = owner.handle().read_service();
+    let backend = reads.postgres_backend();
+    let snapshot = reads.postgres_snapshot(context()).await.unwrap();
+    let (entered, periodic_started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *backend.refresh_fault.lock() = Some(super::storage::RefreshFault {
+        stage: super::storage::RefreshStage::AfterEntities,
+        entered,
+        release: released,
+    });
+    // No admission or explicit health call triggers this capture. The actual
+    // application-owned timer starts it and the barrier retains its SQL cut.
+    tokio::time::timeout(Duration::from_secs(3), periodic_started)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reads.load().admitted,
+        1,
+        "only the snapshot owns read admission"
+    );
+    assert_eq!(backend.pool.size() as usize - backend.pool.num_idle(), 2);
+    assert_eq!(server_sessions(&config).await, (2, 2));
+    snapshot.close().await.unwrap();
+    assert_eq!(reads.load().admitted, 0);
+    assert_eq!(backend.pool.size() as usize - backend.pool.num_idle(), 1);
+    assert_eq!(server_sessions(&config).await, (1, 1));
+    let mut closing = tokio::spawn(close(owner));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut closing)
+            .await
+            .is_err(),
+        "owner close must join the actual periodic capture before closing its pool"
+    );
+    assert_eq!(backend.pool.size() as usize - backend.pool.num_idle(), 1);
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), closing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(backend.pool.is_closed());
+    assert_eq!(backend.pool.size(), 0);
+    assert_eq!(reads.load().admitted, 0);
+    assert_eq!(server_sessions(&config).await, (0, 0));
     cleanup(&config).await;
 }
 
