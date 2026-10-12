@@ -27,7 +27,7 @@ fn context() -> ReadContext {
     )
 }
 fn request(service: &MutationService, id: &str, ops: Vec<EntityOperation>) -> EntityBatchRequest {
-    let state = service.store().graph().state();
+    let state = service.store().native_graph().unwrap().state();
     EntityBatchRequest {
         identity: OperationIdentity {
             operation_id: id.into(),
@@ -50,7 +50,7 @@ async fn managed(
         ApplicationBuilder::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
     let service = MutationService::with_provider(
         builder.handle().read_service(),
-        EphemeralMutationStore::new(graph),
+        EntityMutationStore::new(graph),
         policy,
         limits,
         provider,
@@ -98,7 +98,7 @@ async fn mixed_batch_is_atomic_and_retry_returns_original_after_removed_entity_a
     )
     .await;
     let cursor = bootstrap(&service).await;
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     let mut patch = HDict::new();
     patch.set("label", Kind::Str("changed".into()));
     let r = request(
@@ -264,7 +264,7 @@ async fn invalid_denied_stale_limit_and_capacity_failures_leave_graph_and_feed_u
         Arc::new(EphemeralProvider),
     )
     .await;
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     let before = graph.state();
     for (id, ops) in [
         ("invalid", vec![EntityOperation::Add(row("a"))]),
@@ -394,7 +394,7 @@ async fn provider_rejection_unknown_reply_and_abandoned_pending_have_distinct_re
             "provider",
             vec![EntityOperation::Remove { id: "a".into() }],
         );
-        let before = service.store().graph().state().revision;
+        let before = service.store().native_graph().unwrap().state().revision;
         let result = service.submit(context(), r.clone()).await.unwrap();
         let reconciled = service
             .reconcile(context(), r.identity.clone())
@@ -410,7 +410,10 @@ async fn provider_rejection_unknown_reply_and_abandoned_pending_have_distinct_re
                     }
                 ));
                 assert_eq!(result, reconciled);
-                assert_eq!(service.store().graph().state().revision, before)
+                assert_eq!(
+                    service.store().native_graph().unwrap().state().revision,
+                    before
+                )
             }
             1 => {
                 assert!(matches!(result, MutationOutcome::Unknown { .. }));
@@ -424,7 +427,10 @@ async fn provider_rejection_unknown_reply_and_abandoned_pending_have_distinct_re
                         ..
                     }
                 ));
-                assert_eq!(service.store().graph().state().revision, before)
+                assert_eq!(
+                    service.store().native_graph().unwrap().state().revision,
+                    before
+                )
             }
         }
         let _ = service.submit(context(), r).await.unwrap();
@@ -448,8 +454,12 @@ async fn service_recreation_reconciles_surviving_store_but_new_store_reports_unk
     let receipt = committed(service.submit(context(), r.clone()).await.unwrap());
     let store = service.store();
     close(owner).await;
-    let builder =
-        ApplicationBuilder::new(store.graph(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
+    let builder = ApplicationBuilder::new(
+        store.native_graph().unwrap(),
+        Arc::new(AllowAll),
+        ReadLimits::default(),
+    )
+    .unwrap();
     let replacement = MutationService::new(
         builder.handle().read_service(),
         store.clone(),
@@ -474,7 +484,7 @@ async fn service_recreation_reconciles_surviving_store_but_new_store_reports_unk
     );
     let fresh = MutationService::new(
         replacement.read_service(),
-        EphemeralMutationStore::new(store.graph()),
+        EntityMutationStore::new(store.native_graph().unwrap()),
         Arc::new(AllowAllMutations),
         MutationLimits::default(),
     )
@@ -596,7 +606,7 @@ async fn feed_sanitizes_current_preimages_removals_nested_references_and_denied_
     .unwrap();
     let service = MutationService::new(
         builder.handle().read_service(),
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         Arc::new(AllowAllMutations),
         MutationLimits::default(),
     )
@@ -721,7 +731,12 @@ async fn reversed_provider_completion_and_native_writer_use_committed_graph_orde
     let task = tokio::spawn(async move { clone.submit(context(), first).await.unwrap() });
     provider.entered.acquire().await.unwrap().forget();
     let receipt = committed(service.submit(context(), second).await.unwrap());
-    service.store().graph().add(row("native")).unwrap();
+    service
+        .store()
+        .native_graph()
+        .unwrap()
+        .add(row("native"))
+        .unwrap();
     tx.send(()).unwrap();
     assert!(matches!(
         task.await.unwrap(),
@@ -750,7 +765,13 @@ async fn reversed_provider_completion_and_native_writer_use_committed_graph_orde
     assert_eq!(page.changes[0].revision, receipt.after_revision);
     assert_eq!(page.changes[1].revision, receipt.after_revision + 1);
     assert!(page.complete);
-    assert!(service.store().graph().read(|g| g.get("first").is_none()));
+    assert!(
+        service
+            .store()
+            .native_graph()
+            .unwrap()
+            .read(|g| g.get("first").is_none())
+    );
     close(owner).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -762,7 +783,7 @@ async fn concurrent_readers_observe_only_complete_before_or_after_batch() {
         Arc::new(EphemeralProvider),
     )
     .await;
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let saw_before = Arc::new(AtomicBool::new(false));
     let saw_after = Arc::new(AtomicBool::new(false));
@@ -845,7 +866,7 @@ async fn feed_cursor_rejects_principal_catalog_and_every_graph_replacement_incar
             .await,
         Err(ReadError::StaleCursor)
     ));
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     graph.write(|g| g.set_namespace(haystack_core::ontology::DefNamespace::new()));
     assert!(matches!(
         service
@@ -905,7 +926,7 @@ async fn service_unit_must_fit_feed_byte_limit_before_receipt_or_entity_effect()
         Arc::new(EphemeralProvider),
     )
     .await;
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     let before = graph.state();
     let mut large = row("large");
     large.set("text", Kind::Str("x".repeat(12_000)));
@@ -945,7 +966,7 @@ async fn cancelled_caller_keeps_worker_owned_and_reconciles_guaranteed_precommit
         provider.clone(),
     )
     .await;
-    let before = service.store().graph().state();
+    let before = service.store().native_graph().unwrap().state();
     let r = request(
         &service,
         "cancelled",
@@ -967,7 +988,7 @@ async fn cancelled_caller_keeps_worker_owned_and_reconciles_guaranteed_precommit
     })
     .await
     .unwrap();
-    assert_eq!(service.store().graph().state(), before);
+    assert_eq!(service.store().native_graph().unwrap().state(), before);
     assert!(matches!(
         service.reconcile(context(), identity).await.unwrap(),
         MutationOutcome::Rejected {
@@ -1001,7 +1022,7 @@ async fn deferred_plan_rechecks_policy_generation_after_provider_returns() {
         provider.clone(),
     )
     .await;
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     let before = graph.state();
     let r = request(
         &service,
@@ -1040,7 +1061,7 @@ async fn deferred_plan_retains_work_and_admission_and_rejects_after_owner_seal()
         provider.clone(),
     )
     .await;
-    let before = service.store().graph().state();
+    let before = service.store().native_graph().unwrap().state();
     let r = request(
         &service,
         "deferred-close",
@@ -1061,7 +1082,7 @@ async fn deferred_plan_retains_work_and_admission_and_rejects_after_owner_seal()
             ..
         }
     ));
-    assert_eq!(service.store().graph().state(), before);
+    assert_eq!(service.store().native_graph().unwrap().state(), before);
     close(owner).await;
 }
 
@@ -1074,7 +1095,7 @@ async fn deferred_plan_can_publish_once_and_reconcile_after_provider_returns() {
         provider.clone(),
     )
     .await;
-    let graph = service.store().graph();
+    let graph = service.store().native_graph().unwrap();
     let before = graph.state();
     let r = request(
         &service,

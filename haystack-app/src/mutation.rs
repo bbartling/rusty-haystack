@@ -1,6 +1,9 @@
-//! Authorized entity commits backed by an explicitly ephemeral receipt store.
-//! The provider protocol seam supports failure/uncertainty fixtures; it does not
-//! claim database, disk, crash-recovery or multi-process commit qualification.
+//! Authorized entity commits over the selected application authority.
+//! The default store is ephemeral; the optional PostgreSQL application selects
+//! a durable receipt authority without exposing its mutable projection.
+#[cfg(feature = "postgres")]
+#[path = "mutation_postgres.rs"]
+mod postgres;
 use crate::{
     BudgetKind, Principal, ReadAdmission, ReadContext, ReadError, ReadService, budget::Budget,
 };
@@ -123,27 +126,36 @@ struct Receipts {
 struct Store {
     graph: SharedGraph,
     dataset: [u8; 16],
+    native_writes: bool,
+    #[cfg(feature = "postgres")]
+    backend: Option<Arc<crate::postgres::storage::Backend>>,
     receipts: Mutex<Receipts>,
 }
-/// Retain this handle when recreating a service around the same in-memory state.
-/// Recreating the store creates a new dataset; restarting the graph creates a
-/// new incarnation. This handle provides no persistence beyond its process.
+/// The selected entity receipt authority and its read-only graph projection.
+/// `new` creates an ephemeral store with a fresh dataset. The optional PostgreSQL
+/// application constructor restores a durable store and keeps native writes private.
 #[derive(Clone)]
-pub struct EphemeralMutationStore {
+pub struct EntityMutationStore {
     inner: Arc<Store>,
 }
-impl EphemeralMutationStore {
+impl EntityMutationStore {
     pub fn new(graph: SharedGraph) -> Self {
         Self {
             inner: Arc::new(Store {
                 graph,
                 dataset: rand::random(),
+                native_writes: true,
+                #[cfg(feature = "postgres")]
+                backend: None,
                 receipts: Mutex::new(Receipts::default()),
             }),
         }
     }
-    pub fn graph(&self) -> SharedGraph {
-        self.inner.graph.clone()
+    pub fn graph(&self) -> haystack_core::graph::GraphView {
+        self.inner.graph.view()
+    }
+    pub fn native_graph(&self) -> Option<SharedGraph> {
+        self.inner.native_writes.then(|| self.inner.graph.clone())
     }
     pub fn dataset(&self) -> [u8; 16] {
         self.inner.dataset
@@ -184,6 +196,8 @@ pub struct PreparedMutation {
     store: Arc<Store>,
     binding: Binding,
     plan: PreparedBatch,
+    #[cfg(feature = "postgres")]
+    batch_limits: BatchLimits,
     receipt: EntityReceipt,
     deadline: Instant,
     cancel: CancellationToken,
@@ -220,6 +234,10 @@ impl PreparedMutation {
     }
     /// Guaranteed no effect because this still owns the unconsumed plan.
     pub fn reject(self, reason: RejectionReason) -> MutationOutcome {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = self.store.backend.clone() {
+            return self.reject_postgres(&backend, reason);
+        }
         let result = MutationOutcome::Rejected {
             identity: self.receipt.identity.clone(),
             reason,
@@ -232,6 +250,10 @@ impl PreparedMutation {
         result
     }
     pub fn publish(self) -> MutationOutcome {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = self.store.backend.clone() {
+            return self.publish_postgres(&backend);
+        }
         if let Some(reason) = self.stop() {
             return self.reject(reason);
         }
@@ -370,17 +392,17 @@ impl PolicyVersion {
 }
 pub(crate) struct MutationInner {
     pub(crate) reads: ReadService,
-    store: EphemeralMutationStore,
+    store: EntityMutationStore,
     policy: Arc<RwLock<PolicyVersion>>,
     limits: MutationLimits,
     provider: Arc<dyn MutationProvider>,
     pub(crate) cursor_key: [u8; 32],
-    pub(crate) started: Instant,
+    pub(crate) started: Option<Instant>,
 }
 impl MutationService {
     pub fn new(
         reads: ReadService,
-        store: EphemeralMutationStore,
+        store: EntityMutationStore,
         policy: Arc<dyn MutationPolicy>,
         limits: MutationLimits,
     ) -> Result<Self, ReadError> {
@@ -388,12 +410,18 @@ impl MutationService {
     }
     pub fn with_provider(
         reads: ReadService,
-        store: EphemeralMutationStore,
+        store: EntityMutationStore,
         policy: Arc<dyn MutationPolicy>,
         limits: MutationLimits,
         provider: Arc<dyn MutationProvider>,
     ) -> Result<Self, ReadError> {
         limits.validate()?;
+        #[cfg(feature = "postgres")]
+        if store.inner.backend.is_some()
+            && provider.qualification() != ReceiptQualification::PostgresDurable
+        {
+            return Err(ReadError::Forbidden);
+        }
         if !reads.graph().shares_storage(&store.graph()) {
             return Err(ReadError::Forbidden);
         }
@@ -405,14 +433,14 @@ impl MutationService {
                 limits,
                 provider,
                 cursor_key: rand::random(),
-                started: Instant::now(),
+                started: Some(Instant::now()),
             }),
         })
     }
     pub fn read_service(&self) -> ReadService {
         self.inner.reads.clone()
     }
-    pub fn store(&self) -> EphemeralMutationStore {
+    pub fn store(&self) -> EntityMutationStore {
         self.inner.store.clone()
     }
     pub fn limits(&self) -> &MutationLimits {
@@ -486,6 +514,13 @@ impl MutationInner {
         let identity = request.identity.clone();
         match self.prepare_and_submit(&principal, request, budget) {
             Ok(result) => result,
+            #[cfg(feature = "postgres")]
+            Err(RejectionReason::Provider) if self.store.inner.backend.is_some() => {
+                MutationOutcome::Unknown {
+                    identity,
+                    cause: UnknownCause::Provider,
+                }
+            }
             Err(reason) => MutationOutcome::Rejected { identity, reason },
         }
     }
@@ -599,6 +634,14 @@ impl MutationInner {
         // this one prepared. Never overwrite or reapply that pending operation.
         if let Some(record) = table.entries.get(&binding).cloned() {
             drop(table);
+            #[cfg(feature = "postgres")]
+            let record = if self.store.inner.backend.is_some() {
+                self.lookup(&binding, budget)
+                    .map_err(|_| RejectionReason::Provider)?
+                    .ok_or(RejectionReason::Provider)?
+            } else {
+                record
+            };
             if !policy.rules.authorize_reconcile(
                 principal,
                 &request.identity,
@@ -626,6 +669,33 @@ impl MutationInner {
             identity: request.identity.clone(),
             cause: UnknownCause::Pending,
         };
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = &self.store.inner.backend {
+            match postgres::reserve(backend, &binding, &canonical, &pending, budget.deadline) {
+                Ok(Some(record)) => {
+                    drop(table);
+                    if !policy.rules.authorize_reconcile(
+                        principal,
+                        &request.identity,
+                        Some(&record.request),
+                    ) {
+                        return Err(RejectionReason::Forbidden);
+                    }
+                    return if record.canonical.as_ref() == canonical {
+                        Ok(record.outcome)
+                    } else {
+                        Err(RejectionReason::Conflict)
+                    };
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return Ok(MutationOutcome::Unknown {
+                        identity: request.identity.clone(),
+                        cause: UnknownCause::Provider,
+                    });
+                }
+            }
+        }
         table.entries.insert(
             binding.clone(),
             Record {
@@ -641,6 +711,8 @@ impl MutationInner {
             store: self.store.inner.clone(),
             binding: binding.clone(),
             plan,
+            #[cfg(feature = "postgres")]
+            batch_limits,
             receipt,
             deadline: budget.deadline,
             cancel: budget.cancel.clone(),
@@ -682,6 +754,12 @@ impl MutationInner {
         Ok(())
     }
     fn lookup(&self, binding: &Binding, budget: &Budget) -> Result<Option<Record>, ReadError> {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = &self.store.inner.backend {
+            budget.check()?;
+            return postgres::lookup(backend, binding, budget.deadline)
+                .map_err(|_| ReadError::Unavailable);
+        }
         loop {
             if let Some(table) = self
                 .store
@@ -720,6 +798,28 @@ impl MutationInner {
             return Err(ReadError::Forbidden);
         }
         budget.check()?;
+        #[cfg(feature = "postgres")]
+        let record = {
+            let mut record = record;
+            if let (Some(backend), Some(found)) = (&self.store.inner.backend, &record)
+                && matches!(
+                    found.outcome,
+                    MutationOutcome::Unknown {
+                        cause: UnknownCause::Pending,
+                        ..
+                    }
+                )
+            {
+                record = postgres::reconcile(
+                    backend,
+                    &binding,
+                    RejectionReason::Provider,
+                    budget.deadline,
+                )
+                .map_err(|_| ReadError::Unavailable)?;
+            }
+            record
+        };
         Ok(record.map_or(
             MutationOutcome::Unknown {
                 identity,
@@ -768,6 +868,7 @@ fn read_reason(error: ReadError) -> RejectionReason {
         ReadError::Capacity => RejectionReason::Capacity,
         ReadError::Cancelled => RejectionReason::Cancelled,
         ReadError::Deadline => RejectionReason::Deadline,
+        ReadError::Unavailable => RejectionReason::Provider,
         _ => RejectionReason::Limit,
     }
 }
@@ -787,7 +888,7 @@ mod tests {
         time::Duration,
     };
     struct Observer {
-        store: EphemeralMutationStore,
+        store: EntityMutationStore,
         policy: Arc<RwLock<PolicyVersion>>,
         released: AtomicBool,
     }
@@ -814,7 +915,7 @@ mod tests {
             crate::ReadLimits::default(),
         )
         .unwrap();
-        let store = EphemeralMutationStore::new(graph.clone());
+        let store = EntityMutationStore::new(graph.clone());
         let service = MutationService::new(
             reads,
             store.clone(),

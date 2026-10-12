@@ -10,7 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 
 use haystack_core::auth::{AuthHeader, parse_auth_header};
-use haystack_core::graph::SharedGraph;
+use haystack_core::graph::{GraphView, SharedGraph};
 use haystack_core::ontology::DefNamespace;
 
 use crate::actions::ActionRegistry;
@@ -24,7 +24,8 @@ use haystack_app::HisStore;
 /// Builder for the Haystack HTTP server.
 pub struct HaystackServer {
     repository: Option<Arc<haystack_core::xeto::repository::LibraryRepository>>,
-    graph: SharedGraph,
+    graph: GraphView,
+    native_graph: Option<SharedGraph>,
     namespace: Option<DefNamespace>,
     read_service: Option<haystack_app::ReadService>,
     application: Option<haystack_app::ApplicationHandle>,
@@ -43,7 +44,8 @@ impl HaystackServer {
     /// Create a new server with the given entity graph.
     pub fn new(graph: SharedGraph) -> Self {
         Self {
-            graph,
+            graph: graph.view(),
+            native_graph: Some(graph),
             repository: None,
             namespace: None,
             read_service: None,
@@ -84,6 +86,7 @@ impl HaystackServer {
     pub fn with_scoped_reads(mut self, application: haystack_app::ApplicationHandle) -> Self {
         let service = application.read_service();
         self.graph = service.graph();
+        self.native_graph = service.native_graph();
         self.read_service = Some(service);
         self.application.get_or_insert(application);
         self
@@ -97,6 +100,7 @@ impl HaystackServer {
     /// that owns this handle, including for the legacy profile.
     pub fn with_application(mut self, application: haystack_app::ApplicationHandle) -> Self {
         self.graph = application.read_service().graph();
+        self.native_graph = application.read_service().native_graph();
         self.application = Some(application);
         self
     }
@@ -208,15 +212,21 @@ impl HaystackServer {
                 "attach configured application adapters before starting their ApplicationBuilder",
             ));
         }
+        let graph = self.native_graph.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable storage requires its application owner",
+            )
+        })?;
         let builder = haystack_app::ApplicationBuilder::new(
-            self.graph.clone(),
+            graph.clone(),
             Arc::new(haystack_app::AllowAll),
             haystack_app::ReadLimits::default(),
         )
         .map_err(std::io::Error::other)?;
         let subscriptions = haystack_app::StateSubscriptionService::new(
             builder.handle().read_service(),
-            haystack_app::EphemeralMutationStore::new(self.graph.clone()),
+            haystack_app::EntityMutationStore::new(graph),
             haystack_app::SubscriptionLimits::default(),
         )
         .map_err(std::io::Error::other)?;
@@ -340,14 +350,21 @@ impl HaystackServer {
     fn build_router(self) -> std::io::Result<Router> {
         self.validate_configuration()?;
         let profile = self.profile();
-        // Initialize only when absent; preserve an embedding's existing catalog.
-        self.graph.write(|graph| {
-            if let Some(namespace) = self.namespace {
-                graph.set_namespace(Arc::new(namespace));
-            } else if graph.namespace_arc().is_none() {
-                graph.set_namespace(Arc::new(DefNamespace::new()));
-            }
-        });
+        // Namespace initialization requires the explicit native capability.
+        if let Some(writer) = &self.native_graph {
+            writer.write(|graph| {
+                if let Some(namespace) = self.namespace {
+                    graph.set_namespace(Arc::new(namespace));
+                } else if graph.namespace_arc().is_none() {
+                    graph.set_namespace(Arc::new(DefNamespace::new()));
+                }
+            });
+        } else if self.namespace.is_some() || self.graph.read(|g| g.namespace_arc().is_none()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable catalog replacement is unavailable",
+            ));
+        }
         let history_service = self
             .application
             .as_ref()
@@ -375,6 +392,7 @@ impl HaystackServer {
             history_mutation_service,
             application: self.application,
             graph: self.graph,
+            native_graph: self.native_graph,
             read_service: self.read_service,
             profile,
             lib_mutations: parking_lot::Mutex::new(()),

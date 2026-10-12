@@ -116,7 +116,7 @@ fn setup(policy: Arc<dyn MutationPolicy>) -> (SharedGraph, ApplicationBuilder, M
         ApplicationBuilder::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
     let service = MutationService::new(
         builder.handle().read_service(),
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         policy,
         MutationLimits::default(),
     )

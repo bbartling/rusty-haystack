@@ -207,6 +207,16 @@ impl MutationService {
         mac.update(scope.as_bytes());
         mac
     }
+    fn feed_clock(&self) -> u128 {
+        self.inner.started.map_or_else(
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(u128::MAX, |d| d.as_nanos())
+            },
+            |started| started.elapsed().as_nanos(),
+        )
+    }
     fn encode_cursor(
         &self,
         principal: &Principal,
@@ -215,10 +225,7 @@ impl MutationService {
         position: u64,
     ) -> String {
         let expires = u64::try_from(
-            self.inner
-                .started
-                .elapsed()
-                .as_nanos()
+            self.feed_clock()
                 .saturating_add(self.inner.reads.limits().cursor_ttl.as_nanos()),
         )
         .unwrap_or(u64::MAX);
@@ -262,7 +269,7 @@ impl MutationService {
         if bytes[1..17] != self.store().dataset()
             || bytes[17..33] != state.incarnation
             || number(33) != state.catalog_generation
-            || u128::from(number(49)) <= self.inner.started.elapsed().as_nanos()
+            || u128::from(number(49)) <= self.feed_clock()
         {
             return Err(ReadError::StaleCursor);
         }

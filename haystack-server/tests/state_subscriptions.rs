@@ -45,7 +45,7 @@ impl Running {
             ApplicationBuilder::new(graph.clone(), policy, ReadLimits::default()).unwrap();
         let service = StateSubscriptionService::new(
             builder.handle().read_service(),
-            EphemeralMutationStore::new(graph.clone()),
+            EntityMutationStore::new(graph.clone()),
             SubscriptionLimits::default(),
         )
         .unwrap();
@@ -437,7 +437,7 @@ async fn subscriptions_coexist_with_history_writes_and_optional_entity_mutation_
             ApplicationBuilder::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default())
                 .unwrap();
         let reads = builder.handle().read_service();
-        let entity_store = EphemeralMutationStore::new(graph.clone());
+        let entity_store = EntityMutationStore::new(graph.clone());
         let subscriptions = StateSubscriptionService::new(
             reads.clone(),
             entity_store.clone(),
@@ -578,7 +578,7 @@ async fn lost_http_creation_and_acknowledgement_recover_only_by_explicit_same_ke
         ApplicationBuilder::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
     let service = StateSubscriptionService::new(
         builder.handle().read_service(),
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         SubscriptionLimits::default(),
     )
     .unwrap();
@@ -786,7 +786,7 @@ async fn system_close_isolates_two_real_logins_and_eventually_reclaims_only_its_
         ApplicationBuilder::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
     let subscriptions = StateSubscriptionService::new(
         app.handle().read_service(),
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         SubscriptionLimits::default(),
     )
     .unwrap();

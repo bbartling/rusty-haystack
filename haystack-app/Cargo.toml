@@ -15,6 +15,10 @@ workspace = true
 [lib]
 name = "haystack_app"
 
+[features]
+default = []
+postgres = ["dep:sqlx", "dep:serde"]
+
 [dependencies]
 haystack-core = { workspace = true, features = ["chrono-tz"] }
 chrono.workspace = true
@@ -30,6 +34,8 @@ flate2.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util = { workspace = true, features = ["rt"] }
+sqlx = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

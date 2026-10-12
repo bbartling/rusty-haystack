@@ -37,6 +37,8 @@ pub enum HistoryReceiptQualification {
     EphemeralMemory,
     /// A surviving in-process authority and provider protocol fixture only.
     ProviderProtocol,
+    /// Acknowledged PostgreSQL transaction with required logged durability settings.
+    PostgresDurable,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryWriteReceipt {
@@ -235,6 +237,51 @@ pub fn canonical_request(request: &HistoryWriteRequest) -> Result<Vec<u8>, Typed
         ("expectedGeneration", uint(request.expected_generation)),
         ("samples", Kind::List(rows)),
     ])))
+}
+/// Decode exactly the versioned original-intent bytes used by durable receipts.
+/// Reject noncanonical input so an identity cannot acquire a second spelling.
+pub fn decode_canonical_request(bytes: &[u8]) -> Result<HistoryWriteRequest, TypedPayloadError> {
+    let Kind::Dict(value) = typed::decode(bytes)? else {
+        return Err(invalid());
+    };
+    fields(
+        &value,
+        &["profile", "identity", "expectedGeneration", "samples"],
+    )?;
+    if string(&value, "profile")? != PROFILE {
+        return Err(invalid());
+    };
+    let Some(Kind::List(rows)) = value.get("samples") else {
+        return Err(invalid());
+    };
+    if rows.len() > MAX_SAMPLES {
+        return Err(invalid());
+    };
+    let samples = rows
+        .iter()
+        .map(|row| {
+            let Kind::Dict(row) = row else {
+                return Err(invalid());
+            };
+            fields(row, &["ts", "val"])?;
+            let Some(Kind::DateTime(ts)) = row.get("ts") else {
+                return Err(invalid());
+            };
+            Ok(HistorySample {
+                ts: ts.clone(),
+                val: row.get("val").ok_or_else(invalid)?.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, TypedPayloadError>>()?;
+    let request = HistoryWriteRequest {
+        identity: identity(&value)?,
+        expected_generation: number(&value, "expectedGeneration")?,
+        samples,
+    };
+    if canonical_request(&request)? != bytes {
+        return Err(invalid());
+    };
+    Ok(request)
 }
 fn control(value: HDict) -> Result<Kind, TypedPayloadError> {
     let bytes = typed::encode(&kd(value))?;
@@ -445,6 +492,7 @@ pub fn outcome_grid(outcome: &HistoryWriteOutcome) -> Result<HGrid, TypedPayload
                 text(match receipt.qualification {
                     HistoryReceiptQualification::EphemeralMemory => "ephemeralMemory",
                     HistoryReceiptQualification::ProviderProtocol => "providerProtocol",
+                    HistoryReceiptQualification::PostgresDurable => "postgresDurable",
                 }),
             );
         }
@@ -494,6 +542,7 @@ pub fn outcome_from_grid(grid: &HGrid) -> Result<HistoryWriteOutcome, TypedPaylo
                 qualification: match string(&control, "qualification")? {
                     "ephemeralMemory" => HistoryReceiptQualification::EphemeralMemory,
                     "providerProtocol" => HistoryReceiptQualification::ProviderProtocol,
+                    "postgresDurable" => HistoryReceiptQualification::PostgresDurable,
                     _ => return Err(invalid()),
                 },
             };

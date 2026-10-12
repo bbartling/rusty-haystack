@@ -35,8 +35,8 @@ pub use changelog::{
     DEFAULT_CHANGELOG_CAPACITY, DiffOp, GraphDiff, GraphState, GraphWake,
 };
 pub use entity_graph::{
-    BatchError, BatchLimits, EntityGraph, EntityOperation, GraphError, HierarchyNode,
-    PreparedBatch, PreparedChange,
+    BatchError, BatchLimits, EntityGraph, EntityOperation, GraphError, GraphImage, HierarchyNode,
+    PreparedBatch, PreparedChange, RecoveryChange, RecoveryError, RecoveryLimits,
 };
-pub use shared::SharedGraph;
+pub use shared::{GraphView, SharedGraph};
 pub use subscriber::GraphSubscriber;

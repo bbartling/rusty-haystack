@@ -270,6 +270,9 @@ impl ReadAdmission {
         expected: Option<Arc<ActivatedCatalog>>,
     ) -> Result<CatalogActivation, CatalogActivationError> {
         limits.validate().map_err(ActivationError::Control)?;
+        if !self.inner.native_writes {
+            return Err(ActivationError::Control(ReadError::Unavailable));
+        }
         let inner = self.inner.clone();
         let fence = Arc::new(CommitFence::new());
         let worker_fence = fence.clone();

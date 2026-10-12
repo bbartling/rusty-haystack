@@ -192,7 +192,14 @@ pub async fn handle_load_lib(
         .load_xeto_str(&source, &name)
         .map_err(|e| HaystackError::bad_request(format!("load error: {e}")))?;
     state
-        .graph
+        .native_graph
+        .as_ref()
+        .ok_or_else(|| {
+            HaystackError::new(
+                "durable catalog replacement is unavailable",
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+            )
+        })?
         .write(|graph| {
             if graph.incarnation() != incarnation {
                 return Err(haystack_core::graph::entity_graph::CatalogChanged);
@@ -257,7 +264,14 @@ pub async fn handle_unload_lib(
         .unload_lib(&name)
         .map_err(HaystackError::bad_request)?;
     state
-        .graph
+        .native_graph
+        .as_ref()
+        .ok_or_else(|| {
+            HaystackError::new(
+                "durable catalog replacement is unavailable",
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+            )
+        })?
         .write(|graph| {
             if graph.incarnation() != incarnation {
                 return Err(haystack_core::graph::entity_graph::CatalogChanged);

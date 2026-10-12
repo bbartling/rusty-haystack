@@ -97,7 +97,7 @@ mod tests {
         let reads = ReadService::new(graph.clone(), policy, limits).unwrap();
         let service = StateSubscriptionService::new(
             reads.clone(),
-            EphemeralMutationStore::new(graph),
+            EntityMutationStore::new(graph),
             SubscriptionLimits::default(),
         )
         .unwrap();
@@ -150,7 +150,7 @@ mod tests {
                 ..ReadLimits::default()
             });
             let mut admission = admission(&reads, &session).await;
-            let graph = reads.graph();
+            let graph = reads.native_graph().unwrap();
             let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 graph.set_namespace(DefNamespace::new());
             });
@@ -307,7 +307,7 @@ mod tests {
         let mut secret = HDict::new();
         secret.set("id", Kind::Ref(HRef::from_val("secret")));
         secret.set("dis", Kind::Str("fixture secret".into()));
-        reads.graph().add(secret).unwrap();
+        reads.native_graph().unwrap().add(secret).unwrap();
         let mut admission = admission(&reads, &session).await;
         // Binding retains immutable A; every later snapshot is immutable B.
         admission.budget_mut().typed_lookup_hook = Some(Arc::new(move || {

@@ -591,7 +591,7 @@ mod tests {
         assert!(json.get("watchId").is_none());
     }
     use haystack_app::{
-        AllowAll, ApplicationBuilder, ApplicationOwner, EphemeralMutationStore, PolicySnapshot,
+        AllowAll, ApplicationBuilder, ApplicationOwner, EntityMutationStore, PolicySnapshot,
         Principal, ReadLimits, ReadOperation, ReadPolicy, SubscriptionCreate, SubscriptionLimits,
         SubscriptionOutcome, SubscriptionRequest,
     };
@@ -713,7 +713,7 @@ mod tests {
             ApplicationBuilder::new(graph.clone(), policy, ReadLimits::default()).unwrap();
         let service = StateSubscriptionService::new(
             builder.handle().read_service(),
-            EphemeralMutationStore::new(graph),
+            EntityMutationStore::new(graph),
             SubscriptionLimits::default(),
         )
         .unwrap();
@@ -941,7 +941,12 @@ mod tests {
             Kind::Ref(haystack_core::kinds::HRef::from_val("second-private-point")),
         );
         second.set("secret", Kind::Str("second-retained-value".into()));
-        service.read_service().graph().add(second).unwrap();
+        service
+            .read_service()
+            .native_graph()
+            .unwrap()
+            .add(second)
+            .unwrap();
         let session = SubscriptionSession::trusted("owner", Duration::from_secs(5)).unwrap();
         let connection = [12; 16];
         let guard = owner.handle().admit().unwrap();
