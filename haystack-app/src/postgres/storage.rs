@@ -212,13 +212,17 @@ impl Backend {
         &self,
         connection: &mut PgConnection,
     ) -> Result<(), PostgresError> {
-        sqlx::query(
+        let result = sqlx::query(
             "SELECT pg_advisory_lock_shared(hashtextextended(current_database() || ':' || $1, 0))",
         )
         .bind(&self.schema)
         .execute(connection)
-        .await
-        .map_err(|_| PostgresError::Unavailable)?;
+        .await;
+        #[cfg(test)]
+        if let Err(error) = &result {
+            diagnose_sql_error("schema-shared-gate", error);
+        }
+        result.map_err(|_| PostgresError::Unavailable)?;
         Ok(())
     }
     pub(crate) async fn transaction(
@@ -246,8 +250,12 @@ impl Backend {
             self.pool.acquire(),
         )
         .await
-        .map_err(|_| PostgresError::Deadline)?
-        .map_err(|_| PostgresError::Unavailable)?;
+        .map_err(|_| PostgresError::Deadline)?;
+        #[cfg(test)]
+        if let Err(error) = &transaction {
+            diagnose_sql_error("pool-acquire", error);
+        }
+        let transaction = transaction.map_err(|_| PostgresError::Unavailable)?;
         #[cfg(test)]
         drop(acquiring);
         let mut transaction =
@@ -261,8 +269,12 @@ impl Backend {
             };
             let row = sqlx::query(statement)
                 .fetch_one(&mut *transaction)
-                .await
-                .map_err(|_| PostgresError::Unavailable)?;
+                .await;
+            #[cfg(test)]
+            if let Err(error) = &row {
+                diagnose_sql_error("metadata-lock", error);
+            }
+            let row = row.map_err(|_| PostgresError::Unavailable)?;
             if row
                 .try_get::<i64, _>("owner_generation")
                 .map_err(|_| PostgresError::Incompatible)?
@@ -547,10 +559,13 @@ impl OwnedTransaction {
         } else {
             "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE"
         };
-        if !matches!(
-            tokio::time::timeout(timeout, sqlx::query(statement).execute(&mut *connection)).await,
-            Ok(Ok(_))
-        ) {
+        let began =
+            tokio::time::timeout(timeout, sqlx::query(statement).execute(&mut *connection)).await;
+        #[cfg(test)]
+        if let Ok(Err(error)) = &began {
+            diagnose_sql_error("transaction-begin", error);
+        }
+        if !matches!(began, Ok(Ok(_))) {
             let _ = tokio::time::timeout(timeout, connection.close()).await;
             return Err(PostgresError::Unavailable);
         }
@@ -570,6 +585,29 @@ impl OwnedTransaction {
         )
         .await;
         let closed = tokio::time::timeout(self.timeout, connection.close()).await;
+        #[cfg(test)]
+        {
+            if let Ok(Err(error)) = &result {
+                diagnose_sql_error(
+                    if commit {
+                        "commit-acknowledgment"
+                    } else {
+                        "rollback-acknowledgment"
+                    },
+                    error,
+                );
+            }
+            if let Ok(Err(error)) = &closed {
+                diagnose_sql_error(
+                    if commit {
+                        "close-after-commit"
+                    } else {
+                        "close-after-rollback"
+                    },
+                    error,
+                );
+            }
+        }
         // A COMMIT error stays uncertain even if the subsequent close succeeds.
         result
             .map_err(|_| PostgresError::Deadline)?
@@ -691,6 +729,8 @@ impl Backend {
 /// Connection interruptions are availability failures. Only a proven storage
 /// shape/type mismatch fences the projection; reconnect must remain possible.
 pub(crate) fn read_error(error: sqlx::Error) -> PostgresError {
+    #[cfg(test)]
+    diagnose_sql_error("storage-read", &error);
     if matches!(error, sqlx::Error::RowNotFound)
         || error
             .as_database_error()
@@ -756,4 +796,62 @@ impl Backend {
 pub(crate) struct SetupCloseFault {
     pub(crate) entered: tokio::sync::oneshot::Sender<()>,
     pub(crate) release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Qualification diagnostics intentionally cannot format driver Display/Debug:
+/// those may contain endpoints, SQL, credentials or stored application data.
+#[cfg(test)]
+fn diagnose_sql_error(stage: &'static str, error: &sqlx::Error) {
+    eprintln!("{}", sql_error_diagnostic(stage, error));
+}
+#[cfg(test)]
+fn sql_error_diagnostic(stage: &'static str, error: &sqlx::Error) -> String {
+    let kind = match error {
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Tls(_) => "tls",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::RowNotFound => "row-not-found",
+        sqlx::Error::PoolTimedOut => "pool-timed-out",
+        sqlx::Error::PoolClosed => "pool-closed",
+        sqlx::Error::WorkerCrashed => "worker-crashed",
+        _ => "other",
+    };
+    let code = error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .filter(|code| code.len() == 5 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    let io = match error {
+        sqlx::Error::Io(error) => Some(error.kind()),
+        _ => None,
+    };
+    format!(
+        "PostgreSQL qualification diagnostic: stage={stage} kind={kind} io={io:?} sqlstate={code:?}"
+    )
+}
+#[test]
+fn qualification_diagnostic_omits_driver_message_and_context() {
+    let sensitive = "private endpoint credential SQL and stored payload";
+    for error in [
+        sqlx::Error::Protocol(sensitive.into()),
+        sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            sensitive,
+        )),
+        sqlx::Error::Tls(Box::new(std::io::Error::other(sensitive))),
+    ] {
+        let diagnostic = sql_error_diagnostic("test-stage", &error);
+        assert!(!diagnostic.contains(sensitive));
+        assert!(diagnostic.len() < 160);
+    }
+    assert_eq!(
+        sql_error_diagnostic(
+            "test-stage",
+            &sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                sensitive
+            ))
+        ),
+        "PostgreSQL qualification diagnostic: stage=test-stage kind=io io=Some(BrokenPipe) sqlstate=None"
+    );
 }
