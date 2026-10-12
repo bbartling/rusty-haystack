@@ -1465,3 +1465,266 @@ async fn committed_retry_waits_for_projection_publication_and_notification() {
     close(owner).await;
     cleanup(&config).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
+async fn reversed_distinct_writes_preserve_durable_feed_order_without_gaps() {
+    use haystack_core::graph::{CommitSpan, DiffOp, GraphState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct HoldFirst {
+        calls: AtomicUsize,
+        entered: tokio::sync::Semaphore,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl MutationProvider for HoldFirst {
+        fn qualification(&self) -> ReceiptQualification {
+            ReceiptQualification::PostgresDurable
+        }
+        fn commit(&self, prepared: PreparedMutation) -> MutationOutcome {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.add_permits(1);
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("bounded release of first prepared PostgreSQL write");
+            }
+            // Preserve the selected durable store's actual publication path.
+            prepared.publish()
+        }
+    }
+
+    async fn check_feed_and_sql(
+        service: &MutationService,
+        config: &PostgresConfig,
+        cursor: &str,
+        before: GraphState,
+    ) {
+        let graph = service.store().graph();
+        assert_eq!(
+            graph.state(),
+            GraphState {
+                revision: before.revision + 2,
+                ..before
+            }
+        );
+        assert_eq!(graph.len(), 2);
+        assert!(graph.get("first").is_none());
+        let page = service
+            .changes(
+                context(),
+                ChangesRequest {
+                    cursor: Some(cursor.into()),
+                    max_diffs: 128,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.dataset, service.store().dataset());
+        assert_eq!(page.incarnation, before.incarnation);
+        assert_eq!(page.floor, before.revision);
+        assert_eq!(page.head, before.revision + 2);
+        assert_eq!(page.position, page.head);
+        assert!(page.complete);
+        assert_eq!(page.changes.len(), 2);
+
+        let mut sql = sqlx::PgConnection::connect_with(&config.options().unwrap())
+            .await
+            .unwrap();
+        let (head, floor): (String, String) =
+            sqlx::query_as("SELECT revision::text, floor::text FROM metadata WHERE singleton=1")
+                .fetch_one(&mut sql)
+                .await
+                .unwrap();
+        assert_eq!(head, page.head.to_string());
+        assert_eq!(floor, page.floor.to_string());
+        let stored: Vec<(String, Vec<u8>)> =
+            sqlx::query_as("SELECT revision::text, payload FROM entity_changes ORDER BY revision")
+                .fetch_all(&mut sql)
+                .await
+                .unwrap();
+        assert_eq!(stored.len(), 2);
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM entities ORDER BY id")
+            .fetch_all(&mut sql)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["second", "third"]);
+        for (index, id) in ["second", "third"].into_iter().enumerate() {
+            let revision = before.revision + index as u64 + 1;
+            let span = CommitSpan {
+                first: revision,
+                last: revision,
+            };
+            let diff = &page.changes[index];
+            assert_eq!(diff.id, id);
+            assert_eq!(diff.revision, revision);
+            assert_eq!(diff.span, span);
+            assert_eq!(diff.operation, DiffOp::Add);
+            assert_eq!(
+                value::encode_dict(&diff.changed).unwrap(),
+                value::encode_dict(&row(id)).unwrap()
+            );
+            let change = value::decode_change(&stored[index].1).unwrap();
+            assert_eq!(stored[index].0, revision.to_string());
+            assert_eq!(change.version, revision);
+            assert_eq!(change.id, id);
+            assert_eq!(change.span, span);
+            assert_eq!(change.op, DiffOp::Add);
+            assert_eq!(
+                value::encode_dict(change.new.as_ref().unwrap()).unwrap(),
+                value::encode_dict(&diff.changed).unwrap()
+            );
+        }
+        sql.close().await.unwrap();
+    }
+
+    let config = fixture("ordering");
+    let owner = open(config.clone()).await;
+    // Feed/cursor assertions always use the application's canonical service;
+    // the provider wrapper is used only to schedule its same durable store.
+    let primary = owner.handle().mutation_service().unwrap();
+    let before = primary.store().graph().state();
+    let cursor = primary
+        .changes(
+            context(),
+            ChangesRequest {
+                cursor: None,
+                max_diffs: 128,
+            },
+        )
+        .await
+        .unwrap()
+        .cursor;
+    let request = |operation_id: &str, id: &str, revision| EntityBatchRequest {
+        identity: OperationIdentity {
+            dataset: primary.store().dataset(),
+            incarnation: before.incarnation,
+            operation_id: operation_id.into(),
+        },
+        expected_revision: revision,
+        operations: vec![EntityOperation::Add(row(id))],
+    };
+    let first_request = request("prepared-first", "first", before.revision);
+    let second_request = request("committed-first", "second", before.revision);
+    let (release, held) = std::sync::mpsc::channel();
+    let provider = Arc::new(HoldFirst {
+        calls: AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: std::sync::Mutex::new(held),
+    });
+    let scheduled = MutationService::with_provider(
+        primary.read_service(),
+        primary.store(),
+        Arc::new(AllowAllMutations),
+        primary.limits().clone(),
+        provider.clone(),
+    )
+    .unwrap();
+    let first = tokio::spawn({
+        let service = scheduled.clone();
+        let request = first_request.clone();
+        async move { service.submit(context(), request).await.unwrap() }
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let rows = primary
+        .read_service()
+        .postgres_backend()
+        .receipt_rows(1)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "A reserved its durable identity before B began"
+    );
+    use sqlx::Row;
+    let pending: MutationOutcome =
+        haystack_core::codecs::entity::decode(&rows[0].get::<Vec<u8>, _>("outcome")).unwrap();
+    assert_eq!(
+        pending,
+        MutationOutcome::Unknown {
+            identity: first_request.identity.clone(),
+            cause: UnknownCause::Pending
+        }
+    );
+    assert!(!first.is_finished());
+    let second_outcome = scheduled
+        .submit(context(), second_request.clone())
+        .await
+        .unwrap();
+    let MutationOutcome::Committed(second_receipt) = &second_outcome else {
+        panic!("B must commit while earlier A remains held: {second_outcome:?}");
+    };
+    assert_eq!(second_receipt.before_revision, before.revision);
+    assert_eq!(second_receipt.after_revision, before.revision + 1);
+    assert_eq!(
+        second_receipt.qualification,
+        ReceiptQualification::PostgresDurable
+    );
+    assert!(!first.is_finished());
+    release.send(()).unwrap();
+    let first_outcome = first.await.unwrap();
+    assert_eq!(
+        first_outcome,
+        MutationOutcome::Rejected {
+            identity: first_request.identity.clone(),
+            reason: RejectionReason::Conflict
+        }
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let third_request = request("after-conflict", "third", before.revision + 1);
+    let third_outcome = primary
+        .submit(context(), third_request.clone())
+        .await
+        .unwrap();
+    let MutationOutcome::Committed(third_receipt) = &third_outcome else {
+        panic!("C must commit without a rejected-A feed gap: {third_outcome:?}");
+    };
+    assert_eq!(third_receipt.before_revision, before.revision + 1);
+    assert_eq!(third_receipt.after_revision, before.revision + 2);
+    assert_eq!(
+        third_receipt.qualification,
+        ReceiptQualification::PostgresDurable
+    );
+    check_feed_and_sql(&primary, &config, &cursor, before).await;
+    let expected = [
+        (first_request, first_outcome),
+        (second_request, second_outcome),
+        (third_request, third_outcome),
+    ];
+    for (request, outcome) in &expected {
+        assert_eq!(
+            primary
+                .reconcile(context(), request.identity.clone())
+                .await
+                .unwrap(),
+            *outcome
+        );
+    }
+    drop(scheduled);
+    drop(primary);
+    close(owner).await;
+    let owner = open(config.clone()).await;
+    let primary = owner.handle().mutation_service().unwrap();
+    for (request, outcome) in &expected {
+        assert_eq!(
+            primary
+                .reconcile(context(), request.identity.clone())
+                .await
+                .unwrap(),
+            *outcome
+        );
+        assert_eq!(
+            primary.submit(context(), request.clone()).await.unwrap(),
+            *outcome
+        );
+    }
+    check_feed_and_sql(&primary, &config, &cursor, before).await;
+    close(owner).await;
+    cleanup(&config).await;
+}
