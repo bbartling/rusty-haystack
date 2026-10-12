@@ -1,6 +1,9 @@
 //! Authorized one-point history publication and retained operation receipts.
 //! The selected authority is ephemeral; provider fixtures cannot claim disk or
 //! process-crash durability. Entity and history transaction domains stay separate.
+#[cfg(feature = "postgres")]
+#[path = "history_postgres.rs"]
+mod postgres;
 use crate::{
     BudgetKind, CancellationToken, HisItem, HisStore, HistoryService, Principal, ReadAdmission,
     ReadContext, ReadError, ReadService,
@@ -267,6 +270,13 @@ impl HistoryMutationInner {
         let identity = request.identity.clone();
         match self.prepare_submit(&principal, request, budget) {
             Ok(outcome) => outcome,
+            #[cfg(feature = "postgres")]
+            Err(HistoryWriteRejection::Provider) if self.store.inner.backend.is_some() => {
+                HistoryWriteOutcome::Unknown {
+                    identity,
+                    cause: HistoryWriteUnknown::Provider,
+                }
+            }
             Err(reason) => HistoryWriteOutcome::Rejected { identity, reason },
         }
     }
@@ -298,6 +308,12 @@ impl HistoryMutationInner {
         binding: &HistoryBinding,
         budget: &Budget,
     ) -> Result<Option<HistoryRecord>, ReadError> {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = &self.store.inner.backend {
+            budget.check()?;
+            return postgres::lookup(backend, binding, budget.deadline)
+                .map_err(|_| ReadError::Unavailable);
+        }
         loop {
             if let Some(state) = self.store.inner.state.try_lock_for(budget.wait_quantum()?) {
                 return Ok(state.receipts.get(binding).cloned());
@@ -426,6 +442,14 @@ impl HistoryMutationInner {
         };
         if let Some(record) = state.receipts.get(&binding).cloned() {
             drop(state);
+            #[cfg(feature = "postgres")]
+            let record = if self.store.inner.backend.is_some() {
+                self.lookup(&binding, budget)
+                    .map_err(|_| HistoryWriteRejection::Provider)?
+                    .ok_or(HistoryWriteRejection::Provider)?
+            } else {
+                record
+            };
             return self.recognized(&policy, principal, record, &canonical);
         }
         if state.receipts.len() >= self.store.inner.limits.receipt_capacity
@@ -455,6 +479,22 @@ impl HistoryMutationInner {
                 cause: HistoryWriteUnknown::Pending,
             }
         };
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = &self.store.inner.backend {
+            match postgres::reserve(backend, &binding, &canonical, &outcome, budget.deadline) {
+                Ok(Some(record)) => {
+                    drop(state);
+                    return self.recognized(&policy, principal, record, &canonical);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return Ok(HistoryWriteOutcome::Unknown {
+                        identity: request.identity.clone(),
+                        cause: HistoryWriteUnknown::Provider,
+                    });
+                }
+            }
+        }
         state.receipts.insert(
             binding.clone(),
             HistoryRecord {
@@ -736,6 +776,28 @@ impl HistoryMutationInner {
             return Err(ReadError::Forbidden);
         }
         budget.check()?;
+        #[cfg(feature = "postgres")]
+        let record = {
+            let mut record = record;
+            if let (Some(backend), Some(found)) = (&self.store.inner.backend, &record)
+                && matches!(
+                    found.outcome,
+                    HistoryWriteOutcome::Unknown {
+                        cause: HistoryWriteUnknown::Pending,
+                        ..
+                    }
+                )
+            {
+                record = postgres::reconcile(
+                    backend,
+                    &binding,
+                    HistoryWriteRejection::Provider,
+                    budget.deadline,
+                )
+                .map_err(|_| ReadError::Unavailable)?;
+            }
+            record
+        };
         Ok(record.map_or(
             HistoryWriteOutcome::Unknown {
                 identity,
@@ -749,7 +811,7 @@ impl HistoryMutationInner {
 /// lifecycle lease. Publish/reject consumes it; dropping it leaves Unknown/Pending.
 pub struct PreparedHistoryMutation {
     store: HisStore,
-    graph: haystack_core::graph::SharedGraph,
+    graph: haystack_core::graph::GraphView,
     binding: HistoryBinding,
     plan: Option<PreparedSeries>,
     deadline: Instant,
@@ -793,6 +855,10 @@ impl PreparedHistoryMutation {
         }
     }
     pub fn reject(self, reason: HistoryWriteRejection) -> HistoryWriteOutcome {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = self.store.inner.backend.clone() {
+            return self.reject_postgres(&backend, reason);
+        }
         let outcome = HistoryWriteOutcome::Rejected {
             identity: self.binding.identity.clone(),
             reason,
@@ -810,6 +876,10 @@ impl PreparedHistoryMutation {
         outcome
     }
     pub fn publish(mut self) -> HistoryWriteOutcome {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = self.store.inner.backend.clone() {
+            return self.publish_postgres(&backend);
+        }
         let policy_owner = self.policy.clone();
         let store = self.store.clone();
         let graph = self.graph.clone();
@@ -899,6 +969,7 @@ fn read_reason(error: ReadError) -> HistoryWriteRejection {
         ReadError::Capacity => HistoryWriteRejection::Capacity,
         ReadError::Cancelled => HistoryWriteRejection::Cancelled,
         ReadError::Deadline => HistoryWriteRejection::Deadline,
+        ReadError::Unavailable => HistoryWriteRejection::Provider,
         ReadError::Projection => HistoryWriteRejection::Unsupported,
         ReadError::InvalidQuery(_) => HistoryWriteRejection::Invalid,
         _ => HistoryWriteRejection::Limit,

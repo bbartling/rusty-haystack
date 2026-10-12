@@ -28,6 +28,105 @@ pub struct SharedGraph {
     wakes: broadcast::Sender<GraphWake>,
 }
 
+/// Cloneable observation capability. It exposes no mutation or conversion back
+/// to a writer. Durable adapters retain the separate `SharedGraph` privately.
+#[derive(Clone)]
+pub struct GraphView {
+    graph: SharedGraph,
+}
+impl GraphView {
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&EntityGraph) -> R,
+    {
+        self.graph.read(f)
+    }
+    pub fn read_for<F, R>(&self, wait: std::time::Duration, f: F) -> Option<R>
+    where
+        F: FnOnce(&EntityGraph) -> R,
+    {
+        self.graph.read_for(wait, f)
+    }
+    pub fn shares_storage(&self, other: &Self) -> bool {
+        self.graph.shares_storage(&other.graph)
+    }
+    pub fn state(&self) -> GraphState {
+        self.graph.state()
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<u64> {
+        self.graph.subscribe()
+    }
+    pub fn subscribe_with_version(&self) -> (broadcast::Receiver<u64>, u64) {
+        self.graph.subscribe_with_version()
+    }
+    pub fn subscribe_wakes(&self) -> broadcast::Receiver<GraphWake> {
+        self.graph.subscribe_wakes()
+    }
+    pub fn subscribe_wakes_with_state(&self) -> (broadcast::Receiver<GraphWake>, GraphState) {
+        self.graph.subscribe_wakes_with_state()
+    }
+    pub fn subscriber_count(&self) -> usize {
+        self.graph.subscriber_count()
+    }
+    pub fn get(&self, id: &str) -> Option<HDict> {
+        self.graph.get(id)
+    }
+    pub fn contains(&self, id: &str) -> bool {
+        self.graph.contains(id)
+    }
+    pub fn len(&self) -> usize {
+        self.graph.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.graph.is_empty()
+    }
+    pub fn version(&self) -> u64 {
+        self.graph.version()
+    }
+    pub fn all_entities(&self) -> Vec<HDict> {
+        self.graph.all_entities()
+    }
+    pub fn read_filter(&self, filter: &str, limit: usize) -> Result<HGrid, GraphError> {
+        self.graph.read_filter(filter, limit)
+    }
+    pub fn read_all(&self, filter: &str, limit: usize) -> Result<Vec<HDict>, GraphError> {
+        self.graph.read_all(filter, limit)
+    }
+    pub fn refs_from(&self, id: &str, tag: Option<&str>) -> Vec<String> {
+        self.graph.refs_from(id, tag)
+    }
+    pub fn refs_to(&self, id: &str, tag: Option<&str>) -> Vec<String> {
+        self.graph.refs_to(id, tag)
+    }
+    pub fn changes_since(
+        &self,
+        version: u64,
+    ) -> Result<Vec<super::changelog::GraphDiff>, super::changelog::ChangelogGap> {
+        self.graph.changes_since(version)
+    }
+    pub fn validate(&self) -> Vec<ValidationIssue> {
+        self.graph.validate()
+    }
+    pub fn ref_chain(&self, id: &str, tags: &[&str]) -> Vec<HDict> {
+        self.graph.ref_chain(id, tags)
+    }
+    pub fn site_for(&self, id: &str) -> Option<HDict> {
+        self.graph.site_for(id)
+    }
+    pub fn children(&self, id: &str) -> Vec<HDict> {
+        self.graph.children(id)
+    }
+    pub fn equip_points(&self, id: &str, filter: Option<&str>) -> Result<Vec<HDict>, GraphError> {
+        self.graph.equip_points(id, filter)
+    }
+    pub fn hierarchy_tree(&self, id: &str, depth: usize) -> Option<HierarchyNode> {
+        self.graph.hierarchy_tree(id, depth)
+    }
+    pub fn classify(&self, id: &str) -> Option<String> {
+        self.graph.classify(id)
+    }
+}
+
 /// Own the write lock until the closure finishes, including during unwinding.
 /// `Option` lets Drop release it before broadcasting to potentially reentrant
 /// receiver wakers. Accepted mutations are observable even if the closure fails.
@@ -65,9 +164,22 @@ impl Drop for WriteNotification<'_> {
 }
 
 impl SharedGraph {
+    /// Derive a read-only capability for this exact storage.
+    pub fn view(&self) -> GraphView {
+        GraphView {
+            graph: self.clone(),
+        }
+    }
+
     /// Wrap an `EntityGraph` in a thread-safe handle.
     pub fn new(mut graph: EntityGraph) -> Self {
         graph.renew_incarnation();
+        Self::from_restored(graph)
+    }
+
+    /// Wrap a checked restored graph without changing its durable incarnation.
+    /// This is explicit: ordinary `new` still mints a fresh live identity.
+    pub fn from_restored(graph: EntityGraph) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (wakes, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
@@ -75,6 +187,36 @@ impl SharedGraph {
             tx,
             wakes,
         }
+    }
+
+    /// Publish a fully built durable projection with no allocation under its
+    /// graph lock. The adapter must commit durable state before invoking this.
+    /// A conflict is a projection failure, never proof of database rollback.
+    pub fn publish_restored(
+        &self,
+        expected: GraphState,
+        next: EntityGraph,
+        wait: std::time::Duration,
+    ) -> Result<(), super::RecoveryError> {
+        let mut graph = self
+            .inner
+            .try_write_for(wait)
+            .ok_or(super::RecoveryError::Limit)?;
+        if graph.state() != expected
+            || next.incarnation() != expected.incarnation
+            || next.catalog_generation() != expected.catalog_generation
+            || next.version() < expected.revision
+        {
+            return Err(super::RecoveryError::Invalid);
+        }
+        let after = next.state();
+        *graph = next;
+        drop(graph);
+        if after.revision != expected.revision {
+            let _ = self.tx.send(after.revision);
+            let _ = self.wakes.send(GraphWake::Entities(after));
+        }
+        Ok(())
     }
 
     /// Whether both handles refer to the same graph storage, including after

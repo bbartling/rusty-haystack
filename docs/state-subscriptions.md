@@ -9,7 +9,7 @@ of intermediate values or a durable/distributed subscription service.
 ## Application selection
 
 Select the owner with `ApplicationBuilder::state_subscriptions`. Construct it
-from the builder's exact managed `ReadService`, an `EphemeralMutationStore`, and
+from the builder's exact managed `ReadService`, an `EntityMutationStore`, and
 `SubscriptionLimits`. If entity mutations are also selected, both services must
 share the **same store handle**, including when selection order is reversed.
 Another store on the same graph is a different entity authority and is rejected.
@@ -27,7 +27,7 @@ registry.
 ```rust
 use std::sync::Arc;
 use haystack_app::{
-    AllowAll, ApplicationBuilder, EphemeralMutationStore, ReadLimits,
+    AllowAll, ApplicationBuilder, EntityMutationStore, ReadLimits,
     StateSubscriptionService, SubscriptionLimits,
 };
 use haystack_core::graph::{EntityGraph, SharedGraph};
@@ -36,7 +36,7 @@ let graph = SharedGraph::new(EntityGraph::new());
 let builder = ApplicationBuilder::new(
     graph.clone(), Arc::new(AllowAll), ReadLimits::default(),
 )?;
-let store = EphemeralMutationStore::new(graph);
+let store = EntityMutationStore::new(graph);
 let subscriptions = StateSubscriptionService::new(
     builder.handle().read_service(), store, SubscriptionLimits::default(),
 )?;

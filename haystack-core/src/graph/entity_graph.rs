@@ -3,6 +3,9 @@
 mod prepared;
 pub(crate) use prepared::IndexChange;
 pub use prepared::{BatchError, BatchLimits, EntityOperation, PreparedBatch, PreparedChange};
+#[path = "recovery.rs"]
+mod recovery;
+pub use recovery::{GraphImage, RecoveryChange, RecoveryError, RecoveryLimits};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

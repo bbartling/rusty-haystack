@@ -162,7 +162,7 @@ publication of its required record, not indefinite record retention.
 `retained_changes` is trusted in-process inspection for fixtures; this card adds
 no public history streaming or cursor API.
 
-All selected storage is **ephemeral process memory**. Recreating a service around
+The default selection is **ephemeral process memory**. Recreating a service around
 a surviving authority proves reconciliation of retained process state.
 `ProviderProtocol` fixtures prove failure, ordering and acknowledgement behavior.
 Neither qualification proves disk atomicity, process-crash recovery, database
@@ -203,3 +203,7 @@ own that same contract. WebSocket has no history mutation extension.
 The existing Rust/Python `his_write` helpers remain explicit legacy grid calls.
 They supply no operation control and cannot bypass scoped admission. Python
 scoped receipt wrappers are not introduced by this slice.
+
+The optional [PostgreSQL application profile](postgres-durability.md) persists the
+same authorized history mutations, original intent bindings and change sequence.
+Its ordinary history reads remain explicitly bounded live reads.

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use haystack_core::graph::SharedGraph;
+use haystack_core::graph::{GraphView, SharedGraph};
 use haystack_core::ontology::DefNamespace;
 
 use crate::actions::ActionRegistry;
@@ -19,7 +19,9 @@ pub struct AppState {
     /// Application lifetime for requests and upgraded connections.
     pub application: Option<haystack_app::ApplicationHandle>,
     /// Thread-safe entity graph.
-    pub graph: SharedGraph,
+    pub graph: GraphView,
+    /// Explicit native capability; absent for a durable application.
+    pub native_graph: Option<SharedGraph>,
     /// Application read authority, present only in the scoped service profile.
     pub read_service: Option<haystack_app::ReadService>,
     /// Selection captured when routing is built; discovery uses the same value.

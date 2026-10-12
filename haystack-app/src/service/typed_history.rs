@@ -596,7 +596,7 @@ mod tests {
         let (reads, history, writes, store) = services();
         let request = request(&store);
         let mut admission = reads.begin(context(Principal::Anonymous)).await.unwrap();
-        let graph = reads.graph();
+        let graph = reads.native_graph().unwrap();
         let calls = AtomicUsize::new(0);
         admission.budget_mut().typed_encode_hook = Some(Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -661,7 +661,7 @@ mod tests {
         let store = HisStore::new();
         let provider = Arc::new(RebaseAfterCommit {
             store: store.clone(),
-            graph: reads.graph(),
+            graph: reads.native_graph().unwrap(),
         });
         let history =
             HistoryService::new(reads.clone(), provider, HistoryLimits::default()).unwrap();

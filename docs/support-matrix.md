@@ -20,6 +20,7 @@ policy in `scripts/ci/policy.py` rejects an unknown event, target branch, or pro
 | Current stable Rust 1.99.0 | Ubuntu | Ubuntu | Separate named lane with the workspace and `chrono-tz` Clippy/test selections |
 | Python bindings | Ubuntu, CPython 3.12 | Ubuntu, CPython 3.12 | PyO3 Clippy, locked release-mode `maturin develop` with Maturin 1.15.0, then pytest |
 | Schema and generated HTTP client | Ubuntu, Python 3.12 | Ubuntu, Python 3.12 | Locked OpenAPI/JSON Schema validators and unedited openapi-python-client output against a real local fixture; part of the existing Python job |
+| PostgreSQL 18.6 durability | Ubuntu | Ubuntu | Optional app feature Clippy/tests/doctests plus real Docker verified-TLS, restart, receipt, owner fencing and snapshot cleanup qualification |
 | Cargo Deny | Ubuntu | Ubuntu | Locked all-feature dependency advisory, license, ban and source checks |
 | CodeQL | Ubuntu, Rust/Python/Actions | Ubuntu, Rust/Python/Actions | Analysis and upload jobs completed using the existing query filters; the separate alert-results check is described below |
 | CI policy | Ubuntu | Ubuntu | Process-level aggregate and matrix tests, workflow wiring regressions, benchmark capture input/receipt regressions, and artifact provenance/staging regressions |
@@ -32,13 +33,13 @@ standing in for either contract. Workspace builds can enable dependency features
 that an isolated core build does not.
 
 `CI OK` is the canonical workflow-job aggregate. Its explicit dependencies are `ci-policy`, `fmt`,
-`clippy`, `test`, `current-stable`, `python`, `deny`, `core-features`, and `codeql`.
+`clippy`, `test`, `current-stable`, `python`, `deny`, `postgres`, `core-features`, and `codeql`.
 It runs with `always()` and accepts only `success` for every required job. Missing
 jobs, malformed or duplicate JSON keys, failure, cancellation, skip, unknown profiles,
 or an unexpected planned OS inventory fail closed. Job results enter through an
 environment variable, never interpolation into shell source. There are no optional
-jobs in either profile; the only platform exclusion is macOS/Windows in the documented
-dev test matrix.
+jobs in either profile. The general dev test matrix excludes macOS/Windows; the
+PostgreSQL selected profile is explicitly Ubuntu-only on both target branches.
 
 For CodeQL, `CI OK` confirms successful completion of the reusable analysis and upload
 jobs. GitHub subsequently evaluates alert severity in the separate
@@ -95,7 +96,10 @@ or full Haystack 5 interoperability.
 
 Running without `--full` omits Cargo Deny and therefore returns 2 if all other checks
 pass. The local gate does not run hosted CodeQL, other host operating systems, or
-release-artifact validation. It does not predict all hosted CI outcomes.
+release-artifact validation or the optional PostgreSQL runtime profile. For a
+PostgreSQL change, also run `python3 scripts/postgres/qualify.py --docker`; see the
+[exact profile and external-fixture alternative](postgres-durability.md). The
+baseline gate does not predict all hosted CI outcomes.
 
 ## Release build inventory and qualification limits
 
@@ -145,8 +149,14 @@ Local workspace tests cover prepared core batches and indexes, native singleton
 changes, complete-span count/byte retention, current policy disclosure, stable
 receipt binding, provider-protocol failure fixtures, managed worker ownership,
 and actual HTTP/client requests including a lost committed response reconciled
-without resubmission. The selected provider is ephemeral process memory. Retained
+without resubmission. The default provider is ephemeral process memory. Retained
 fixture state across service recreation is not crash recovery or disk/database
 durability evidence. Multi-process commit ordering, history mutation, equipment
 commands and WebSocket mutations remain unqualified and out of this slice. See
 [entity mutation and feed contracts](entity-mutations.md).
+
+The optional PostgreSQL profile adds an independently required Ubuntu job without
+changing core/default feature coverage or the baseline local gate. Its documented
+18.6 fixture tests qualify the selected application path at the tested revision;
+other database versions, multi-instance operation, power-loss behavior and backup
+restoration remain separate evidence requirements.

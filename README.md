@@ -102,3 +102,11 @@ The correctness-checked performance baseline separates cold, parsed-filter-warm 
 ## License
 
 [MIT](LICENSE). Retained upstream Xeto source keeps its source license and provenance alongside the pinned profile.
+
+### Optional PostgreSQL authority
+
+`rusty-haystack-app` offers an explicit `postgres` feature for bounded, single-owner
+entity and history durability through the shared application services. It includes
+verified TLS, durable operation receipts, restart recovery and bounded entity
+snapshot sessions. Default/core builds remain unchanged. See the
+[PostgreSQL contract and qualification profile](docs/postgres-durability.md).

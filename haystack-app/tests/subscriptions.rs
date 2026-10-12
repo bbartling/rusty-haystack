@@ -21,7 +21,7 @@ fn graph() -> SharedGraph {
 fn service(graph: SharedGraph) -> StateSubscriptionService {
     StateSubscriptionService::new(
         ReadService::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap(),
-        EphemeralMutationStore::new(graph),
+        EntityMutationStore::new(graph),
         SubscriptionLimits::default(),
     )
     .unwrap()
@@ -306,7 +306,7 @@ async fn builder_requires_exact_read_and_entity_authority_in_both_orders_without
             ApplicationBuilder::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default())
                 .unwrap();
         let reads = builder.handle().read_service();
-        let store = EphemeralMutationStore::new(graph.clone());
+        let store = EntityMutationStore::new(graph.clone());
         let subscriptions = StateSubscriptionService::new(
             reads.clone(),
             store.clone(),
@@ -315,7 +315,7 @@ async fn builder_requires_exact_read_and_entity_authority_in_both_orders_without
         .unwrap();
         let different = MutationService::new(
             reads.clone(),
-            EphemeralMutationStore::new(graph),
+            EntityMutationStore::new(graph),
             Arc::new(AllowAllMutations),
             MutationLimits::default(),
         )
@@ -344,7 +344,7 @@ async fn builder_requires_exact_read_and_entity_authority_in_both_orders_without
     let early = builder.handle();
     let subscriptions = StateSubscriptionService::new(
         early.read_service(),
-        EphemeralMutationStore::new(graph),
+        EntityMutationStore::new(graph),
         SubscriptionLimits::default(),
     )
     .unwrap();
@@ -381,7 +381,7 @@ async fn bounded_original_bindings_survive_close_and_reject_before_initial_effec
         ..SubscriptionLimits::default()
     };
     let service =
-        StateSubscriptionService::new(reads, EphemeralMutationStore::new(graph), limits).unwrap();
+        StateSubscriptionService::new(reads, EntityMutationStore::new(graph), limits).unwrap();
     let session = session();
     let first_request = create(&service, "first", &["a"]);
     let first = delivery(execute(&service, &session, first_request.clone()).await);
@@ -425,7 +425,7 @@ async fn bounded_original_bindings_survive_close_and_reject_before_initial_effec
     let reads = ReadService::new(fresh.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
     let small = StateSubscriptionService::new(
         reads,
-        EphemeralMutationStore::new(fresh),
+        EntityMutationStore::new(fresh),
         SubscriptionLimits {
             max_view_bytes: 32,
             ..SubscriptionLimits::default()
@@ -580,7 +580,7 @@ async fn revoked_entities_tags_references_and_operations_never_replay_or_emit_re
         let reads = ReadService::new(graph.clone(), policy.clone(), ReadLimits::default()).unwrap();
         let service = StateSubscriptionService::new(
             reads,
-            EphemeralMutationStore::new(graph.clone()),
+            EntityMutationStore::new(graph.clone()),
             SubscriptionLimits::default(),
         )
         .unwrap();
@@ -708,7 +708,7 @@ async fn concurrent_create_reserves_one_binding_before_snapshot_and_never_duplic
     .unwrap();
     let service = StateSubscriptionService::new(
         reads,
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         SubscriptionLimits::default(),
     )
     .unwrap();
@@ -765,7 +765,7 @@ async fn initial_projection_and_feed_head_share_one_guard_with_concurrent_commit
     .unwrap();
     let service = StateSubscriptionService::new(
         reads,
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         SubscriptionLimits::default(),
     )
     .unwrap();
@@ -830,7 +830,7 @@ async fn complete_commit_units_are_never_split_when_a_poll_limit_is_too_small() 
             ReadService::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
         let service = StateSubscriptionService::new(
             reads,
-            EphemeralMutationStore::new(graph.clone()),
+            EntityMutationStore::new(graph.clone()),
             SubscriptionLimits {
                 max_change_diffs: limit,
                 ..SubscriptionLimits::default()
@@ -891,7 +891,7 @@ async fn review_replacement_membership_growth_is_reserved_before_publication() {
     };
     let service = StateSubscriptionService::new(
         ReadService::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap(),
-        EphemeralMutationStore::new(graph),
+        EntityMutationStore::new(graph),
         limits.clone(),
     )
     .unwrap();
@@ -975,7 +975,7 @@ async fn review_execution_resource_exhaustion_is_terminal_overflow_native_and_wi
             let reads = ReadService::new(graph.clone(), Arc::new(AllowAll), read_limits).unwrap();
             let service = StateSubscriptionService::new(
                 reads.clone(),
-                EphemeralMutationStore::new(graph.clone()),
+                EntityMutationStore::new(graph.clone()),
                 SubscriptionLimits {
                     max_change_diffs: 16_000,
                     ..SubscriptionLimits::default()

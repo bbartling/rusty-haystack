@@ -1,4 +1,4 @@
-//! One in-memory history authority. Publication lock order is policy -> graph
+//! One history authority and its in-process projection. Publication lock order is policy -> graph
 //! read -> authority -> point. Native writes/reset use authority -> point only;
 //! read sessions retain a point handle and never acquire authority while held.
 use crate::history_mutation::{HistoryBinding, HistoryRecord};
@@ -80,11 +80,14 @@ pub(crate) struct AuthorityState {
 }
 pub(crate) struct HistoryStoreInner {
     pub(crate) authority: [u8; 16],
+    #[cfg(feature = "postgres")]
+    pub(crate) backend: Option<Arc<crate::postgres::storage::Backend>>,
     pub(crate) limits: HistoryStoreLimits,
     pub(crate) state: Mutex<AuthorityState>,
 }
 /// Retain this handle to preserve series, incarnation/generation and receipts
-/// together. A fresh store has a fresh authority; none of this survives a crash.
+/// together. Native constructors create an ephemeral authority. The PostgreSQL
+/// application constructor restores the projection from its durable authority.
 #[derive(Clone)]
 pub struct HisStore {
     pub(crate) inner: Arc<HistoryStoreInner>,
@@ -126,6 +129,8 @@ impl HisStore {
         Ok(Self {
             inner: Arc::new(HistoryStoreInner {
                 authority: rand::random(),
+                #[cfg(feature = "postgres")]
+                backend: None,
                 limits,
                 state: Mutex::new(AuthorityState {
                     points: HashMap::new(),
@@ -171,12 +176,31 @@ impl HisStore {
             .points
             .try_reserve(1)
             .map_err(|_| HistoryProviderError::Limit)?;
-        let point = Arc::new(RwLock::new(Series::default()));
+        let series = Series::default();
+        #[cfg(feature = "postgres")]
+        let series = {
+            let mut series = series;
+            if let Some(backend) = &self.inner.backend {
+                use sha2::{Digest, Sha256};
+                backend.check().map_err(|_| HistoryProviderError::Stopped)?;
+                let mut hash = Sha256::new();
+                hash.update(b"rusty-haystack-postgres-point-v1\0");
+                hash.update(self.authority());
+                hash.update(id.as_bytes());
+                series.incarnation.copy_from_slice(&hash.finalize()[..16]);
+            }
+            series
+        };
+        let point = Arc::new(RwLock::new(series));
         state.points.insert(id.to_owned(), point.clone());
         Ok(point)
     }
     /// Trusted observation, allocating at most one bounded empty point identity.
     pub fn state(&self, id: &str) -> Result<HistoryState, HistoryProviderError> {
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = &self.inner.backend {
+            backend.check().map_err(|_| HistoryProviderError::Stopped)?;
+        }
         let mut state = self.inner.state.lock();
         let point = self.point_in(&mut state, id)?;
         let series = point.read();
@@ -200,6 +224,10 @@ impl HisStore {
     /// same point handle receives a newly minted incarnation; old plans/sessions
     /// cannot revive previous state. Recognized receipts remain in this authority.
     pub fn reset_point(&self, id: &str) -> Result<HistoryState, HistoryProviderError> {
+        #[cfg(feature = "postgres")]
+        if self.inner.backend.is_some() {
+            return Err(HistoryProviderError::Unsupported);
+        }
         let mut state = self.inner.state.lock();
         let sequence = state
             .sequence
@@ -230,6 +258,10 @@ impl HisStore {
     /// change ledger once. Empty native writes have no effect or allocation.
     /// This compatibility API does not perform scoped schema/policy admission.
     pub fn write(&self, id: &str, items: Vec<HisItem>) -> Result<(), HistoryProviderError> {
+        #[cfg(feature = "postgres")]
+        if self.inner.backend.is_some() {
+            return Err(HistoryProviderError::Unsupported);
+        }
         if items.is_empty() {
             return Ok(());
         }
@@ -343,6 +375,10 @@ fn open_memory(
     end: DateTime<FixedOffset>,
     budget: HistoryPullBudget,
 ) -> Result<Box<dyn HistorySession>, HistoryProviderError> {
+    #[cfg(feature = "postgres")]
+    if let Some(backend) = &store.inner.backend {
+        backend.check().map_err(|_| HistoryProviderError::Stopped)?;
+    }
     let point = loop {
         if let Some(mut state) = store.inner.state.try_lock_for(quantum(&budget)?) {
             if !state.points.contains_key(&id)
@@ -473,6 +509,13 @@ impl HistorySession for MemorySession {
 }
 impl HistoryProvider for HisStore {
     fn history_write_capability(&self) -> Option<crate::HistoryWriteCapability> {
+        #[cfg(feature = "postgres")]
+        if self.inner.backend.is_some() {
+            return Some(crate::HistoryWriteCapability {
+                store: self.clone(),
+                qualification: crate::HistoryReceiptQualification::PostgresDurable,
+            });
+        }
         Some(crate::HistoryWriteCapability {
             store: self.clone(),
             qualification: crate::HistoryReceiptQualification::EphemeralMemory,

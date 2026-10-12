@@ -295,7 +295,11 @@ impl SimulatedCommandService {
                 + self.inner.limits.max_who_bytes.saturating_mul(34)
                 + request.id.len(),
         )?;
-        let graph = self.inner.reads.graph();
+        let graph = self
+            .inner
+            .reads
+            .native_graph()
+            .ok_or(ApiError::Unavailable)?;
         let (schema, observed) = loop {
             if let Some(result) = graph.read_for(budget.wait_quantum()?, |graph| {
                 budget.check_catalog(graph)?;

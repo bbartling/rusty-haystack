@@ -121,6 +121,28 @@ jobs:
       - run: cargo +1.99.0 test --locked --workspace --exclude rusty-haystack
       - run: cargo +1.99.0 test --locked -p rusty-haystack-core --features chrono-tz
 
+  postgres:
+    name: PostgreSQL 18.6 durability
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres-18.6
+      - name: Install pinned qualification test runner
+        run: cargo +1.99.0 install --locked cargo-nextest --version 0.9.146
+      - run: cargo +1.99.0 clippy --locked -p rusty-haystack-app --features postgres --all-targets -- -D warnings
+      - run: cargo +1.99.0 test --locked -p rusty-haystack-app --features postgres
+      - name: Check fixture startup phase and readiness deadline
+        run: python3 -m unittest discover -s scripts/postgres -p 'test_*.py' -v
+      - name: Qualify verified TLS, ownership, commits, restart and snapshot cleanup
+        run: python3 scripts/postgres/qualify.py --docker
+
   # The PyO3 crate is excluded from `cargo test --locked --workspace`, so nothing above
   # covers it. Without this job the Python suite rots unnoticed — 11 of its tests
   # spent four months failing against APIs removed in v0.8.0.
@@ -189,7 +211,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: ${{ always() }}
-    needs: [ci-policy, fmt, clippy, test, current-stable, python, deny, core-features, codeql]
+    needs: [ci-policy, fmt, clippy, test, current-stable, python, deny, postgres, core-features, codeql]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

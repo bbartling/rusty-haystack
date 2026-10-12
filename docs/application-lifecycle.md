@@ -150,3 +150,12 @@ scoped-policy restrictions are documented in [shared reads](shared-reads.md).
 
 `POST /api/close` is bearer-session logout. It does not request application
 shutdown. Persistent-store recovery and publication authority, scoped watches, and Python lifecycle bridging are separate boundaries.
+
+## Optional PostgreSQL selection
+
+The [PostgreSQL application constructor](postgres-durability.md) recovers bounded
+entity/history authority before returning its builder, then participates in the
+same readiness and shutdown protocol. Its owned construction task, transaction
+workers and snapshot sessions retain actual database cleanup work; dropping an
+awaiting caller is not proof of rollback or released capacity. Dropping a recovered
+unstarted builder requests closure of its already-acquired database authority.

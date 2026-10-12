@@ -1049,7 +1049,7 @@ async fn entity_and_history_operation_text_are_independent_domains() {
     let reads = ReadService::new(graph.clone(), Arc::new(AllowAll), ReadLimits::default()).unwrap();
     let entities = MutationService::new(
         reads.clone(),
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         Arc::new(AllowAllMutations),
         MutationLimits::default(),
     )

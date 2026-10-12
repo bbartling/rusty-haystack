@@ -16,7 +16,7 @@ normally implement `MutationPolicy` themselves.
 
 ```rust,ignore
 let builder = ApplicationBuilder::new(graph.clone(), read_policy, ReadLimits::default())?;
-let store = EphemeralMutationStore::new(graph.clone());
+let store = EntityMutationStore::new(graph.clone());
 let mutations = MutationService::new(
     builder.handle().read_service(), store, mutation_policy, MutationLimits::default(),
 )?;
@@ -76,7 +76,7 @@ checks the committed revision range and span against the exact request: adds,
 removes and nonempty patches each advance once; empty patches do not. An
 inconsistent acknowledgement remains `Unknown` with its original identity.
 
-The selected store is **ephemeral process memory**. Retaining its handle permits a
+The default store is **ephemeral process memory**. Retaining its handle permits a
 new service to reconcile the same surviving state. A new store gets a new dataset;
 a newly wrapped or replaced graph gets a new incarnation. `MutationProvider`
 fixtures qualify before-commit rejection, abandoned pending work, lost postcommit
@@ -148,3 +148,7 @@ caller-supplied reqwest client cannot prove those policies and rejects entity
 submission before dispatch; use `connect_with_config`, `HttpTransport::new`,
 `with_format`, or `with_bearer_config`. Custom transports explicitly implement the
 single-submit `EntityTransport` contract. WebSocket does not implement it.
+
+The optional [PostgreSQL application profile](postgres-durability.md) selects durable
+entities and history together. Its read-only graph views and explicit receipt
+qualification preserve the same admission, authorization and uncertainty contracts.

@@ -42,7 +42,7 @@ impl Running {
                 .unwrap();
         let service = StateSubscriptionService::new(
             builder.handle().read_service(),
-            EphemeralMutationStore::new(graph.clone()),
+            EntityMutationStore::new(graph.clone()),
             SubscriptionLimits::default(),
         )
         .unwrap();

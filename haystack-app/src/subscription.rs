@@ -4,9 +4,9 @@
 mod adapters;
 pub(crate) mod watch;
 use crate::{
-    ApplicationResource, BudgetKind, EphemeralMutationStore, PolicySnapshot, Principal,
-    ReadAdmission, ReadContext, ReadError, ReadOperation, ReadService, ReadyInfo, ResourceContext,
-    ResourceFuture, SubscriptionSession, budget::Budget, sanitize,
+    ApplicationResource, BudgetKind, EntityMutationStore, PolicySnapshot, Principal, ReadAdmission,
+    ReadContext, ReadError, ReadOperation, ReadService, ReadyInfo, ResourceContext, ResourceFuture,
+    SubscriptionSession, budget::Budget, sanitize,
 };
 pub use adapters::{LegacySubscriptionRequest, SubscriptionWireRequest};
 use haystack_core::{
@@ -95,7 +95,7 @@ pub struct StateSubscriptionService {
 }
 struct SubscriptionInner {
     reads: ReadService,
-    store: EphemeralMutationStore,
+    store: EntityMutationStore,
     authority: [u8; 16],
     limits: SubscriptionLimits,
     records: Mutex<Registry>,
@@ -208,7 +208,7 @@ enum Publication {
 impl StateSubscriptionService {
     pub fn new(
         reads: ReadService,
-        store: EphemeralMutationStore,
+        store: EntityMutationStore,
         limits: SubscriptionLimits,
     ) -> Result<Self, ReadError> {
         limits.validate()?;
@@ -230,7 +230,7 @@ impl StateSubscriptionService {
     pub fn read_service(&self) -> &ReadService {
         &self.inner.reads
     }
-    pub fn entity_store(&self) -> EphemeralMutationStore {
+    pub fn entity_store(&self) -> EntityMutationStore {
         self.inner.store.clone()
     }
     pub fn authority(&self) -> [u8; 16] {

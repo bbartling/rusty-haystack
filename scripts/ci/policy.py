@@ -8,7 +8,7 @@ import sys
 # independent tests, and docs/support-matrix.md alongside this inventory.
 REQUIRED_JOBS = frozenset({
     "ci-policy", "fmt", "clippy", "test", "current-stable", "python", "deny",
-    "core-features", "codeql",
+    "core-features", "codeql", "postgres",
 })
 PROFILE_OS = {
     "dev": ["ubuntu-latest"],

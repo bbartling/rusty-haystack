@@ -33,6 +33,8 @@ pub struct EntityBatchRequest {
 pub enum ReceiptQualification {
     EphemeralMemory,
     ProviderProtocol,
+    /// Acknowledged PostgreSQL transaction with required logged durability settings.
+    PostgresDurable,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityReceipt {
@@ -451,6 +453,7 @@ impl EntityWire for MutationOutcome {
                     text(match r.qualification {
                         ReceiptQualification::EphemeralMemory => "ephemeralMemory",
                         ReceiptQualification::ProviderProtocol => "providerProtocol",
+                        ReceiptQualification::PostgresDurable => "postgresDurable",
                     }),
                 );
             }
@@ -493,6 +496,7 @@ impl EntityWire for MutationOutcome {
                     qualification: match string(d, "qualification")? {
                         "ephemeralMemory" => ReceiptQualification::EphemeralMemory,
                         "providerProtocol" => ReceiptQualification::ProviderProtocol,
+                        "postgresDurable" => ReceiptQualification::PostgresDurable,
                         _ => return Err(invalid()),
                     },
                 };

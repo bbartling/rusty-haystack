@@ -335,7 +335,7 @@ async fn legacy_websocket_connection_and_writer_finish_before_provider_close() {
     let application = builder(&graph);
     let subscriptions = StateSubscriptionService::new(
         application.handle().read_service(),
-        EphemeralMutationStore::new(graph.clone()),
+        EntityMutationStore::new(graph.clone()),
         SubscriptionLimits::default(),
     )
     .unwrap();

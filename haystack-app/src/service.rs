@@ -1,5 +1,7 @@
 mod activation;
 mod packages;
+#[cfg(feature = "postgres")]
+pub(crate) mod postgres_snapshot;
 pub use packages::{ApplicationPackageError, PackagePreparationLimits, PreparedPackageAdmission};
 mod nav;
 mod system;
@@ -20,7 +22,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use haystack_core::{
     data::HDict,
     filter::{self, CatalogKind, FilterError, FilterNode, FilterParseLimits},
-    graph::SharedGraph,
+    graph::{GraphView, SharedGraph},
     kinds::{Kind, Symbol},
     ontology::DefNamespace,
     xeto::Spec,
@@ -53,6 +55,9 @@ struct Inner {
     system: system::SystemInfo,
     lifecycle: Option<Arc<Lifecycle>>,
     graph: SharedGraph,
+    native_writes: bool,
+    #[cfg(feature = "postgres")]
+    backend: Option<Arc<crate::postgres::storage::Backend>>,
     dataset: [u8; 16],
     policy: Arc<dyn ReadPolicy>,
     limits: Arc<ReadLimits>,
@@ -124,6 +129,9 @@ impl ReadService {
                 system: system::SystemInfo::new(false),
                 lifecycle: None,
                 graph,
+                native_writes: true,
+                #[cfg(feature = "postgres")]
+                backend: None,
                 dataset: rand::random(),
                 policy,
                 active: Arc::new(Semaphore::new(limits.max_concurrent)),
@@ -146,16 +154,30 @@ impl ReadService {
         inner.system = system::SystemInfo::new(true);
         Ok(service)
     }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn configure_postgres(
+        &mut self,
+        backend: Arc<crate::postgres::storage::Backend>,
+    ) -> Result<(), ReadError> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(ReadError::Unavailable)?;
+        inner.native_writes = false;
+        inner.backend = Some(backend);
+        Ok(())
+    }
     /// Whether both handles share this exact service, including policy, cursor
     /// authority and admission. Independently constructed services differ even
     /// when they refer to the same graph.
     pub fn same_service(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
-    /// Administrative graph handle for the owning application, outside the
-    /// resource-policy API. Native callers already holding it remain trusted.
-    pub fn graph(&self) -> SharedGraph {
-        self.inner.graph.clone()
+    /// Trusted read-only inspection of the selected graph projection.
+    pub fn graph(&self) -> GraphView {
+        self.inner.graph.view()
+    }
+    /// Explicit native mutation capability, available only for ephemeral stores.
+    /// Durable services never disclose their mutable derived projection.
+    pub fn native_graph(&self) -> Option<SharedGraph> {
+        self.inner.native_writes.then(|| self.inner.graph.clone())
     }
     pub(crate) fn policy_snapshot(
         &self,
@@ -309,14 +331,17 @@ impl ReadService {
         }
         budget.check()?;
         let permit = self.admit(&budget).await?;
-        Ok(ReadAdmission {
+        let admission = ReadAdmission {
             inner: self.inner.clone(),
             principal: Some(context.principal),
             session,
             budget: Some(budget),
             permit: Some(permit),
             guard,
-        })
+        };
+        #[cfg(feature = "postgres")]
+        let admission = admission.verify_postgres().await?;
+        Ok(admission)
     }
     async fn run(&self, context: ReadContext, input: Input) -> Result<ReadPage, ReadError> {
         self.begin(context).await?.run(input).await
@@ -1102,6 +1127,16 @@ impl Inner {
         input: Input,
         budget: &mut Budget,
     ) -> Result<ReadPage, ReadError> {
+        self.execute_on_graph(principal, input, budget, &self.graph)
+    }
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    fn execute_on_graph(
+        &self,
+        principal: Principal,
+        input: Input,
+        budget: &mut Budget,
+        source: &SharedGraph,
+    ) -> Result<ReadPage, ReadError> {
         if let Principal::Authenticated { permissions, .. } = &principal
             && permissions.len() > budget.limits.max_ids
         {
@@ -1142,7 +1177,7 @@ impl Inner {
         }
         loop {
             let wait = budget.wait_quantum()?;
-            if let Some(result) = self.graph.read_for(wait, |graph| {
+            if let Some(result) = source.read_for(wait, |graph| {
                 let stamp = Stamp {
                     dataset: self.dataset,
                     incarnation: graph.incarnation(),

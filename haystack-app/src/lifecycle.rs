@@ -168,6 +168,18 @@ impl ApplicationBuilder {
             shutdown: ShutdownPolicy::default(),
         })
     }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn configure_postgres(
+        &mut self,
+        backend: Arc<crate::postgres::storage::Backend>,
+    ) -> Result<(), ReadError> {
+        self.parts
+            .as_mut()
+            .ok_or(ReadError::Unavailable)?
+            .application
+            .reads
+            .configure_postgres(backend)
+    }
     /// Configure the bounded label reported by typed `about`. The boot timestamp
     /// is captured once when this owner starts on its selected runtime.
     pub fn server_name(self, name: impl Into<String>) -> Result<Self, ReadError> {

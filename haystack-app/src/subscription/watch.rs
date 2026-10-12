@@ -784,7 +784,7 @@ mod tests {
             Self {
                 service: StateSubscriptionService::new(
                     reads,
-                    EphemeralMutationStore::new(graph.clone()),
+                    EntityMutationStore::new(graph.clone()),
                     limits,
                 )
                 .unwrap(),

@@ -8,6 +8,8 @@
 //! compatibility API. Pure `EntityGraph` remains a trusted in-process API.
 mod budget;
 mod command;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub use command::*;
 mod session;
 mod subscription;
@@ -35,7 +37,7 @@ mod feed;
 mod mutation;
 pub use entity_wire::EntityWireOperation;
 pub use mutation::{
-    AllowAllMutations, EphemeralMutationStore, EphemeralProvider, MutationLimits, MutationPolicy,
+    AllowAllMutations, EntityMutationStore, EphemeralProvider, MutationLimits, MutationPolicy,
     MutationProvider, MutationService, PreparedMutation,
 };
 mod lifecycle;
