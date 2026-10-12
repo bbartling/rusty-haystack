@@ -620,6 +620,15 @@ impl MutationInner {
             .saturating_mul(32)
             .saturating_add(principal.bytes().saturating_mul(2))
             .saturating_add(8192);
+        #[cfg(feature = "postgres")]
+        let mut reservation = self
+            .store
+            .inner
+            .backend
+            .as_ref()
+            .map(|backend| backend.publication_guard(budget.deadline))
+            .transpose()
+            .map_err(|_| RejectionReason::Provider)?;
         let mut table = loop {
             if let Some(t) = self
                 .store
@@ -634,6 +643,8 @@ impl MutationInner {
         // this one prepared. Never overwrite or reapply that pending operation.
         if let Some(record) = table.entries.get(&binding).cloned() {
             drop(table);
+            #[cfg(feature = "postgres")]
+            drop(reservation.take());
             #[cfg(feature = "postgres")]
             let record = if self.store.inner.backend.is_some() {
                 self.lookup(&binding, budget)
@@ -671,9 +682,13 @@ impl MutationInner {
         };
         #[cfg(feature = "postgres")]
         if let Some(backend) = &self.store.inner.backend {
+            drop(table);
             match postgres::reserve(backend, &binding, &canonical, &pending, budget.deadline) {
-                Ok(Some(record)) => {
-                    drop(table);
+                Ok(Some(_)) => {
+                    drop(reservation.take());
+                    let record = postgres::lookup(backend, &binding, budget.deadline)
+                        .map_err(|_| RejectionReason::Provider)?
+                        .ok_or(RejectionReason::Provider)?;
                     if !policy.rules.authorize_reconcile(
                         principal,
                         &request.identity,
@@ -687,7 +702,9 @@ impl MutationInner {
                         Err(RejectionReason::Conflict)
                     };
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    table = self.store.inner.receipts.lock();
+                }
                 Err(_) => {
                     return Ok(MutationOutcome::Unknown {
                         identity: request.identity.clone(),
@@ -706,6 +723,8 @@ impl MutationInner {
         );
         table.bytes += bytes;
         drop(table);
+        #[cfg(feature = "postgres")]
+        drop(reservation);
         let identity = receipt.identity.clone();
         let prepared = PreparedMutation {
             store: self.store.inner.clone(),
@@ -798,28 +817,8 @@ impl MutationInner {
             return Err(ReadError::Forbidden);
         }
         budget.check()?;
-        #[cfg(feature = "postgres")]
-        let record = {
-            let mut record = record;
-            if let (Some(backend), Some(found)) = (&self.store.inner.backend, &record)
-                && matches!(
-                    found.outcome,
-                    MutationOutcome::Unknown {
-                        cause: UnknownCause::Pending,
-                        ..
-                    }
-                )
-            {
-                record = postgres::reconcile(
-                    backend,
-                    &binding,
-                    RejectionReason::Provider,
-                    budget.deadline,
-                )
-                .map_err(|_| ReadError::Unavailable)?;
-            }
-            record
-        };
+        // Observation cannot cancel a live preparation owned by another
+        // process. Pending remains bound; only its owning publisher settles it.
         Ok(record.map_or(
             MutationOutcome::Unknown {
                 identity,

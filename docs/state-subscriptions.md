@@ -196,6 +196,22 @@ The scoped WebSocket client serializes calls with eight bounded callers;
 cancelling a dispatched call drops its socket so an uncertain partial frame is
 never continued by a later call.
 
+## PostgreSQL shared-instance continuity
+
+The optional PostgreSQL authority refreshes managed subscription operations from
+a coherent committed database cut. A surviving owner can Resume remote changes
+through its durable retained entity feed after missed local wakes or a database
+connectivity interruption. A retention gap requires explicit `Gap` resync and a
+fresh authorized initial snapshot. Failed database verification denies admission;
+it does not acknowledge an old local cache as current.
+
+Subscription IDs, exact-session ownership and leases remain process-local. A
+request routed to another process, or to a restarted owner, receives explicit
+authority/unknown resynchronization and must create a new watch. Durable entity
+feed cursors survive compatible process reconstruction separately. Explicit
+restore rotation invalidates old continuation authority. See the
+[PostgreSQL contract](postgres-durability.md) for polling bounds and restore limits.
+
 ## Bounds and the legacy profile
 
 Default application ceilings are 128 active watches, 32 per session, 1,024

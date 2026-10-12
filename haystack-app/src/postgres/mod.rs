@@ -2,6 +2,7 @@
 mod config;
 pub(crate) mod history_value;
 mod recovery;
+mod refresh;
 pub(crate) mod storage;
 pub(crate) mod value;
 pub use crate::service::postgres_snapshot::PostgresSnapshot;
@@ -17,9 +18,7 @@ pub enum PostgresError {
     AmbientConfiguration,
     #[error("PostgreSQL connection or verified transport failed")]
     Connection,
-    #[error("PostgreSQL dataset already has an application owner")]
-    AlreadyOwned,
-    #[error("PostgreSQL dataset owner is unavailable")]
+    #[error("PostgreSQL dataset is unavailable")]
     Unavailable,
     #[error("PostgreSQL durability configuration is unsupported")]
     Durability,
@@ -27,6 +26,8 @@ pub enum PostgresError {
     Incompatible,
     #[error("PostgreSQL recovery limit exceeded")]
     Limit,
+    #[error("PostgreSQL prepared dependency changed")]
+    Conflict,
     #[error("PostgreSQL operation deadline exceeded")]
     Deadline,
 }
@@ -69,12 +70,27 @@ impl ApplicationResource for DatabaseResource {
     fn name(&self) -> &str {
         "postgres"
     }
-    fn initialize(&mut self, _: ResourceContext) -> ResourceFuture<'_, ReadyInfo> {
+    fn initialize(&mut self, context: ResourceContext) -> ResourceFuture<'_, ReadyInfo> {
         Box::pin(async move {
             self.0
                 .health()
                 .await
                 .map_err(|e| ApplicationError::resource("postgres", e.to_string()))?;
+            let backend = self.0.clone();
+            let cancel = context.cancellation();
+            context.spawn("postgres-refresh", async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(backend.limits.refresh_interval) => {},
+                    }
+                    // Await the actual worker even when close is requested.
+                    // A transient failure denies admissions but remains retryable.
+                    let _ = backend.health().await;
+                }
+                Ok(())
+            })?;
             Ok(ReadyInfo::default())
         })
     }
@@ -129,7 +145,7 @@ async fn construct(
     let catalog =
         Arc::new(ActivatedCatalog::new(catalog, None).map_err(|_| PostgresError::Incompatible)?);
     let mut opened = storage::Opened::connect(config).await?;
-    let recovered = match opened.recover_entities(catalog).await {
+    let recovered = match opened.recover_entities(catalog.clone()).await {
         Ok(recovered) => recovered,
         Err(error) => {
             use sqlx::Connection;
@@ -141,17 +157,38 @@ async fn construct(
             return Err(error);
         }
     };
-    let backend = opened.finish(recovered.generation);
+    let backend = opened.finish(recovered.generation).await?;
     let result = async {
-        let rows = backend.receipt_rows(1).await?;
+        let candidate = backend
+            .capture(
+                catalog.clone(),
+                &limits,
+                std::time::Instant::now() + backend.limits.transaction_timeout,
+            )
+            .await?;
+        let recovered = candidate.recovered;
+        let graph = haystack_core::graph::SharedGraph::from_restored(recovered.graph);
         let store = crate::EntityMutationStore::from_postgres(
-            recovered.graph.clone(),
+            graph.clone(),
             recovered.dataset,
             backend.clone(),
-            rows,
+            candidate.receipts,
             &limits.entities,
         )?;
-        let mut builder = ApplicationBuilder::new(recovered.graph, policies.reads, limits.reads)
+        let history_store = candidate.history;
+        backend
+            .projection
+            .set(refresh::Projection {
+                backend: Arc::downgrade(&backend),
+                graph: graph.clone(),
+                history: Arc::downgrade(&history_store.inner),
+                catalog,
+                limits: limits.clone(),
+                dataset: recovered.dataset,
+                cursor_key: recovered.cursor_key,
+            })
+            .map_err(|_| PostgresError::Configuration)?;
+        let mut builder = ApplicationBuilder::new(graph, policies.reads, limits.reads)
             .map_err(|_| PostgresError::Configuration)?;
         builder
             .configure_postgres(backend.clone())
@@ -164,13 +201,6 @@ async fn construct(
             recovered.cursor_key,
         )
         .map_err(|_| PostgresError::Configuration)?;
-        let history_store = crate::HisStore::from_postgres(
-            backend.clone(),
-            recovered.history_authority,
-            recovered.history_sequence,
-            limits.history_store,
-        )
-        .await?;
         let history = crate::HistoryService::new(
             builder.handle().read_service(),
             Arc::new(history_store),

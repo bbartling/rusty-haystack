@@ -665,6 +665,7 @@ async fn snapshot_pages_and_reference_traversal_share_sql_view_and_release_capac
 async fn exhausted_pool_cancelled_and_expired_waiters_release_actual_ownership() {
     use std::sync::atomic::Ordering;
     let mut config = fixture("pool_waiters");
+    config.limits.refresh_interval = Duration::from_secs(60);
     config.limits.pool_connections = 1;
     let owner = open(config.clone()).await;
     let reads = owner.handle().read_service();
@@ -773,7 +774,165 @@ async fn exhausted_pool_cancelled_and_expired_waiters_release_actual_ownership()
         fresh.close().await.unwrap();
         assert_eq!(reads.load().admitted, 0);
     }
-    close(owner).await;
+    let holder = reads.postgres_snapshot(context()).await.unwrap();
+    let waiter = tokio::spawn({
+        let reads = reads.clone();
+        async move { reads.postgres_snapshot(context()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while backend.snapshot_acquiring.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("owner-close waiter reached actual pool acquisition");
+    assert_eq!(reads.load().admitted, 2);
+    tokio::time::timeout(Duration::from_secs(5), close(owner))
+        .await
+        .expect("owner close cancels holder and joins blocked refresh before pool close");
+    assert!(matches!(
+        waiter.await.unwrap(),
+        Err(ReadError::Unavailable | ReadError::Closed | ReadError::Cancelled)
+    ));
+    let _ = holder.close().await;
+    assert_eq!(backend.snapshot_acquiring.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load().admitted, 0);
+    assert!(backend.pool.is_closed());
+    assert_eq!(server_sessions(&config).await.1, 0);
+    cleanup(&config).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
+async fn failed_snapshot_schema_gate_retains_work_until_physical_setup_cleanup() {
+    let mut config = fixture("snapshot_gate_close");
+    config.limits.refresh_interval = Duration::from_secs(60);
+    config.limits.pool_connections = 1;
+    config.limits.lock_timeout = Duration::from_millis(200);
+    let mut owner = Some(open(config.clone()).await);
+    let reads = owner.as_ref().unwrap().handle().read_service();
+    let backend = reads.postgres_backend();
+    let options = config
+        .options()
+        .unwrap()
+        .application_name("rusty-haystack-qualification");
+    let mut admin = sqlx::PgConnection::connect_with(&options).await.unwrap();
+    // Cover original gate failure, caller cancellation, and caller deadline.
+    // The final phase also closes the owner while actual cleanup is held.
+    for abandonment in [None, Some(false), Some(true)] {
+        let mut request = context();
+        if abandonment == Some(true) {
+            request.deadline = std::time::Instant::now() + Duration::from_secs(1);
+        }
+        let cancellation = request.cancellation.clone();
+        let admission = reads.begin(request).await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended(current_database() || ':' || $1,0))")
+            .bind(&config.schema)
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        let (entered, mut cleanup_entered) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *backend.snapshot_setup_close.lock() = Some(super::storage::SetupCloseFault {
+            entered,
+            release: released,
+        });
+        let mut opening = tokio::spawn(async move { admission.postgres_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock' AND query LIKE 'SELECT pg_advisory_lock_shared%'")
+                    .bind(format!("rusty-haystack:{}", config.schema)).fetch_one(&mut admin).await.unwrap();
+                if waiting == 1 { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("snapshot waits on the actual exclusive schema gate");
+        tokio::select! {
+            entered = &mut cleanup_entered => entered.expect("owned setup cleanup boundary"),
+            result = &mut opening => {
+                assert!(matches!(result.unwrap(), Err(ReadError::Unavailable)));
+                panic!("snapshot worker finished before owned physical setup cleanup");
+            },
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("gate timeout must enter bounded setup cleanup"),
+        }
+        // The real lock timeout has happened, but physical connection retirement
+        // is paused: the original admission and sole pool permit must stay owned.
+        assert!(!opening.is_finished());
+        assert_eq!(reads.load().admitted, 1);
+        assert_eq!(backend.pool.size(), 1);
+        assert_eq!(backend.pool.num_idle(), 0);
+        assert_eq!(server_sessions(&config).await, (1, 0));
+        if let Some(expire) = abandonment {
+            if !expire {
+                cancellation.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut opening)
+                .await
+                .unwrap()
+                .unwrap();
+            if expire {
+                assert!(matches!(result, Err(ReadError::Deadline)));
+            } else {
+                assert!(matches!(result, Err(ReadError::Cancelled)));
+            }
+            assert_eq!(
+                reads.load().admitted,
+                1,
+                "caller departure does not finish physical cleanup"
+            );
+            assert_eq!(backend.pool.num_idle(), 0);
+            assert_eq!(server_sessions(&config).await, (1, 0));
+        }
+        sqlx::query(
+            "SELECT pg_advisory_unlock(hashtextextended(current_database() || ':' || $1,0))",
+        )
+        .bind(&config.schema)
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        let closing = if abandonment == Some(true) {
+            let mut closing = tokio::spawn(close(owner.take().unwrap()));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut closing)
+                    .await
+                    .is_err(),
+                "owner must await the held setup cleanup"
+            );
+            assert_eq!(reads.load().admitted, 1);
+            Some(closing)
+        } else {
+            None
+        };
+        release.send(()).unwrap();
+        if abandonment.is_none() {
+            assert!(
+                matches!(opening.await.unwrap(), Err(ReadError::Unavailable)),
+                "preserve the original gate failure"
+            );
+        }
+        if let Some(closing) = closing {
+            tokio::time::timeout(Duration::from_secs(3), closing)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(backend.pool.is_closed());
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reads.load().admitted != 0
+                || backend.pool.size() as usize != backend.pool.num_idle()
+                || server_sessions(&config).await != (0, 0)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("actual setup connection and work are fully retired");
+        if abandonment != Some(true) {
+            let snapshot = reads.postgres_snapshot(context()).await.unwrap();
+            snapshot.close().await.unwrap();
+            assert_eq!(reads.load().admitted, 0);
+        }
+    }
+    admin.close().await.unwrap();
     cleanup(&config).await;
 }
 
@@ -872,6 +1031,7 @@ async fn commit_faults_distinguish_proven_effect_rollback_and_restart_reconcilia
 async fn unresolved_commit_barrier_keeps_unknown_and_owns_cleanup_until_actual_completion() {
     use super::storage::CommitFault;
     let mut config = fixture("uncertain");
+    config.limits.refresh_interval = Duration::from_secs(60);
     config.limits.lock_timeout = Duration::from_millis(150);
     let owner = open(config.clone()).await;
     let service = owner.handle().mutation_service().unwrap();
@@ -938,35 +1098,17 @@ async fn unresolved_commit_barrier_keeps_unknown_and_owns_cleanup_until_actual_c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
-async fn second_process_is_denied_and_owner_socket_loss_fences_stale_services() {
-    const CHILD: &str = "RUSTY_HAYSTACK_PG_OWNER_CHILD_SCHEMA";
-    if let Some(schema) = std::env::var_os(CHILD) {
-        let mut config = fixture("owner_child");
-        config.schema = schema.into_string().unwrap();
-        let result = application(
-            config,
-            Catalog::load_http_pinned().unwrap(),
-            policies(),
-            PostgresServiceLimits::default(),
-        )
-        .await;
-        assert!(matches!(result, Err(PostgresError::AlreadyOwned)));
-        return;
-    }
-    let config = fixture("owner");
+async fn pooled_connection_loss_reconnects_between_shared_instances() {
+    let config = fixture("reconnect");
     let owner = open(config.clone()).await;
+    let peer = open(config.clone()).await;
     let reads = owner.handle().read_service();
     let backend = reads.postgres_backend();
-    let status=tokio::task::spawn_blocking({let schema=config.schema.clone();move || {
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact").arg("postgres::qualification::second_process_is_denied_and_owner_socket_loss_fences_stale_services")
-            .arg("--ignored").env(CHILD,schema).output().unwrap()
-    }}).await.unwrap();
-    assert!(
-        status.status.success(),
-        "independent process must observe AlreadyOwned"
-    );
-    let pid = backend.owner_pid().await;
+    let mut live = backend.pool.acquire().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *live)
+        .await
+        .unwrap();
     let mut admin = sqlx::PgConnection::connect_with(&config.options().unwrap())
         .await
         .unwrap();
@@ -976,24 +1118,30 @@ async fn second_process_is_denied_and_owner_socket_loss_fences_stale_services() 
         .await
         .unwrap();
     assert!(terminated);
-    let successor = open(config.clone()).await;
+    drop(live);
     assert!(matches!(
-        reads
-            .read(
-                context(),
-                ReadRequest::new(ReadQuery::Ids(vec!["a".into()]), OutputProfile::Typed)
-            )
-            .await,
-        Err(ReadError::Unavailable)
+        entity_batch(
+            &peer.handle().mutation_service().unwrap(),
+            "peer",
+            vec![EntityOperation::Add(row("reconnected"))]
+        )
+        .await,
+        MutationOutcome::Committed(_)
     ));
-    assert!(
-        backend
-            .transaction(std::time::Instant::now() + Duration::from_secs(2))
-            .await
-            .is_err()
-    );
+    let page = reads
+        .read(
+            context(),
+            ReadRequest::new(
+                ReadQuery::Ids(vec!["reconnected".into()]),
+                OutputProfile::Typed,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.row_count, 1);
+    assert!(backend.check().is_ok());
     close(owner).await;
-    close(successor).await;
+    close(peer).await;
     admin.close().await.unwrap();
     cleanup(&config).await;
 }
@@ -1001,11 +1149,16 @@ async fn second_process_is_denied_and_owner_socket_loss_fences_stale_services() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
 async fn transaction_generation_mismatch_fences_a_still_connected_owner() {
-    let config = fixture("generation");
+    let mut config = fixture("generation");
+    config.limits.refresh_interval = Duration::from_secs(60);
     let owner = open(config.clone()).await;
     let reads = owner.handle().read_service();
     let backend = reads.postgres_backend();
-    let pid = backend.owner_pid().await;
+    let mut live = backend.pool.acquire().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *live)
+        .await
+        .unwrap();
     let mut admin = sqlx::PgConnection::connect_with(&config.options().unwrap())
         .await
         .unwrap();
@@ -1041,6 +1194,7 @@ async fn transaction_generation_mismatch_fences_a_still_connected_owner() {
             .await,
         Err(ReadError::Unavailable)
     ));
+    live.close().await.unwrap();
     close(owner).await;
     admin.close().await.unwrap();
     cleanup(&config).await;
@@ -1728,3 +1882,70 @@ async fn reversed_distinct_writes_preserve_durable_feed_order_without_gaps() {
     close(owner).await;
     cleanup(&config).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
+async fn independent_application_processes_share_one_authority() {
+    const CHILD: &str = "RUSTY_HAYSTACK_PG_SHARED_CHILD_SCHEMA";
+    if let Some(schema) = std::env::var_os(CHILD) {
+        let mut config = fixture("shared_child");
+        config.schema = schema.into_string().unwrap();
+        let owner = open(config).await;
+        let service = owner.handle().mutation_service().unwrap();
+        let state = service.store().graph().state();
+        let request = EntityBatchRequest {
+            identity: OperationIdentity {
+                dataset: service.store().dataset(),
+                incarnation: state.incarnation,
+                operation_id: "child-write".into(),
+            },
+            expected_revision: state.revision,
+            operations: vec![EntityOperation::Add(row("from-child"))],
+        };
+        assert!(matches!(
+            service.submit(context(), request).await.unwrap(),
+            MutationOutcome::Committed(_)
+        ));
+        close(owner).await;
+        return;
+    }
+    let config = fixture("shared_processes");
+    let owner = open(config.clone()).await;
+    let status = tokio::task::spawn_blocking({
+        let schema = config.schema.clone();
+        move || std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("postgres::qualification::independent_application_processes_share_one_authority")
+            .arg("--ignored").arg("--nocapture").env(CHILD, schema).output().unwrap()
+    }).await.unwrap();
+    assert!(
+        status.status.success(),
+        "second real application process must start and commit: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    owner
+        .handle()
+        .read_service()
+        .read(
+            context(),
+            ReadRequest::new(
+                ReadQuery::Ids(vec!["from-child".into()]),
+                OutputProfile::Typed,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        owner
+            .handle()
+            .mutation_service()
+            .unwrap()
+            .store()
+            .graph()
+            .get("from-child")
+            .is_some()
+    );
+    close(owner).await;
+    cleanup(&config).await;
+}
+
+mod process;
