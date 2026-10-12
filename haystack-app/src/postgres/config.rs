@@ -38,6 +38,8 @@ pub struct PostgresLimits {
     pub lock_timeout: Duration,
     pub transaction_timeout: Duration,
     pub snapshot_timeout: Duration,
+    /// Maximum idle delay before beginning a bounded reconciliation attempt.
+    pub refresh_interval: Duration,
     pub recovery: haystack_core::graph::RecoveryLimits,
     pub max_receipts: usize,
     pub max_receipt_bytes: usize,
@@ -52,6 +54,7 @@ impl Default for PostgresLimits {
             lock_timeout: Duration::from_secs(3),
             transaction_timeout: Duration::from_secs(15),
             snapshot_timeout: Duration::from_secs(10),
+            refresh_interval: Duration::from_millis(250),
             recovery: Default::default(),
             max_receipts: 1024,
             max_receipt_bytes: 64 * 1024 * 1024,
@@ -197,6 +200,7 @@ impl PostgresConfig {
                 l.lock_timeout,
                 l.transaction_timeout,
                 l.snapshot_timeout,
+                l.refresh_interval,
             ]
             .iter()
             .any(|d| *d < Duration::from_millis(1) || *d > Duration::from_secs(60))

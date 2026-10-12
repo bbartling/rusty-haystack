@@ -126,12 +126,25 @@ impl EntityMutationStore {
 }
 
 impl Backend {
+    #[cfg(test)]
     pub(crate) async fn receipt_rows(
         &self,
         domain: i16,
     ) -> Result<Vec<sqlx::postgres::PgRow>, PostgresError> {
+        let mut tx = self
+            .transaction(Instant::now() + self.limits.transaction_timeout)
+            .await?;
+        let result = self.receipt_rows_at(domain, &mut tx).await;
+        tx.rollback().await?;
+        result
+    }
+    pub(crate) async fn receipt_rows_at(
+        &self,
+        domain: i16,
+        connection: &mut sqlx::PgConnection,
+    ) -> Result<Vec<sqlx::postgres::PgRow>, PostgresError> {
         let counts = sqlx::query("SELECT count(*) AS n, coalesce(sum(octet_length(binding)+octet_length(request)+octet_length(outcome)),0)::bigint AS bytes FROM receipts WHERE domain=$1")
-            .bind(domain).fetch_one(&self.pool).await.map_err(|_| PostgresError::Incompatible)?;
+            .bind(domain).fetch_one(&mut *connection).await.map_err(crate::postgres::storage::read_error)?;
         if counts
             .try_get::<i64, _>("n")
             .map_err(|_| PostgresError::Incompatible)?
@@ -145,9 +158,9 @@ impl Backend {
         };
         sqlx::query("SELECT binding,request,outcome FROM receipts WHERE domain=$1 ORDER BY binding")
             .bind(domain)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
-            .map_err(|_| PostgresError::Incompatible)
+            .map_err(crate::postgres::storage::read_error)
     }
 }
 
@@ -207,11 +220,18 @@ pub(super) fn lookup(
 ) -> Result<Option<Record>, PostgresError> {
     let _publication = backend.publication_guard(deadline)?;
     let key = binding.storage_key()?;
-    backend
+    let record = backend
         .runtime
         .block_on(backend.lookup_receipt(1, &key))?
         .map(|stored| record(stored, binding))
-        .transpose()
+        .transpose()?;
+    if record
+        .as_ref()
+        .is_some_and(|record| matches!(record.outcome, MutationOutcome::Committed(_)))
+    {
+        backend.refresh_locked(deadline)?;
+    }
+    Ok(record)
 }
 pub(super) fn settle(
     backend: &Backend,
@@ -415,7 +435,7 @@ impl PreparedMutation {
             if crate::postgres::value::number(&state.try_get::<String,_>("revision").map_err(|_| PostgresError::Incompatible)?)? != expected.revision
                 || state.try_get::<Vec<u8>,_>("incarnation").map_err(|_| PostgresError::Incompatible)? != expected.incarnation
                 || crate::postgres::value::number(&state.try_get::<String,_>("catalog_generation").map_err(|_| PostgresError::Incompatible)?)? != expected.catalog_generation
-            {return Err(PostgresError::Incompatible)};
+            {return Err(PostgresError::Conflict)};
             let stored: Vec<u8> = sqlx::query_scalar("SELECT outcome FROM receipts WHERE domain=1 AND binding=$1")
                 .bind(&key).fetch_one(&mut *tx).await.map_err(|_| PostgresError::Unavailable)?;
             let stored: MutationOutcome = entity::decode(&stored).map_err(|_| PostgresError::Incompatible)?;
@@ -454,15 +474,18 @@ impl PreparedMutation {
         });
         let resolved = match result {
             Ok(result) => result,
-            Err(_) => match settle(
+            Err(error) => match settle(
                 backend,
                 &self.binding,
-                RejectionReason::Provider,
+                if error == PostgresError::Conflict {
+                    RejectionReason::Conflict
+                } else {
+                    RejectionReason::Provider
+                },
                 Instant::now() + backend.limits.statement_timeout,
             ) {
                 Ok(Some(record)) => record.outcome,
                 _ => {
-                    backend.seal();
                     return self.unknown();
                 }
             },
@@ -515,14 +538,4 @@ impl MutationService {
         inner.started = None;
         Ok(service)
     }
-}
-
-pub(super) fn reconcile(
-    backend: &Backend,
-    binding: &Binding,
-    reason: RejectionReason,
-    deadline: Instant,
-) -> Result<Option<Record>, PostgresError> {
-    let _publication = backend.publication_guard(deadline)?;
-    settle(backend, binding, reason, deadline)
 }

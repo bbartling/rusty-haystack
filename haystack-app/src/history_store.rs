@@ -404,6 +404,8 @@ fn open_memory(
         }
     };
     Ok(Box::new(MemorySession {
+        #[cfg(feature = "postgres")]
+        backend: store.inner.backend.clone(),
         point,
         cursor,
         end,
@@ -417,6 +419,8 @@ fn open_memory(
 }
 #[derive(Clone)]
 struct MemorySession {
+    #[cfg(feature = "postgres")]
+    backend: Option<Arc<crate::postgres::storage::Backend>>,
     point: Arc<RwLock<Series>>,
     cursor: usize,
     end: DateTime<FixedOffset>,
@@ -429,6 +433,10 @@ impl MemorySession {
         budget: &HistoryPullBudget,
     ) -> Result<ProviderHistoryBatch, HistoryProviderError> {
         budget.check()?;
+        #[cfg(feature = "postgres")]
+        if let Some(backend) = &self.backend {
+            backend.check().map_err(|_| HistoryProviderError::Stopped)?;
+        }
         if self.closed {
             return Err(HistoryProviderError::Stopped);
         }

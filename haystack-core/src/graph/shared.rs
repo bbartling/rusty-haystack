@@ -198,6 +198,19 @@ impl SharedGraph {
         next: EntityGraph,
         wait: std::time::Duration,
     ) -> Result<(), super::RecoveryError> {
+        self.publish_restored_with(expected, next, wait, || {})
+    }
+
+    /// Publish related projections under the graph capture fence. The callback
+    /// must perform only a short, prebuilt memory transition: no IO or waits on
+    /// client work. It runs only after graph identity and monotonicity checks.
+    pub fn publish_restored_with(
+        &self,
+        expected: GraphState,
+        next: EntityGraph,
+        wait: std::time::Duration,
+        publish_related: impl FnOnce(),
+    ) -> Result<(), super::RecoveryError> {
         let mut graph = self
             .inner
             .try_write_for(wait)
@@ -210,6 +223,7 @@ impl SharedGraph {
             return Err(super::RecoveryError::Invalid);
         }
         let after = next.state();
+        publish_related();
         *graph = next;
         drop(graph);
         if after.revision != expected.revision {

@@ -430,6 +430,15 @@ impl HistoryMutationInner {
             .saturating_add(canonical.len().saturating_mul(8))
             .saturating_add(principal.bytes().saturating_mul(2))
             .saturating_add(4096);
+        #[cfg(feature = "postgres")]
+        let mut reservation = self
+            .store
+            .inner
+            .backend
+            .as_ref()
+            .map(|backend| backend.publication_guard(budget.deadline))
+            .transpose()
+            .map_err(|_| HistoryWriteRejection::Provider)?;
         let mut state = loop {
             if let Some(state) = self
                 .store
@@ -442,6 +451,8 @@ impl HistoryMutationInner {
         };
         if let Some(record) = state.receipts.get(&binding).cloned() {
             drop(state);
+            #[cfg(feature = "postgres")]
+            drop(reservation.take());
             #[cfg(feature = "postgres")]
             let record = if self.store.inner.backend.is_some() {
                 self.lookup(&binding, budget)
@@ -481,12 +492,18 @@ impl HistoryMutationInner {
         };
         #[cfg(feature = "postgres")]
         if let Some(backend) = &self.store.inner.backend {
+            drop(state);
             match postgres::reserve(backend, &binding, &canonical, &outcome, budget.deadline) {
-                Ok(Some(record)) => {
-                    drop(state);
+                Ok(Some(_)) => {
+                    drop(reservation.take());
+                    let record = postgres::lookup(backend, &binding, budget.deadline)
+                        .map_err(|_| HistoryWriteRejection::Provider)?
+                        .ok_or(HistoryWriteRejection::Provider)?;
                     return self.recognized(&policy, principal, record, &canonical);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    state = self.store.inner.state.lock();
+                }
                 Err(_) => {
                     return Ok(HistoryWriteOutcome::Unknown {
                         identity: request.identity.clone(),
@@ -505,6 +522,8 @@ impl HistoryMutationInner {
         );
         state.receipt_bytes += bytes;
         drop(state);
+        #[cfg(feature = "postgres")]
+        drop(reservation);
         let Some(plan) = plan else {
             return Ok(outcome);
         };
@@ -776,28 +795,8 @@ impl HistoryMutationInner {
             return Err(ReadError::Forbidden);
         }
         budget.check()?;
-        #[cfg(feature = "postgres")]
-        let record = {
-            let mut record = record;
-            if let (Some(backend), Some(found)) = (&self.store.inner.backend, &record)
-                && matches!(
-                    found.outcome,
-                    HistoryWriteOutcome::Unknown {
-                        cause: HistoryWriteUnknown::Pending,
-                        ..
-                    }
-                )
-            {
-                record = postgres::reconcile(
-                    backend,
-                    &binding,
-                    HistoryWriteRejection::Provider,
-                    budget.deadline,
-                )
-                .map_err(|_| ReadError::Unavailable)?;
-            }
-            record
-        };
+        // Observation cannot cancel a live preparation owned by another
+        // process. Pending remains bound; only its owning publisher settles it.
         Ok(record.map_or(
             HistoryWriteOutcome::Unknown {
                 identity,

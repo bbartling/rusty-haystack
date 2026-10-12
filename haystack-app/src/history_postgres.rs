@@ -89,11 +89,18 @@ pub(super) fn lookup(
 ) -> Result<Option<HistoryRecord>, PostgresError> {
     let _publication = backend.publication_guard(deadline)?;
     let key = binding.storage_key()?;
-    backend
+    let record = backend
         .runtime
         .block_on(backend.lookup_receipt(2, &key))?
         .map(|stored| record(stored, binding))
-        .transpose()
+        .transpose()?;
+    if record
+        .as_ref()
+        .is_some_and(|record| matches!(record.outcome, HistoryWriteOutcome::Committed(_)))
+    {
+        backend.refresh_locked(deadline)?;
+    }
+    Ok(record)
 }
 pub(super) fn reserve(
     backend: &Backend,
@@ -134,6 +141,7 @@ pub(super) fn settle(
 impl HisStore {
     pub(crate) async fn from_postgres(
         backend: Arc<Backend>,
+        connection: &mut sqlx::PgConnection,
         authority: [u8; 16],
         sequence: u64,
         limits: HistoryStoreLimits,
@@ -142,7 +150,7 @@ impl HisStore {
         let validated =
             Self::with_limits(limits.clone()).map_err(|_| PostgresError::Configuration)?;
         let counts=sqlx::query("SELECT (SELECT count(*) FROM history_points) AS points, (SELECT coalesce(sum(octet_length(id)+coalesce(octet_length(evicted),0)),0)::bigint FROM history_points) AS point_bytes, (SELECT count(*) FROM history_samples) AS samples, (SELECT coalesce(sum(octet_length(payload)+octet_length(point)),0)::bigint FROM history_samples) AS bytes, (SELECT count(*) FROM history_changes) AS changes, (SELECT coalesce(sum(octet_length(payload)),0)::bigint FROM history_changes) AS change_bytes")
-            .fetch_one(&backend.pool).await.map_err(|_|PostgresError::Incompatible)?;
+            .fetch_one(&mut *connection).await.map_err(crate::postgres::storage::read_error)?;
         let count = |name| {
             counts
                 .try_get::<i64, _>(name)
@@ -162,9 +170,9 @@ impl HisStore {
         let point_rows = sqlx::query(
             "SELECT id,incarnation,generation::text,evicted FROM history_points ORDER BY id",
         )
-        .fetch_all(&backend.pool)
+        .fetch_all(&mut *connection)
         .await
-        .map_err(|_| PostgresError::Incompatible)?;
+        .map_err(crate::postgres::storage::read_error)?;
         let mut points = HashMap::new();
         for row in point_rows {
             let id: String = row.try_get("id").map_err(|_| PostgresError::Incompatible)?;
@@ -201,9 +209,9 @@ impl HisStore {
         let samples = sqlx::query(
             "SELECT point,seconds,nanos,payload FROM history_samples ORDER BY point,seconds,nanos",
         )
-        .fetch_all(&backend.pool)
+        .fetch_all(&mut *connection)
         .await
-        .map_err(|_| PostgresError::Incompatible)?;
+        .map_err(crate::postgres::storage::read_error)?;
         for row in samples {
             let id: String = row
                 .try_get("point")
@@ -240,9 +248,9 @@ impl HisStore {
             .map_err(|_| PostgresError::Limit)?;
         let change_rows =
             sqlx::query("SELECT sequence::text,payload FROM history_changes ORDER BY sequence")
-                .fetch_all(&backend.pool)
+                .fetch_all(&mut *connection)
                 .await
-                .map_err(|_| PostgresError::Incompatible)?;
+                .map_err(crate::postgres::storage::read_error)?;
         let mut previous = None;
         for row in change_rows {
             let change = history_value::decode_change(
@@ -267,7 +275,7 @@ impl HisStore {
         };
         let mut receipts = HashMap::new();
         let mut receipt_bytes = 0usize;
-        for row in backend.receipt_rows(2).await? {
+        for row in backend.receipt_rows_at(2, connection).await? {
             let binding = HistoryBinding::from_storage_key(
                 &row.try_get::<Vec<u8>, _>("binding")
                     .map_err(|_| PostgresError::Incompatible)?,
@@ -392,7 +400,7 @@ impl PreparedHistoryMutation {
             return self.reject_postgres(backend, HistoryWriteRejection::Conflict);
         }
         let store = self.store.clone();
-        let mut state = loop {
+        let state = loop {
             if let Some(reason) = self.stopped() {
                 drop(policy);
                 drop(writer);
@@ -403,7 +411,7 @@ impl PreparedHistoryMutation {
             }
         };
         let point = self.plan.as_ref().expect("unconsumed plan").point.clone();
-        let mut series = loop {
+        let series = loop {
             if let Some(reason) = self.stopped() {
                 drop(state);
                 drop(policy);
@@ -432,6 +440,11 @@ impl PreparedHistoryMutation {
         plan.change.sequence = sequence;
         plan.receipt.change_sequence = sequence;
         let committed = HistoryWriteOutcome::Committed(plan.receipt.clone());
+        let before_sequence = state.sequence;
+        drop(series);
+        drop(state);
+        // Preparation and publication are excluded by the writer gate. Never
+        // hold a point or history-capture lock while awaiting SQL or a pool slot.
         let result=backend.runtime.block_on(async {
             let encoded=encode_outcome(&committed)?;
             let change=history_value::encode_change(&plan.change)?;
@@ -446,9 +459,14 @@ impl PreparedHistoryMutation {
             let key=self.binding.storage_key()?;
             let mut tx=backend.transaction(self.deadline).await?;
             let prepared=tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline),async {
-            let current:String=sqlx::query_scalar("SELECT history_sequence::text FROM metadata WHERE singleton=1")
+            let current=sqlx::query("SELECT history_sequence::text,revision::text,incarnation,catalog_generation::text FROM metadata WHERE singleton=1")
                 .fetch_one(&mut *tx).await.map_err(|_|PostgresError::Unavailable)?;
-            if value::number(&current)?!=state.sequence {return Err(PostgresError::Incompatible)};
+            let get = |name| current.try_get::<String,_>(name).map_err(|_|PostgresError::Incompatible);
+            if value::number(&get("history_sequence")?)? != before_sequence
+                || value::number(&get("revision")?)? != plan.graph.revision
+                || value::number(&get("catalog_generation")?)? != plan.graph.catalog_generation
+                || current.try_get::<Vec<u8>,_>("incarnation").map_err(|_|PostgresError::Incompatible)? != plan.graph.incarnation
+            {return Err(PostgresError::Conflict)};
             let stored:Vec<u8>=sqlx::query_scalar("SELECT outcome FROM receipts WHERE domain=2 AND binding=$1")
                 .bind(&key).fetch_one(&mut *tx).await.map_err(|_|PostgresError::Unavailable)?;
             let stored=decode_outcome(&stored)?;
@@ -488,19 +506,24 @@ impl PreparedHistoryMutation {
         });
         let resolved = match result {
             Ok(outcome) => outcome,
-            Err(_) => match settle(
+            Err(error) => match settle(
                 backend,
                 &self.binding,
-                HistoryWriteRejection::Provider,
+                if error == PostgresError::Conflict {
+                    HistoryWriteRejection::Conflict
+                } else {
+                    HistoryWriteRejection::Provider
+                },
                 Instant::now() + backend.limits.statement_timeout,
             ) {
                 Ok(Some(record)) => record.outcome,
                 _ => {
-                    backend.seal();
                     return self.unknown();
                 }
             },
         };
+        let mut state = store.inner.state.lock();
+        let mut series = point.write();
         if resolved == committed {
             *series = plan.next;
             store.append_change(&mut state, plan.change);
@@ -517,14 +540,4 @@ impl PreparedHistoryMutation {
         drop(writer);
         resolved
     }
-}
-
-pub(super) fn reconcile(
-    backend: &Backend,
-    binding: &HistoryBinding,
-    reason: HistoryWriteRejection,
-    deadline: Instant,
-) -> Result<Option<HistoryRecord>, PostgresError> {
-    let _publication = backend.publication_guard(deadline)?;
-    settle(backend, binding, reason, deadline)
 }

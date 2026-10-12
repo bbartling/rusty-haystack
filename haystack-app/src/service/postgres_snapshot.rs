@@ -99,7 +99,10 @@ impl ReadAdmission {
         let observer = owned.clone();
         let (send, receive) = oneshot::channel();
         self.runtime().spawn(async move {
-            let result = backend.health().await.map_err(|_| ReadError::Unavailable);
+            let result = backend
+                .refresh_until(owned.deadline)
+                .await
+                .map_err(|_| ReadError::Unavailable);
             let _ = send.send(result);
             drop(owned);
         });
@@ -175,9 +178,18 @@ fn run(
         backend
             .snapshot_acquiring
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        let connection = acquired
+        let mut connection = acquired
             .map_err(|_| ReadError::Deadline)?
             .map_err(|_| ReadError::Unavailable)?;
+        // Session gate precedes BEGIN: RR's first statement must not freeze
+        // a snapshot while waiting behind an exclusive schema transition.
+        connection.close_on_drop();
+        if backend.schema_shared(&mut connection).await.is_err() {
+            // The schema gate precedes OwnedTransaction, but its failure must
+            // still retain this worker and admission through physical cleanup.
+            backend.close_snapshot_setup(connection).await;
+            return Err(ReadError::Unavailable);
+        }
         OwnedTransaction::begin(connection, true, backend.limits.statement_timeout)
             .await
             .map_err(|_| ReadError::Unavailable)
@@ -216,11 +228,7 @@ fn run(
                     let Some(request) = request else { break Ok(()) };
                     let result = budget
                         .check()
-                        .and_then(|()| {
-                            runtime
-                                .block_on(backend.health())
-                                .map_err(|_| ReadError::Unavailable)
-                        })
+                        .and_then(|()| backend.check().map_err(|_| ReadError::Unavailable))
                         .and_then(|()| {
                             inner.execute_on_graph(
                                 principal.clone(),
@@ -253,7 +261,7 @@ async fn recover(
         .graph
         .read(|graph| graph.activated_catalog().cloned())
         .ok_or(ReadError::Unavailable)?;
-    let meta=sqlx::query("SELECT CASE WHEN octet_length(incarnation)=16 THEN incarnation END AS incarnation,revision::text,catalog_generation::text,owner_generation,CASE WHEN octet_length(catalog)<=1048576 THEN catalog END AS catalog FROM metadata WHERE singleton=1")
+    let meta=sqlx::query("SELECT format,CASE WHEN octet_length(incarnation)=16 THEN incarnation END AS incarnation,revision::text,catalog_generation::text,owner_generation,CASE WHEN octet_length(catalog)<=1048576 THEN catalog END AS catalog FROM metadata WHERE singleton=1")
         .fetch_one(&mut **tx).await.map_err(|_|ReadError::Unavailable)?;
     let get = |name| {
         meta.try_get::<String, _>(name)
@@ -263,6 +271,10 @@ async fn recover(
         .try_get::<i64, _>("owner_generation")
         .map_err(|_| ReadError::Unavailable)?
         != backend.generation
+        || meta
+            .try_get::<i32, _>("format")
+            .map_err(|_| ReadError::Unavailable)?
+            != 2
         || get("catalog")? != catalog.selection_identity()
     {
         return Err(ReadError::Unavailable);
