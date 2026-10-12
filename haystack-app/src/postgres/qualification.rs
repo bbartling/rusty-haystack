@@ -2005,3 +2005,92 @@ async fn independent_application_processes_share_one_authority() {
 }
 
 mod process;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
+async fn schema_validation_does_not_deparse_unrelated_removed_relations() {
+    removed_schema_validation_probe(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL fixture; run the qualification script"]
+async fn schema_validation_does_not_deparse_unrelated_removed_foreign_keys() {
+    removed_schema_validation_probe(true).await;
+}
+
+async fn removed_schema_validation_probe(history: bool) {
+    let config = fixture("catalog_scope");
+    let unrelated = fixture("catalog_other");
+    let mut admin = sqlx::PgConnection::connect_with(&unrelated.options().unwrap())
+        .await
+        .unwrap();
+    let tables = if history {
+        "CREATE TABLE history_points(id text PRIMARY KEY); CREATE TABLE history_samples(point text REFERENCES history_points(id));"
+    } else {
+        "CREATE TABLE metadata(format integer CHECK(format=2));"
+    };
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA \"{}\"; SET search_path=\"{}\"; {tables}",
+        unrelated.schema, unrelated.schema
+    )))
+    .execute(&mut admin)
+    .await
+    .unwrap();
+    let owner = open(config.clone()).await;
+    close(owner).await;
+    let mut connection = sqlx::PgConnection::connect_with(&config.options().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended(current_database() || ':' || $1,0))")
+        .bind(&config.schema)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    if history {
+        // Keep EXISTS semantics: an earlier, differently defined owned FK does
+        // not hide a later matching one, and is not itself sufficient.
+        sqlx::raw_sql("ALTER TABLE history_samples DROP CONSTRAINT history_samples_point_fkey; ALTER TABLE history_samples ADD CONSTRAINT cascade_reference FOREIGN KEY(point) REFERENCES history_points(id) ON DELETE CASCADE; ALTER TABLE history_samples ADD CONSTRAINT history_samples_point_fkey FOREIGN KEY(point) REFERENCES history_points(id);")
+            .execute(&mut connection).await.unwrap();
+    }
+    sqlx::raw_sql("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=off; SET LOCAL enable_hashjoin=off; SET LOCAL enable_mergejoin=off;")
+        .execute(&mut connection).await.unwrap();
+    let _: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_constraint")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    // Preserve the catalog observation that a concurrent statement may already
+    // hold when another schema is dropped. Name lookup during deparse consults
+    // current catalogs, independently of that observation.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA \"{}\" CASCADE",
+        unrelated.schema
+    )))
+    .execute(&mut admin)
+    .await
+    .unwrap();
+    let result = super::storage::validate_schema(&mut connection, &config.schema).await;
+    sqlx::query("ROLLBACK")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    if history {
+        sqlx::query("ALTER TABLE history_samples DROP CONSTRAINT history_samples_point_fkey")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                super::storage::validate_schema(&mut connection, &config.schema).await,
+                Err(PostgresError::Incompatible)
+            ),
+            "a different FK definition cannot satisfy the required schema contract"
+        );
+    }
+    connection.close().await.unwrap();
+    admin.close().await.unwrap();
+    cleanup(&config).await;
+    assert!(
+        result.is_ok(),
+        "validation of the intact owned schema must not deparse a removed unrelated relation: {result:?}"
+    );
+}

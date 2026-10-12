@@ -363,9 +363,12 @@ const PRIMARY_KEYS: &[(&str, &[&str])] = &[
     ("history_samples", &["point", "seconds", "nanos"]),
     ("history_changes", &["sequence"]),
 ];
-async fn validate_schema(connection: &mut PgConnection, schema: &str) -> Result<(), PostgresError> {
+pub(super) async fn validate_schema(
+    connection: &mut PgConnection,
+    schema: &str,
+) -> Result<(), PostgresError> {
     let keys = sqlx::query("SELECT c.relname,array_agg(a.attname::text ORDER BY k.ordinality) AS columns FROM pg_constraint p JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL unnest(p.conkey) WITH ORDINALITY AS k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.attnum WHERE p.contype='p' AND n.nspname=$1 AND c.relname=ANY($2) GROUP BY c.relname")
-        .bind(schema).bind(TABLES.as_slice()).fetch_all(&mut *connection).await.map_err(read_error)?;
+        .bind(schema).bind(TABLES.as_slice()).fetch_all(&mut *connection).await.map_err(|error| { #[cfg(test)] diagnose_sql_error("schema-primary-keys", &error); read_error(error) })?;
     if keys.len() != PRIMARY_KEYS.len()
         || PRIMARY_KEYS.iter().any(|(table, columns)| {
             !keys.iter().any(|row| {
@@ -383,15 +386,70 @@ async fn validate_schema(connection: &mut PgConnection, schema: &str) -> Result<
     {
         return Err(PostgresError::Incompatible);
     }
-    let format: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_constraint p JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='metadata' AND p.conname='metadata_format_check' AND p.contype='c' AND p.convalidated AND pg_get_constraintdef(p.oid)='CHECK ((format = 2))')")
-        .bind(schema).fetch_one(&mut *connection).await.map_err(read_error)?;
-    let history_reference: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_constraint p JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_class target ON target.oid=p.confrelid WHERE n.nspname=$1 AND c.relname='history_samples' AND target.relnamespace=c.relnamespace AND target.relname='history_points' AND p.contype='f' AND p.convalidated AND pg_get_constraintdef(p.oid)='FOREIGN KEY (point) REFERENCES history_points(id)')")
-        .bind(schema).fetch_one(&mut *connection).await.map_err(read_error)?;
+    let format = constraint_definition_exists(
+        connection,
+        schema,
+        "SELECT p.oid::bigint FROM pg_constraint p JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='metadata' AND p.conname='metadata_format_check' AND p.contype='c' AND p.convalidated AND p.oid::bigint>$2 ORDER BY p.oid LIMIT 1",
+        "CHECK ((format = 2))",
+        "schema-format-constraint",
+    ).await?;
+    let history_reference = constraint_definition_exists(
+        connection,
+        schema,
+        "SELECT p.oid::bigint FROM pg_constraint p JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_class target ON target.oid=p.confrelid WHERE n.nspname=$1 AND c.relname='history_samples' AND target.relnamespace=c.relnamespace AND target.relname='history_points' AND p.contype='f' AND p.convalidated AND p.oid::bigint>$2 ORDER BY p.oid LIMIT 1",
+        "FOREIGN KEY (point) REFERENCES history_points(id)",
+        "schema-history-reference",
+    ).await?;
     if !format || !history_reference {
         return Err(PostgresError::Incompatible);
     }
     Ok(())
 }
+/// Select only owned OIDs before invoking the deparser. A WHERE predicate does
+/// not order evaluation: deparsing inside the catalog join can inspect another
+/// schema's relation while it is being dropped. The caller's exclusive schema
+/// gate protects these selected relations across both statements. Walk one OID
+/// at a time to preserve EXISTS semantics with bounded client memory; the outer
+/// initialization deadline bounds all queries, including additional constraints.
+async fn constraint_definition_exists(
+    connection: &mut PgConnection,
+    schema: &str,
+    selection: &'static str,
+    expected: &'static str,
+    _stage: &'static str,
+) -> Result<bool, PostgresError> {
+    let mut after = 0_i64;
+    loop {
+        // Both selections are trusted static SQL defined above, not caller SQL.
+        let oid: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(selection))
+            .bind(schema)
+            .bind(after)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| {
+                #[cfg(test)]
+                diagnose_sql_error(_stage, &error);
+                read_error(error)
+            })?;
+        let Some(oid) = oid else { return Ok(false) };
+        let matches: Option<bool> =
+            sqlx::query_scalar("SELECT pg_get_constraintdef($1::bigint::oid)=$2")
+                .bind(oid)
+                .bind(expected)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|error| {
+                    #[cfg(test)]
+                    diagnose_sql_error(_stage, &error);
+                    read_error(error)
+                })?;
+        if matches == Some(true) {
+            return Ok(true);
+        }
+        after = oid;
+    }
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS metadata (
  singleton smallint PRIMARY KEY CHECK(singleton = 1),
@@ -825,8 +883,18 @@ fn sql_error_diagnostic(stage: &'static str, error: &sqlx::Error) -> String {
         sqlx::Error::Io(error) => Some(error.kind()),
         _ => None,
     };
+    let routine = error
+        .as_database_error()
+        .and_then(|error| error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+        .and_then(|error| match error.routine() {
+            Some("get_relation_name") => Some("get_relation_name"),
+            Some("get_attname") => Some("get_attname"),
+            Some("generate_relation_name") => Some("generate_relation_name"),
+            Some("pg_get_constraintdef_worker") => Some("pg_get_constraintdef_worker"),
+            _ => None,
+        });
     format!(
-        "PostgreSQL qualification diagnostic: stage={stage} kind={kind} io={io:?} sqlstate={code:?}"
+        "PostgreSQL qualification diagnostic: stage={stage} kind={kind} io={io:?} sqlstate={code:?} routine={routine:?}"
     )
 }
 #[test]
@@ -842,7 +910,7 @@ fn qualification_diagnostic_omits_driver_message_and_context() {
     ] {
         let diagnostic = sql_error_diagnostic("test-stage", &error);
         assert!(!diagnostic.contains(sensitive));
-        assert!(diagnostic.len() < 160);
+        assert!(diagnostic.len() < 256);
     }
     assert_eq!(
         sql_error_diagnostic(
@@ -852,6 +920,6 @@ fn qualification_diagnostic_omits_driver_message_and_context() {
                 sensitive
             ))
         ),
-        "PostgreSQL qualification diagnostic: stage=test-stage kind=io io=Some(BrokenPipe) sqlstate=None"
+        "PostgreSQL qualification diagnostic: stage=test-stage kind=io io=Some(BrokenPipe) sqlstate=None routine=None"
     );
 }
