@@ -2145,6 +2145,7 @@ dependencies = [
  "rusty-haystack-core",
  "rusty-haystack-server",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

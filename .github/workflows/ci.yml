@@ -144,7 +144,7 @@ jobs:
         run: python3 -m unittest discover -s scripts/postgres -p 'test_*.py' -v
       - name: Qualify verified TLS, ownership, commits, restart and snapshot cleanup
         run: python3 scripts/postgres/qualify.py --docker
-      - name: Qualify installed standalone authorization, persistence and signal cleanup
+      - name: Qualify installed standalone authorization, archived restore, selector and signal cleanup
         run: python3 scripts/postgres/standalone.py --docker
 
   # The PyO3 crate is excluded from `cargo test --locked --workspace`, so nothing above

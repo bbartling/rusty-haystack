@@ -7,7 +7,9 @@ Cooperating application processes may share one database/schema with the same
 supported format and activated catalog. Managed admission observes a coherent
 committed database cut; bounded periodic refresh supplies idle convergence.
 This profile makes no general serializability, rolling mixed-version, geographic
-replication, backup, power-loss, performance or production deployment claim.
+replication, cross-server disaster recovery, power-loss, performance or production deployment claim.
+For the bounded same-database backup/restore workflow, see
+[backup and authority selection](postgres-recovery.md).
 
 For an installed standalone server with explicit configuration and a disposable
 authenticated HTTP write/history/restart recipe, see
@@ -56,10 +58,12 @@ work completion and cleanup errors, as in the [lifecycle contract](application-l
 
 ## Authority and atomic publication
 
-Initialization and the supported format-1-to-format-2 transition hold the schema's
+Initialization and supported format-1/2-to-format-3 transitions hold the schema's
 exclusive advisory gate. Transactional DDL, format changes and relation checks
 roll back together on failure. The gate uses the former exclusive-owner key, so
-a live format-1 owner must close before transition. Startup verifies logged
+a live format-1 owner must close before transition. The format bump fences later
+format-2 transactions; current format-3 transactions also require an active
+authority state. Startup verifies logged
 authority relations, required primary/foreign keys, the format constraint and
 stored catalog/values; `IF NOT EXISTS` alone is not compatibility evidence.
 Concurrent starters share one durable dataset, incarnation and cursor key.
@@ -189,18 +193,16 @@ restarted-owner subscription IDs return authority/unknown resynchronization;
 create a fresh authorized initial snapshot. This differs from the durable entity
 feed cursor, whose key and position survive compatible application reconstruction.
 
-Restore is an explicit coordinated authority change, not a backup API. With all
-schema-dependent work excluded by the exclusive schema gate, the administrator
-must rotate the entity incarnation, history authority and affected point
-incarnations, cursor signing key and durable authority epoch, and reconcile the
-restored heads, floors, changes and receipt ledgers atomically. Old instances
-fence on their next verified observation; old prepared writes cannot cross the
-epoch, retained history sessions stop after fencing, and reconstructed services
-reject old feed/subscription continuations. Observed same-epoch head regression
-fails rather than silently rewinding. A byte-for-byte restore that removes future
-commits cannot be inferred from the restored bytes alone and still requires
-explicit authority rotation. No automatic disaster-recovery or backup
-qualification follows from these controls.
+The [backup/restore workflow](postgres-recovery.md) now implements explicit
+coordinated authority changes between distinct schemas in one database. It
+quiesces source work, validates canonical retained data, stages fresh identities
+and atomically updates source/target states, selection and the operation journal.
+Old instances fence on their next verified observation; prepared writes cannot
+cross the epoch and retained resources require resynchronization. Archived
+backups can be reused under a new restore intent after the producer was cancelled.
+Observed same-epoch regression still fails rather than silently rewinding. Loss
+of the whole database/control journal and cross-server disaster recovery remain
+outside this profile.
 
 ## Explicit qualification
 

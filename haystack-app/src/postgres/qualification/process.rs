@@ -1218,7 +1218,7 @@ async fn schema_transition_rolls_back_and_snapshot_waits_before_freezing_its_vie
         .fetch_one(&mut admin)
         .await
         .unwrap();
-    assert_eq!(format, 2);
+    assert_eq!(format, 3);
     a.call(json!({"op":"snapshot_prepare"}));
     let mut migration = admin.begin().await.unwrap();
     sqlx::query(

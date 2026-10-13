@@ -47,7 +47,7 @@ fn postgres_rejects_invalid_configuration_and_users_without_echoing_secrets() {
         "[users.reader]\npassword_hash = {:?}\npermissions = [\"read\"]\n",
         hash_password("only-local-test")
     );
-    let valid_config = "host = '127.0.0.1'\nport = 5432\ndatabase = 'local'\nusername = 'local'\nschema = 'standalone'\npassword_env = 'HAYSTACK_MISSING_TEST_PASSWORD'\n[transport]\nmode = 'loopback-plaintext'\n";
+    let valid_config = "version = 1\nhost = '127.0.0.1'\nport = 5432\ndatabase = 'local'\nusername = 'local'\nschema = 'standalone'\npassword_env = 'HAYSTACK_MISSING_TEST_PASSWORD'\n[transport]\nmode = 'loopback-plaintext'\n";
     for (source, credentials, expected) in [
         (
             "password = 'secret-sentinel'\ninvalid = [",
@@ -55,7 +55,7 @@ fn postgres_rejects_invalid_configuration_and_users_without_echoing_secrets() {
             "invalid PostgreSQL TOML",
         ),
         (
-            "host = 'secret-sentinel'\nunknown_key = true",
+            "version = 1\nhost = 'secret-sentinel'\nunknown_key = true",
             valid_users.as_str(),
             "invalid PostgreSQL TOML",
         ),
@@ -110,7 +110,7 @@ fn postgres_semantic_configuration_failures_do_not_connect_or_echo_credentials()
         ("secret-sentinel.invalid", 5432, "standalone"),
         ("127.0.0.1", 5432, "public"),
     ] {
-        std::fs::write(&config, format!("host = {host:?}\nport = {port}\ndatabase = 'local'\nusername = 'local'\nschema = {schema:?}\npassword_env = 'HAYSTACK_TEST_DATABASE_PASSWORD'\n[transport]\nmode = 'loopback-plaintext'\n")).unwrap();
+        std::fs::write(&config, format!("version = 1\nhost = {host:?}\nport = {port}\ndatabase = 'local'\nusername = 'local'\nschema = {schema:?}\npassword_env = 'HAYSTACK_TEST_DATABASE_PASSWORD'\n[transport]\nmode = 'loopback-plaintext'\n")).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
             .args([
                 "serve",
@@ -127,5 +127,63 @@ fn postgres_semantic_configuration_failures_do_not_connect_or_echo_credentials()
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("invalid PostgreSQL configuration"));
         assert!(!error.contains("secret-sentinel"));
+    }
+}
+
+#[test]
+fn storage_administration_commands_are_discoverable() {
+    let output = run(&["storage", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "export",
+        "import",
+        "restore",
+        "activate",
+        "cancel",
+        "status",
+        "reconcile",
+        "verify",
+    ] {
+        assert!(help.contains(command));
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let output = run(&["storage", "verify", "--backup", "absent"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--features postgres"));
+    }
+}
+#[cfg(feature = "postgres")]
+#[test]
+fn shared_configuration_requires_version_and_exactly_one_authority_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let common = "host='127.0.0.1'\nport=5432\ndatabase='fixture'\nusername='fixture'\npassword_env='HAYSTACK_MISSING_TEST_PASSWORD'\n";
+    for (selection, expected) in [
+        ("schema='source'\n", "invalid PostgreSQL TOML"),
+        (
+            "version=2\nschema='source'\n",
+            "unsupported PostgreSQL configuration version",
+        ),
+        ("version=1\n", "choose exactly one"),
+        (
+            "version=1\nschema='source'\nselector_schema='control'\n",
+            "choose exactly one",
+        ),
+        (
+            "version=1\nselector_schema='control'\n",
+            "password environment variable is missing",
+        ),
+    ] {
+        std::fs::write(
+            &path,
+            format!("{common}{selection}[transport]\nmode='loopback-plaintext'\n"),
+        )
+        .unwrap();
+        let output = run(&["storage", "status", "--config", path.to_str().unwrap()]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
     }
 }
