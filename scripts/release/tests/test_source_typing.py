@@ -1,4 +1,4 @@
-"""Reproduce Maturin's relocated project root with the original nested stub."""
+"""Verify the explicit Python package at Maturin's relocated project root."""
 import importlib.util
 from pathlib import Path
 import sys
@@ -15,43 +15,48 @@ finally:
     sys.path.pop(0)
 
 
-class SourceTypingRepairTests(unittest.TestCase):
+class SourceTypingLayoutTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="source typing archive ")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "archive"; self.root.mkdir()
-        (self.root / "pyproject.toml").write_text('[tool.maturin]\nmanifest-path="rusty-haystack/Cargo.toml"\n')
-        nested = self.root / "rusty-haystack"; nested.mkdir()
-        (nested / "Cargo.toml").write_text('[package]\nname="rusty-haystack"\nversion="0.9.0"\n')
-        self.expected = Path(self.temp.name) / "current-source.pyi"
-        self.expected.write_bytes(b'class CurrentAPI: ...\n')
-        self.nested = nested / "rusty_haystack.pyi"
-        self.nested.write_bytes(self.expected.read_bytes())
-        self.output = self.root / "rusty_haystack.pyi"
+        self.expected = Path(self.temp.name) / "current-package"; self.expected.mkdir()
+        self.package = self.root / "rusty_haystack"; self.package.mkdir()
+        for directory in (self.expected, self.package):
+            (directory / "__init__.py").write_bytes(b"from .rusty_haystack import *\n")
+            for name in builder.a.TYPING_FILES:
+                (directory / name).write_bytes(b"" if name == "py.typed" else b"class CurrentAPI: ...\n")
 
-    def test_misplaced_stub_is_copied_without_regeneration(self):
-        expected = builder.a.digest(self.expected)
-        self.assertFalse(self.output.exists())
+    def test_relocated_package_is_verified_without_rewriting(self):
+        expected = builder.a.typing_hashes(self.expected)
         self.assertEqual(builder.prepare_source_typing(self.root, self.expected), expected)
-        self.assertEqual(self.output.read_bytes(), self.expected.read_bytes())
-        self.assertEqual(self.nested.read_bytes(), self.expected.read_bytes())
-        self.assertFalse((self.root / "py.typed").exists())  # Maturin emits it in the wheel.
+        self.assertEqual(builder.a.typing_hashes(self.package), expected)
+        self.assertFalse((self.root / "rusty_haystack.pyi").exists())
         self.assertEqual(builder.prepare_source_typing(self.root, self.expected), expected)
 
-    def test_missing_or_stale_nested_source_is_rejected(self):
-        for stale in (None, b'class OldAPI: ...\n'):
-            with self.subTest(stale=stale):
-                if stale is None: self.nested.unlink()
-                else: self.nested.write_bytes(stale)
-                with self.assertRaisesRegex(builder.a.Invalid, "typing"):
-                    builder.prepare_source_typing(self.root, self.expected)
-                self.assertFalse(self.output.exists())
+    def test_missing_or_stale_file_is_rejected(self):
+        for name in ("__init__.pyi", "kinds.pyi", "py.typed"):
+            original = (self.package / name).read_bytes()
+            for stale in (None, b"class OldAPI: ...\n"):
+                with self.subTest(name=name, stale=stale):
+                    if stale is None: (self.package / name).unlink()
+                    else: (self.package / name).write_bytes(stale)
+                    with self.assertRaisesRegex(builder.a.Invalid, "typing"):
+                        builder.prepare_source_typing(self.root, self.expected)
+                    (self.package / name).write_bytes(original)
 
-    def test_conflicting_destination_is_never_overwritten(self):
-        self.output.write_bytes(b'class ConflictingAPI: ...\n')
-        with self.assertRaisesRegex(builder.a.Invalid, "conflicting"):
+    def test_unexpected_or_symlinked_stubs_and_stale_loader_are_rejected(self):
+        extra = self.package / "unexpected.pyi"; extra.write_bytes(b"")
+        with self.assertRaisesRegex(builder.a.Invalid, "typing"):
             builder.prepare_source_typing(self.root, self.expected)
-        self.assertEqual(self.output.read_bytes(), b'class ConflictingAPI: ...\n')
+        extra.unlink()
+        target = self.package / "kinds.pyi"; target.unlink(); target.symlink_to(self.expected / "kinds.pyi")
+        with self.assertRaisesRegex(builder.a.Invalid, "typing"):
+            builder.prepare_source_typing(self.root, self.expected)
+        target.unlink(); target.write_bytes((self.expected / "kinds.pyi").read_bytes())
+        (self.package / "__init__.py").write_bytes(b"stale loader\n")
+        with self.assertRaisesRegex(builder.a.Invalid, "loader mismatch"):
+            builder.prepare_source_typing(self.root, self.expected)
 
 
 if __name__ == '__main__':

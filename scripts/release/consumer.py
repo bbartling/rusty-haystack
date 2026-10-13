@@ -14,7 +14,7 @@ import sys
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--prefix", type=Path, required=True)
 parser.add_argument("--version", required=True)
-parser.add_argument("--stub-sha256", required=True)
+parser.add_argument("--typing-manifest", type=Path, required=True)
 args = parser.parse_args()
 assert platform.python_implementation() == "CPython" and sys.version_info[:2] == (3, 12)
 assert Path(sys.prefix).resolve() == args.prefix.resolve()
@@ -45,9 +45,12 @@ package = origin.parent
 stub = package / "__init__.pyi"
 marker = package / "py.typed"
 assert stub.is_file() and marker.is_file()
-assert hashlib.sha256(stub.read_bytes()).hexdigest() == args.stub_sha256
+expected_typing = json.loads(args.typing_manifest.read_text())
+assert set(expected_typing) == {p.name for p in package.glob("*.pyi")} | {"py.typed"}
+for name, expected in expected_typing.items():
+    assert hashlib.sha256((package / name).read_bytes()).hexdigest() == expected, name
 classes = {node.name for node in ast.parse(stub.read_text()).body if isinstance(node, ast.ClassDef)}
 assert {"Number", "Ref", "HGrid", "CodecError", "ClientError"} <= classes
 installed_files = {str(path) for path in importlib.metadata.distribution("rusty-haystack").files}
-assert {"rusty_haystack/__init__.pyi", "rusty_haystack/py.typed"} <= installed_files
-print(json.dumps({"implementation": platform.python_implementation(), "python": platform.python_version(), "prefix": str(args.prefix.resolve()), "module_origin": str(origin), "version": module.__version__, "typing_stub_sha256": args.stub_sha256, "typing": "installed PEP 561 layout, current stub digest and parsed public names; no full type-checker claim"}, sort_keys=True))
+assert {"rusty_haystack/" + name for name in expected_typing} <= installed_files
+print(json.dumps({"implementation": platform.python_implementation(), "python": platform.python_version(), "prefix": str(args.prefix.resolve()), "module_origin": str(origin), "version": module.__version__, "typing_files_sha256": expected_typing, "typing": "installed PEP 561 layout, complete current stub digests and parsed public names; no full type-checker claim"}, sort_keys=True))

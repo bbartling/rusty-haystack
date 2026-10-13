@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Validate a fresh installed wheel and real positive/negative static consumers.
+
+This is local selected-host evidence, not release provenance or a platform matrix.
+The caller builds the wheel; no source or stub paths enter the consumer import path.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tomllib
+
+CHECKER = "pyright 1.1.413"
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "scripts/release"))
+import artifacts
+sys.path.pop(0)
+
+
+def run(command, work, label, *, cwd, expected=0):
+    env = dict(os.environ)
+    for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        env.pop(name, None)
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, timeout=300)
+    (work / (label + ".stdout")).write_text(result.stdout)
+    (work / (label + ".stderr")).write_text(result.stderr)
+    if result.returncode != expected:
+        raise RuntimeError(f"{label} exited {result.returncode}, expected {expected}; retained output in {work}")
+    return result.stdout
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--python", type=Path, required=True)
+    parser.add_argument("--pyright", type=Path, required=True)
+    parser.add_argument("--work", type=Path, required=True)
+    args = parser.parse_args()
+    work = args.work.resolve()
+    if work.is_relative_to(REPO):
+        raise ValueError("consumer work must be outside the checkout")
+    work.mkdir(parents=True, exist_ok=False)
+    scratch = work / "consumer"; scratch.mkdir()
+    checker = str(args.pyright.resolve())
+    if run([checker, "--version"], work, "checker-version", cwd=scratch).strip() != CHECKER:
+        raise ValueError(f"expected {CHECKER}")
+    venv = work / "venv"
+    run([str(args.python.resolve()), "-I", "-m", "venv", str(venv)], work, "create-venv", cwd=scratch)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    wheel = args.wheel.resolve()
+    run([str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir", str(wheel)], work, "install-wheel", cwd=scratch)
+    manifest = work / "expected-typing.json"
+    manifest.write_text(json.dumps(artifacts.typing_sources(REPO), sort_keys=True))
+    version = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    installed = json.loads(run([str(python), "-I", str(REPO / "scripts/release/consumer.py"), "--prefix", str(venv), "--version", version, "--typing-manifest", str(manifest)], work, "installed-layout", cwd=scratch))
+    for name in ("positive.py", "negative.py"):
+        shutil.copyfile(Path(__file__).with_name(name), scratch / name)
+    shutil.copyfile(REPO / "haystack-core/tests/fixtures/typed-v1-entity.json", scratch / "typed-v1-entity.json")
+    (scratch / "pyrightconfig.json").write_text(json.dumps({"typeCheckingMode": "strict", "pythonVersion": "3.11", "extraPaths": []}))
+    run([str(python), "-I", str(scratch / "positive.py")], work, "positive-runtime", cwd=scratch)
+    command = [checker, "--pythonpath", str(python), "--outputjson"]
+    positive = json.loads(run(command + ["positive.py"], work, "positive-static", cwd=scratch))
+    # PyO3 registers these modules in sys.modules; no Python source file exists
+    # for them. Keep the checker's source-location warnings in the receipt while
+    # requiring the corresponding installed runtime imports above to succeed.
+    native_modules = {"auth", "client", "codecs", "data", "filter", "graph", "kinds", "ontology", "server", "units"}
+    source_warnings = positive["generalDiagnostics"]
+    imported_lines = {node.module.removeprefix("rusty_haystack."): node.lineno - 1 for node in ast.parse((scratch / "positive.py").read_text()).body if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("rusty_haystack.")}
+    expected_warnings = {(f'Import "rusty_haystack.{name}" could not be resolved from source', imported_lines[name]) for name in native_modules}
+    actual_warnings = {(item["message"], item["range"]["start"]["line"]) for item in source_warnings}
+    if positive["summary"]["errorCount"] != 0 or actual_warnings != expected_warnings or any(item["severity"] != "warning" or item.get("rule") != "reportMissingModuleSource" or Path(item["file"]).resolve() != scratch / "positive.py" for item in source_warnings):
+        raise AssertionError("positive static consumer has diagnostics")
+    negative = json.loads(run(command + ["negative.py"], work, "negative-static", cwd=scratch, expected=1))
+    expected_lines = {i for i, line in enumerate((scratch / "negative.py").read_text().splitlines()) if "# reject" in line}
+    diagnostics = negative["generalDiagnostics"]
+    actual_lines = {item["range"]["start"]["line"] for item in diagnostics if item["severity"] == "error" and Path(item["file"]).resolve() == scratch / "negative.py"}
+    if actual_lines != expected_lines or any(item["severity"] != "error" or Path(item["file"]).resolve() != scratch / "negative.py" for item in diagnostics):
+        raise AssertionError("negative static diagnostics did not match the marked consumer lines")
+    result = {"wheel": str(wheel), "wheel_sha256": artifacts.digest(wheel), "checker": CHECKER, "static_python_floor": "3.11", "positive_errors": 0, "native_submodule_source_warnings": source_warnings, "negative_lines_rejected": len(expected_lines), "installed": installed}
+    (work / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

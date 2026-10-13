@@ -160,8 +160,7 @@ impl PyGraphDiff {
             .into_iter()
             .flatten()
         {
-            haystack_core::kinds::projection::ensure_h4_dict(dict)
-                .map_err(crate::convert::unsupported_value)?;
+            crate::convert::ensure_python_dict(dict)?;
         }
         Ok(Self {
             version: d.version,
@@ -295,8 +294,7 @@ impl PyEntityGraph {
     fn remove(&mut self, py: Python<'_>, ref_val: &str) -> PyResult<Py<PyAny>> {
         self.check_live()?;
         if let Some(entity) = self.inner.get(ref_val) {
-            haystack_core::kinds::projection::ensure_h4_dict(entity)
-                .map_err(crate::convert::unsupported_value)?;
+            crate::convert::ensure_python_dict(entity)?;
         }
         let entity = self
             .inner
@@ -618,8 +616,7 @@ impl PySharedGraph {
         // cannot be deleted and only then fail conversion to Python.
         let entity = self.inner.write(|graph| {
             if let Some(entity) = graph.get(ref_val) {
-                haystack_core::kinds::projection::ensure_h4_dict(entity)
-                    .map_err(crate::convert::unsupported_value)?;
+                crate::convert::ensure_python_dict(entity)?;
             }
             graph
                 .remove(ref_val)
@@ -827,33 +824,38 @@ mod tests {
     use haystack_core::kinds::{HRef, Kind};
 
     #[test]
-    fn typed_graph_reads_and_removal_fail_without_mutation_at_python_boundary() {
+    fn unrepresentable_graph_reads_and_removal_fail_without_mutation_at_python_boundary() {
         Python::initialize();
         Python::attach(|py| {
             let mut entity = HDict::new();
             entity.set("id", Kind::Ref(HRef::from_val("typed")));
-            entity.set("nested", Kind::List(vec![Kind::Int(i64::MAX)]));
+            entity.set(
+                "nested",
+                Kind::List(vec![Kind::Time(
+                    chrono::NaiveTime::from_hms_nano_opt(0, 0, 0, 1).unwrap(),
+                )]),
+            );
             let mut owned = PyEntityGraph::new();
             owned.inner.add(entity.clone()).unwrap();
             let version = owned.inner.version();
-            let is_type_error =
-                |error: PyErr| assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
-            is_type_error(owned.get(py, "typed").err().unwrap());
-            is_type_error(owned.read("nested", 0).err().unwrap());
-            is_type_error(owned.all(py).err().unwrap());
-            is_type_error(owned.changes_since(0).err().unwrap());
-            is_type_error(owned.remove(py, "typed").err().unwrap());
+            let is_value_error =
+                |error: PyErr| assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            is_value_error(owned.get(py, "typed").err().unwrap());
+            is_value_error(owned.read("nested", 0).err().unwrap());
+            is_value_error(owned.all(py).err().unwrap());
+            is_value_error(owned.changes_since(0).err().unwrap());
+            is_value_error(owned.remove(py, "typed").err().unwrap());
             assert_eq!(owned.inner.get("typed"), Some(&entity));
             assert_eq!(owned.inner.version(), version);
 
             let shared = PySharedGraph {
                 inner: SharedGraph::new(owned.inner),
             };
-            is_type_error(shared.get(py, "typed").err().unwrap());
-            is_type_error(shared.read(py, "nested", 0).err().unwrap());
-            is_type_error(shared.all(py).err().unwrap());
-            is_type_error(shared.changes_since(0).err().unwrap());
-            is_type_error(shared.remove(py, "typed").err().unwrap());
+            is_value_error(shared.get(py, "typed").err().unwrap());
+            is_value_error(shared.read(py, "nested", 0).err().unwrap());
+            is_value_error(shared.all(py).err().unwrap());
+            is_value_error(shared.changes_since(0).err().unwrap());
+            is_value_error(shared.remove(py, "typed").err().unwrap());
             assert_eq!(shared.inner.get("typed"), Some(entity));
             assert_eq!(shared.inner.read(EntityGraph::version), version);
         });

@@ -8,6 +8,7 @@ mod filter;
 mod graph;
 mod kinds;
 mod ontology;
+mod rich_kinds;
 mod server;
 mod units;
 
@@ -37,6 +38,11 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Top-level convenience re-exports ──
     // All types also available at top level for backward compatibility
     m.add_class::<kinds::PyMarker>()?;
+    m.add_class::<rich_kinds::PyIntValue>()?;
+    m.add_class::<rich_kinds::PyFloatValue>()?;
+    m.add_class::<rich_kinds::PyNoneValue>()?;
+    m.add_class::<rich_kinds::PyBuf>()?;
+    m.add_class::<rich_kinds::PyNominal>()?;
     m.add_class::<kinds::PyNA>()?;
     m.add_class::<kinds::PyRemove>()?;
     m.add_class::<kinds::PyNumber>()?;
@@ -60,6 +66,8 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(codecs::decode_grid, m)?)?;
     m.add_function(wrap_pyfunction!(codecs::encode_scalar, m)?)?;
     m.add_function(wrap_pyfunction!(codecs::decode_scalar, m)?)?;
+    m.add_function(wrap_pyfunction!(codecs::encode_typed_value, m)?)?;
+    m.add_function(wrap_pyfunction!(codecs::decode_typed_value, m)?)?;
     m.add_function(wrap_pyfunction!(filter::parse_filter, m)?)?;
     m.add_function(wrap_pyfunction!(filter::matches_filter, m)?)?;
 
@@ -72,6 +80,11 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Submodule: kinds ──
     add_submodule(m, "kinds", |sub| {
         sub.add_class::<kinds::PyMarker>()?;
+        sub.add_class::<rich_kinds::PyIntValue>()?;
+        sub.add_class::<rich_kinds::PyFloatValue>()?;
+        sub.add_class::<rich_kinds::PyNoneValue>()?;
+        sub.add_class::<rich_kinds::PyBuf>()?;
+        sub.add_class::<rich_kinds::PyNominal>()?;
         sub.add_class::<kinds::PyNA>()?;
         sub.add_class::<kinds::PyRemove>()?;
         sub.add_class::<kinds::PyNumber>()?;
@@ -99,6 +112,8 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
         sub.add_function(wrap_pyfunction!(codecs::decode_grid, sub)?)?;
         sub.add_function(wrap_pyfunction!(codecs::encode_scalar, sub)?)?;
         sub.add_function(wrap_pyfunction!(codecs::decode_scalar, sub)?)?;
+        sub.add_function(wrap_pyfunction!(codecs::encode_typed_value, sub)?)?;
+        sub.add_function(wrap_pyfunction!(codecs::decode_typed_value, sub)?)?;
         Ok(())
     })?;
 
