@@ -39,3 +39,9 @@ create_exception!(
     HaystackError,
     "Error in the Haystack client."
 );
+create_exception!(
+    rusty_haystack,
+    ApplicationError,
+    HaystackError,
+    "Error in a managed embedded application."
+);

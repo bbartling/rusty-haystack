@@ -29,3 +29,21 @@ async_client.closed = True  # reject
 async_client.state = "open"  # reject
 asyncio.create_task(async_client.read("site"))  # reject: Future is not a coroutine
 rh.AsyncHaystackClient("http://localhost:1", "user", "password", timeout="slow")  # reject
+
+builder = rh.ApplicationBuilder()
+builder.start(1)  # reject
+rh.ApplicationBuilder(host=123)  # reject
+rh.ApplicationBuilder(auth=object())  # reject
+application = builder.start()
+application.read("site", cursor=123)  # reject
+application.read("site", limit=None)  # reject
+application.close(1.0)  # reject
+application.closed = True  # reject
+application.handle().close()  # reject: borrowed view has no shutdown authority
+asyncio.create_task(application.ready())  # reject: Future needs an async wrapper
+application.__aenter__().cancel()  # reject: entry is a coroutine, not a Future
+
+async def bad_report() -> None:
+    report = await application.terminated()
+    report.close_error = None  # reject
+    report.cleanup_errors = ()  # reject

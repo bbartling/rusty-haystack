@@ -388,8 +388,13 @@ impl ApplicationOwner {
         self.application.ready().await
     }
     pub async fn close(&self) -> Result<CloseReport, ApplicationError> {
-        self.application.lifecycle.seal();
+        self.request_close();
         self.application.lifecycle.close_result().await
+    }
+    /// Seal admission immediately and request autonomous cleanup. This does not
+    /// wait or claim completion; await `terminated` for the cleanup receipt.
+    pub fn request_close(&self) {
+        self.application.lifecycle.seal();
     }
     pub async fn terminated(&self) -> TerminationReport {
         self.application.terminated().await
@@ -432,6 +437,11 @@ impl ApplicationHandle {
     }
     pub fn state(&self) -> ApplicationState {
         self.lifecycle.control.lock().state
+    }
+    /// Whether actual work/resource cleanup ended, including a failed outcome.
+    /// `Failed` alone is not termination: cleanup can still be in progress.
+    pub fn is_terminated(&self) -> bool {
+        self.lifecycle.control.lock().termination.is_some()
     }
     pub fn outstanding_tasks(&self) -> usize {
         self.lifecycle.tasks.len()
@@ -703,7 +713,12 @@ async fn coordinate(mut parts: BuildParts, policy: ShutdownPolicy, startup_deadl
             }
             result => {
                 partial = Some(index);
-                if let Some(Err(error)) = result {
+                // Sealing can win while initialize is being polled, before it
+                // registers a resource task. That rejected registration is
+                // cooperative startup cancellation, not a resource failure.
+                if let Some(Err(error)) = result
+                    && !(error == ApplicationError::Closed && life.sealed.is_cancelled())
+                {
                     life.fail(error);
                 }
                 break;

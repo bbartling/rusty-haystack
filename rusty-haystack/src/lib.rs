@@ -1,3 +1,4 @@
+mod application;
 mod async_bridge;
 mod async_client;
 mod auth;
@@ -65,6 +66,10 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ontology::PyDefNamespace>()?;
 
     m.add_class::<async_client::PyAsyncHaystackClient>()?;
+    m.add_class::<application::PyApplicationBuilder>()?;
+    m.add_class::<application::PyApplicationOwner>()?;
+    m.add_class::<application::PyApplicationHandle>()?;
+    m.add_class::<application::PyApplicationTermination>()?;
 
     // Top-level codec/filter functions
     m.add_function(wrap_pyfunction!(codecs::encode_grid, m)?)?;
@@ -185,6 +190,10 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ── Submodule: server ──
     add_submodule(m, "server", |sub| {
+        sub.add_class::<application::PyApplicationBuilder>()?;
+        sub.add_class::<application::PyApplicationOwner>()?;
+        sub.add_class::<application::PyApplicationHandle>()?;
+        sub.add_class::<application::PyApplicationTermination>()?;
         sub.add_class::<server::PyHaystackServer>()?;
         sub.add_class::<server::PyAuthManager>()?;
         sub.add_class::<server::PyHisStore>()?;
@@ -201,6 +210,10 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("GraphError", m.py().get_type::<exceptions::GraphError>())?;
     m.add("AuthError", m.py().get_type::<exceptions::AuthError>())?;
     m.add("ClientError", m.py().get_type::<exceptions::ClientError>())?;
+    m.add(
+        "ApplicationError",
+        m.py().get_type::<exceptions::ApplicationError>(),
+    )?;
 
     Ok(())
 }

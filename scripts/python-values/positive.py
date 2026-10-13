@@ -2,7 +2,7 @@
 import datetime as dt
 import json
 from pathlib import Path
-from typing import assert_type
+from typing import Any, Coroutine, assert_type
 
 import rusty_haystack as rh
 from rusty_haystack import Buf, CodecError, Coord, Float, HDateTime, HDict, HGrid, HList, Int, Nominal, NoneValue, Number
@@ -14,7 +14,7 @@ from rusty_haystack.filter import CmpOp, Filter, Path as FilterPath
 from rusty_haystack.graph import DiffOp, EntityGraph, GraphDiff, SharedGraph
 from rusty_haystack.kinds import Int as KindInt
 from rusty_haystack.ontology import DefNamespace, Slot, Spec
-from rusty_haystack.server import AuthManager, HaystackServer, HisStore
+from rusty_haystack.server import ApplicationBuilder, ApplicationHandle, ApplicationOwner, ApplicationTermination, AuthManager, HaystackServer, HisStore
 from rusty_haystack.units import compatible
 
 assert KindInt is Int and rh.kinds.Int is Int
@@ -60,7 +60,7 @@ except CodecError:
 else:
     raise AssertionError("rich values were silently projected by an H4 codec")
 
-# The installed async surface is Future-valued, including context management.
+# The installed client surface is Future-valued, including context management.
 # The network consumer below is a separate executable fixture in this gate.
 import asyncio
 
@@ -82,3 +82,33 @@ async def close_unconnected_owner() -> None:
     assert client.closed
 
 asyncio.run(close_unconnected_owner())
+
+assert ApplicationBuilder is rh.ApplicationBuilder
+assert ApplicationOwner is rh.ApplicationOwner
+assert ApplicationHandle is rh.ApplicationHandle
+assert ApplicationTermination is rh.ApplicationTermination
+assert issubclass(rh.ApplicationError, rh.HaystackError)
+
+async def application_surface() -> None:
+    async with rh.ApplicationBuilder(SharedGraph()).start() as application:
+        assert_type(application, ApplicationOwner)
+        assert_type(application.ready(), asyncio.Future[tuple[str, int]])
+        assert_type(application.handle(), ApplicationHandle)
+        assert_type(application.read("site", limit=1), asyncio.Future[HGrid])
+        assert_type(await application.read("site"), HGrid)
+    report = await application.terminated()
+    assert_type(report, ApplicationTermination)
+    assert_type(report.close_error, str | None)
+    assert_type(report.drain_expired, bool | None)
+    assert_type(report.cleanup_errors, tuple[str, ...])
+    assert_type(application.close(), asyncio.Future[None])
+    await application.close()
+
+async def application_entry_types(application: ApplicationOwner) -> None:
+    entering = assert_type(application.__aenter__(), Coroutine[Any, Any, ApplicationOwner])
+    assert_type(await entering, ApplicationOwner)
+    task = asyncio.create_task(application.__aenter__())
+    assert_type(task, asyncio.Task[ApplicationOwner])
+    await task
+
+asyncio.run(application_surface())

@@ -1,5 +1,7 @@
 //! One process-wide Tokio/Python bridge for async bindings. Client I/O runtimes
 //! have independent ownership; closing a client never claims to destroy this.
+//! Embedded applications borrow this runtime and join their native lifecycle's
+//! tracked work/resources without shutting down the shared bridge.
 use std::future::Future;
 use std::pin::Pin;
 

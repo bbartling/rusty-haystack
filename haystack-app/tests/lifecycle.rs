@@ -35,6 +35,92 @@ fn short_close() -> ShutdownPolicy {
         stop_timeout: Duration::from_millis(40),
     }
 }
+
+struct RegistrationRace {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    rolled_back: Arc<AtomicUsize>,
+    genuine_failure: bool,
+}
+impl ApplicationResource for RegistrationRace {
+    fn name(&self) -> &str {
+        "registration race"
+    }
+    fn initialize(&mut self, context: ResourceContext) -> ResourceFuture<'_, ReadyInfo> {
+        Box::pin(async move {
+            self.entered.send(()).unwrap();
+            // Deliberately pause this poll while a different thread seals. The
+            // close branch was Pending before initialize started this poll.
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            if self.genuine_failure {
+                return Err(ApplicationError::resource(
+                    "registration race",
+                    "actual init failure",
+                ));
+            }
+            context.spawn("late registration", async { Ok(()) })?;
+            Ok(ReadyInfo::default())
+        })
+    }
+    fn rollback_start(&mut self) -> ResourceFuture<'_> {
+        Box::pin(async move {
+            self.rolled_back.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    fn close(&mut self) -> ResourceFuture<'_> {
+        Box::pin(async { panic!("incomplete initialization must roll back") })
+    }
+}
+
+#[test]
+fn close_during_initialization_poll_distinguishes_rejected_registration_from_failure() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    for genuine_failure in [false, true] {
+        let (entered, receive) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let rolled_back = Arc::new(AtomicUsize::new(0));
+        let owner = builder()
+            .owned_resource(RegistrationRace {
+                entered,
+                release: wait,
+                rolled_back: rolled_back.clone(),
+                genuine_failure,
+            })
+            .start(runtime.handle())
+            .unwrap();
+        receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        owner.request_close();
+        assert!(!owner.handle().is_terminated());
+        release.send(()).unwrap();
+        let report = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), owner.terminated())
+                .await
+                .unwrap()
+        });
+        assert_eq!(rolled_back.load(Ordering::SeqCst), 1);
+        assert!(owner.handle().is_terminated());
+        if genuine_failure {
+            assert_eq!(
+                report.close,
+                Err(ApplicationError::resource(
+                    "registration race",
+                    "actual init failure"
+                ))
+            );
+        } else {
+            assert!(
+                report.close.is_ok(),
+                "shutdown-induced registration rejection: {report:?}"
+            );
+        }
+        assert_eq!(owner.handle().outstanding_tasks(), 0);
+    }
+}
 async fn state(handle: &ApplicationHandle, expected: ApplicationState) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while handle.state() != expected {
