@@ -138,10 +138,14 @@ jobs:
         run: cargo +1.99.0 install --locked cargo-nextest --version 0.9.146
       - run: cargo +1.99.0 clippy --locked -p rusty-haystack-app --features postgres --all-targets -- -D warnings
       - run: cargo +1.99.0 test --locked -p rusty-haystack-app --features postgres
+      - run: cargo +1.99.0 clippy --locked -p rusty-haystack-cli --features postgres --all-targets -- -D warnings
+      - run: cargo +1.99.0 test --locked -p rusty-haystack-cli --features postgres
       - name: Check fixture startup phase and readiness deadline
         run: python3 -m unittest discover -s scripts/postgres -p 'test_*.py' -v
       - name: Qualify verified TLS, ownership, commits, restart and snapshot cleanup
         run: python3 scripts/postgres/qualify.py --docker
+      - name: Qualify installed standalone authorization, persistence and signal cleanup
+        run: python3 scripts/postgres/standalone.py --docker
 
   # The PyO3 crate is excluded from `cargo test --locked --workspace`, so nothing above
   # covers it. Without this job the Python suite rots unnoticed — 11 of its tests
