@@ -43,7 +43,7 @@ issues = ns.validate_entity(entity)
 
 ## Features
 
-- **Kind types** — Marker, NA, Remove, Number (with units), Ref, Uri, Symbol, XStr, Coord, HDateTime, HDict, HGrid, HList
+- **Kind types** — Marker, NA, Remove, Number (with units), Ref, Uri, Symbol, XStr, Coord, HDateTime, HDict, HGrid, HList, plus exact Int, Float, NoneValue, Buf and Nominal wrappers
 - **Codecs** — Zinc, Trio, JSON, JSON v3, CSV encoding and decoding
 - **Filters** — Parse and evaluate Haystack filter expressions against entities
 - **EntityGraph** — In-memory graph with CRUD, filter queries, and ref traversal
@@ -62,7 +62,26 @@ grid = rh.decode_grid("text/zinc", zinc_str)
 # Scalar encode/decode
 s = rh.encode_scalar("text/zinc", rh.Number(72.5, "°F"))
 v = rh.decode_scalar("text/zinc", s)
+
+# Project-owned typed payload v1 preserves rich variants and exact float bits.
+typed = rh.HDict({"count": rh.Int(2**53 + 1), "sample": rh.Float.from_bits(1)})
+payload = rh.encode_typed_value(typed)
+assert rh.decode_typed_value(payload) == typed
 ```
+
+Plain Python integers still become Number, but must fit signed 64-bit and be
+exactly representable as binary64; use Int when retaining integer identity or
+precision matters. Number and Coord are immutable and use representation
+equality, including distinct signed zero. H4 codecs reject rich values recursively.
+
+HDateTime retains exact nanoseconds with a fixed offset and opaque timezone label.
+Its `dt()` method rejects precision loss, leap seconds and out-of-range local
+calendars. Calendar components and offsets accept concrete integers, including
+bool, without invoking arbitrary numeric hooks. Native date/time conversion reads
+stored fields without invoking subclass properties; time values require no
+timezone and `fold=0`. Runtime checks remain
+necessary for numeric ranges and temporal restrictions even with static typing.
+The package ships root and submodule stubs for Python 3.11+.
 
 ## EntityGraph
 

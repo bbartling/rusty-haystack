@@ -37,6 +37,7 @@ impl PyHDict {
             for (key, value) in py_dict.iter() {
                 let name: String = key.extract()?;
                 let kind = py_to_kind(&value)?;
+                crate::convert::ensure_python_child(&kind)?;
                 inner.set(name, kind);
             }
         }
@@ -87,6 +88,7 @@ impl PyHDict {
     fn set(&mut self, py: Python<'_>, name: String, val: &Bound<'_, PyAny>) -> PyResult<()> {
         let _ = py;
         let kind = py_to_kind(val)?;
+        crate::convert::ensure_python_child(&kind)?;
         self.inner.set(name, kind);
         Ok(())
     }
@@ -103,6 +105,7 @@ impl PyHDict {
         for (key, value) in d.iter() {
             let name: String = key.extract()?;
             let kind = py_to_kind(&value)?;
+            crate::convert::ensure_python_child(&kind)?;
             inner.set(name, kind);
         }
         Ok(Self { inner })
@@ -173,6 +176,7 @@ impl PyHDict {
 
     fn __setitem__(&mut self, key: String, val: &Bound<'_, PyAny>) -> PyResult<()> {
         let kind = py_to_kind(val)?;
+        crate::convert::ensure_python_child(&kind)?;
         self.inner.set(key, kind);
         Ok(())
     }
@@ -220,8 +224,7 @@ impl PyHDict {
 
 impl PyHDict {
     pub fn from_core(d: &data::HDict) -> PyResult<Self> {
-        haystack_core::kinds::projection::ensure_h4_dict(d)
-            .map_err(crate::convert::unsupported_value)?;
+        crate::convert::ensure_python_dict(d)?;
         Ok(Self { inner: d.clone() })
     }
 
@@ -298,8 +301,7 @@ impl PyHCol {
 
 impl PyHCol {
     pub fn from_core(c: &data::HCol) -> PyResult<Self> {
-        haystack_core::kinds::projection::ensure_h4_dict(&c.meta)
-            .map_err(crate::convert::unsupported_value)?;
+        crate::convert::ensure_python_dict(&c.meta)?;
         Ok(Self {
             name: c.name.clone(),
             meta: c.meta.clone(),
@@ -335,35 +337,54 @@ impl PyHGrid {
 
     /// Construct a grid from meta, columns, and rows.
     #[staticmethod]
-    fn from_parts(meta: &PyHDict, cols: Vec<PyHCol>, rows: Vec<PyRef<'_, PyHDict>>) -> Self {
+    fn from_parts(
+        meta: &PyHDict,
+        cols: Vec<PyHCol>,
+        rows: Vec<PyRef<'_, PyHDict>>,
+    ) -> PyResult<Self> {
+        crate::convert::ensure_python_grid_dict(&meta.inner)?;
+        for col in &cols {
+            crate::convert::ensure_python_grid_dict(&col.meta)?;
+        }
+        for row in &rows {
+            crate::convert::ensure_python_grid_dict(&row.inner)?;
+        }
         let core_cols: Vec<data::HCol> = cols
             .into_iter()
             .map(|c| data::HCol::with_meta(c.name.clone(), c.meta.clone()))
             .collect();
         let core_rows: Vec<data::HDict> = rows.iter().map(|r| r.inner.clone()).collect();
-        Self {
+        Ok(Self {
             inner: data::HGrid::from_parts(meta.inner.clone(), core_cols, core_rows),
-        }
+        })
     }
 
     /// Add a row (HDict) to the grid.
-    fn add_row(&mut self, row: &PyHDict) {
+    fn add_row(&mut self, row: &PyHDict) -> PyResult<()> {
+        crate::convert::ensure_python_grid_dict(&row.inner)?;
         self.inner.rows.push(row.inner.clone());
+        Ok(())
     }
 
     /// Set the grid metadata.
-    fn set_meta(&mut self, meta: &PyHDict) {
+    fn set_meta(&mut self, meta: &PyHDict) -> PyResult<()> {
+        crate::convert::ensure_python_grid_dict(&meta.inner)?;
         self.inner.meta = meta.inner.clone();
+        Ok(())
     }
 
     /// Add a column to the grid.
     #[pyo3(signature = (name, meta = None))]
-    fn add_col(&mut self, name: String, meta: Option<&PyHDict>) {
+    fn add_col(&mut self, name: String, meta: Option<&PyHDict>) -> PyResult<()> {
+        if let Some(meta) = meta {
+            crate::convert::ensure_python_grid_dict(&meta.inner)?;
+        }
         let col = match meta {
             Some(m) => data::HCol::with_meta(name, m.inner.clone()),
             None => data::HCol::new(name),
         };
         self.inner.cols.push(col);
+        Ok(())
     }
 
     /// Return all rows as a list of HDict.
@@ -468,8 +489,7 @@ impl PyHGrid {
 
 impl PyHGrid {
     pub fn from_core(g: &data::HGrid) -> PyResult<Self> {
-        haystack_core::kinds::projection::ensure_h4_grid(g)
-            .map_err(crate::convert::unsupported_value)?;
+        crate::convert::ensure_python_grid(g)?;
         Ok(Self { inner: g.clone() })
     }
 
@@ -528,6 +548,7 @@ impl PyHList {
         if let Some(items) = items {
             for item in items {
                 let kind = py_to_kind(&item)?;
+                crate::convert::ensure_python_child(&kind)?;
                 inner.push(kind);
             }
         }
@@ -537,6 +558,7 @@ impl PyHList {
     /// Append a single value to the list.
     fn push(&mut self, val: &Bound<'_, pyo3::PyAny>) -> PyResult<()> {
         let kind = py_to_kind(val)?;
+        crate::convert::ensure_python_child(&kind)?;
         self.inner.push(kind);
         Ok(())
     }
@@ -561,6 +583,7 @@ impl PyHList {
             ));
         }
         let kind = py_to_kind(val)?;
+        crate::convert::ensure_python_child(&kind)?;
         self.inner.0[idx as usize] = kind;
         Ok(())
     }
@@ -636,8 +659,7 @@ impl PyHList {
 impl PyHList {
     pub fn from_core(l: &data::HList) -> PyResult<Self> {
         for value in &l.0 {
-            haystack_core::kinds::projection::ensure_h4(value)
-                .map_err(crate::convert::unsupported_value)?;
+            crate::convert::ensure_python_child(value)?;
         }
         Ok(Self { inner: l.clone() })
     }

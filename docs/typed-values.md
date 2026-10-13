@@ -148,24 +148,97 @@ default encoding accepts that document. String sizes and allocation are also
 bounded by the admitted byte count. These are payload bounds, not general limits
 on in-memory graph size.
 
-## Python compatibility and validation
+## Python values, conversion and typing
 
-Plain Python inputs keep the H4 mapping: integers/floats become Number and Python
-`None` becomes Null. No Python typed-value API is introduced. Rich Rust values
-raise `TypeError` at scalar, list, dictionary, grid, column, graph-read and graph
-diff conversion boundaries. A Python graph removal first validates the returned
-entity, under the same write lock for SharedGraph, so a rejected conversion does
-not remove the entity or advance its revision. Number and Coord Python equality
-and hashing delegate to the same core representation identity.
+Python exposes the shared value model through the root package and matching
+`kinds`, `data` and `codecs` submodules. `Int(value)` retains a signed i64,
+`Float(value)` retains binary64 identity, and `Float.from_bits(bits)` accepts any
+unsigned 64-bit pattern, including signed zero, infinities and NaN payloads.
+`NoneValue()` is typed absence; Python `None` remains Haystack Null. `Buf(bytes)`
+owns immutable bytes. `Nominal(type_name, catalog_id, schema_id, value)` retains
+the qualified spec, catalog identity, catalog revision (`schema_id`) and exact
+text. Nominal construction validates identity syntax, not the existence of a
+catalog or conformance to its spec. These wrappers are immutable, hashable and
+support equality/inequality; use their numeric properties for ordered comparison.
 
-`haystack-core/tests/typed_values.rs` contains independent payload vectors,
-integer/binary64 edges, graph reads, nested rejection and scan-versus-index checks.
-The fixture `tests/fixtures/typed-v1-entity.json` was authored independently of the
-encoder. Binding-internal Rust tests exercise rich values using an explicitly
-linked trusted CPython library; normal extension rebuild/pytest validation is a
-separate check. Existing H4 codec and Python suites remain the compatibility
-corpus. Neither these local checks nor this payload establishes H5, database,
-Arrow, external-client or release-artifact qualification.
+Plain Python integers and floats retain the H4 Number mapping; bool is admitted
+first as Bool. A native integer must fit signed i64 **and** be exactly representable
+as binary64. Overflow raises `OverflowError`; rounding would raise `ValueError`.
+For example `2**53 + 1` requires `Int`, while `2**53 + 2` is admitted as Number.
+The same concrete numeric admission applies to Number, Coord and Float
+constructors. Bool is not a numeric constructor argument, and arbitrary
+`__float__`/`__index__` objects are rejected without executing their hooks.
+`int(Number(...))` truncates finite values toward zero only within
+`[-2**63, 2**63)`; the upper bound is exclusive.
+
+Number and Coord equality/hashing use core bit identity, with Number's unit also
+part of identity: positive and negative zero differ, and equal NaN bit patterns
+have equal hashes. Number ordering uses numeric comparison only when units match;
+NaN is unordered and differing units return false. Coord has equality/inequality
+only. Read-only properties in shipped stubs match these immutable runtime fields.
+Ref display remains cosmetic, and DateTime identity retains its existing instant
+plus timezone-label semantics.
+
+`HDict` and `HList` accept supported values; nested containers are explicit
+`HDict`, `HList` and `HGrid` objects, rather than implicit arbitrary Python
+containers. Value traversal is bounded to 64 levels. Accepted-type conversion
+errors propagate unchanged, including `UnicodeEncodeError` for lone surrogates
+and mutable wrapper borrow errors. Failed construction returns no partial value;
+failed assignments leave the destination unchanged. Graph outputs preflight
+nested representability before cloning. Graph removal preflights the returned
+entity before mutation, under the same write lock for SharedGraph, so a rejected
+conversion does not remove the entity or advance its revision.
+
+Native `datetime.date` output requires years 1 through 9999. Native
+`datetime.time` input requires `tzinfo is None` and `fold == 0`; output rejects
+leap seconds and sub-microsecond precision with `ValueError`. Date/time inputs
+read their native stored fields, including timezone and fold, without invoking
+subclass property overrides. Raw Python
+`datetime.datetime` input is rejected: use HDateTime. HDateTime retains the exact
+core nanoseconds and a fixed offset plus opaque Haystack timezone label. It does
+not resolve IANA rules or normalize local-time gaps/folds. Its calendar components
+and offset require concrete Python integers (including bool and int subclasses),
+without arbitrary `__index__` calls. Its `dt()` projection to native datetime
+raises `ValueError` for out-of-range local calendars, leap seconds and any loss
+of nanosecond precision. Keeping a value in HDateTime or a typed payload preserves
+precision even when native datetime projection is impossible.
+
+`encode_typed_value(value) -> str` and `decode_typed_value(payload)` use the
+project-owned typed payload v1 and its byte/node/depth bounds. They preserve rich
+variant and bit identity, including nested grid metadata, columns and rows.
+Malformed/over-budget payloads raise CodecError; valid Date/Time values outside
+Python's representable domain raise ValueError before a container is returned.
+H4 codecs remain strict: rich values at any depth raise CodecError instead of
+being silently projected. The Python API does not expose an implicit lossy
+projection.
+
+The explicit Python package carries one canonical `__init__.pyi`, actual
+submodule stubs and `py.typed`. Root convenience exports and submodule-only APIs
+match runtime locations. Private value aliases are signature helpers, not runtime
+imports. Runtime value range/precision checks remain necessary even for a
+statically accepted `int`. The Python floor is 3.11; selected local execution uses
+CPython 3.12. From a fresh wheel, outside the checkout, run:
+
+```sh
+python scripts/python-values/validate.py \
+  --wheel /absolute/path/rusty_haystack-<version>-cp312-cp312-<platform>.whl \
+  --python /absolute/path/python3.12 \
+  --pyright /absolute/path/pyright \
+  --work /absolute/path/fresh-consumer-directory
+```
+
+This verifies the installed module origin, exact stub inventory/digests, the
+independent `haystack-core/tests/fixtures/typed-v1-entity.json` fixture, runtime
+imports and positive/negative static samples with **Pyright 1.1.413**. The positive
+installed sample requires zero type errors and retains ten exact
+`reportMissingModuleSource` warnings for runtime-verified native submodule
+imports: these modules are registered by the extension and have no Python source
+files. Other diagnostics fail validation. The negative sample must reject every
+marked misuse. Source-stub analysis is separate and can be warning-free. The
+consumer performs no network installation. Binding-internal Rust tests additionally exercise
+unrepresentable core values with an explicitly linked trusted CPython library;
+rebuilt-extension pytest remains separate evidence. These selected checks do not
+establish every platform, free-threaded Python, H5 or release qualification.
 
 The separate [contextual Jeto codec](jeto.md) encodes these native values under
 a closed admitted context with explicit exact, lossy and unsupported outcomes.

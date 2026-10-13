@@ -19,7 +19,8 @@ SOURCE = "a" * 40
 TARGET = "x86_64-unknown-linux-gnu"
 VERSION = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"]["package"]["version"]
 LOCK = (REPO / "Cargo.lock").read_bytes()
-STUB = (REPO / "rusty-haystack/rusty_haystack.pyi").read_bytes()
+TYPING = {p.name: p.read_bytes() for p in (REPO / "rusty-haystack/rusty_haystack").iterdir() if p.suffix == ".pyi" or p.name == "py.typed"}
+TYPING_HASHES = {name: hashlib.sha256(data).hexdigest() for name, data in TYPING.items()}
 
 
 def sha(data):
@@ -63,13 +64,14 @@ class ArtifactCLI(unittest.TestCase):
                     archive.writestr(f"rusty_haystack-{VERSION}.dist-info/METADATA", f"Name: rusty-haystack\nVersion: {VERSION}\nRequires-Python: >=3.11\n")
                     archive.writestr(f"rusty_haystack-{VERSION}.dist-info/WHEEL", "Wheel-Version: 1.0\nGenerator: maturin (1.15.0)\nRoot-Is-Purelib: false\nTag: cp312-cp312-manylinux_2_17_x86_64\n")
                     archive.writestr("rusty_haystack/rusty_haystack.cpython-312-x86_64-linux-gnu.so", elf)
-                    archive.writestr("rusty_haystack/__init__.pyi", STUB)
-                    archive.writestr("rusty_haystack/py.typed", "")
-                details = {"python": "cp312", "abi": "cp312", "platforms": ["manylinux_2_17_x86_64"], "requires_python": ">=3.11", "typing_stub_sha256": sha(STUB)}
+                    archive.writestr("rusty_haystack/__init__.py", "from .rusty_haystack import *\n")
+                    for name, data in TYPING.items():
+                        archive.writestr("rusty_haystack/" + name, data)
+                details = {"python": "cp312", "abi": "cp312", "platforms": ["manylinux_2_17_x86_64"], "requires_python": ">=3.11", "typing_files_sha256": TYPING_HASHES}
             else:
                 path = files / f"rusty_haystack-{VERSION}.tar.gz"
-                tar(path, {f"rusty_haystack-{VERSION}/Cargo.lock": LOCK, f"rusty_haystack-{VERSION}/rusty_haystack.pyi": STUB, f"rusty_haystack-{VERSION}/rusty-haystack/rusty_haystack.pyi": STUB, f"rusty_haystack-{VERSION}/PKG-INFO": f"Name: rusty-haystack\nVersion: {VERSION}\n".encode()})
-                details = {"lock_sha256": sha(LOCK), "typing_stub_sha256": sha(STUB)}
+                tar(path, {f"rusty_haystack-{VERSION}/Cargo.lock": LOCK, f"rusty_haystack-{VERSION}/PKG-INFO": f"Name: rusty-haystack\nVersion: {VERSION}\n".encode(), f"rusty_haystack-{VERSION}/rusty_haystack/__init__.py": b"from .rusty_haystack import *\n", **{f"rusty_haystack-{VERSION}/rusty_haystack/{name}": data for name, data in TYPING.items()}})
+                details = {"lock_sha256": sha(LOCK), "typing_files_sha256": TYPING_HASHES}
             record = receipt(path, kind, details)
             record_path = bundle / "receipts" / (path.name + ".json")
             record_path.write_text(json.dumps(record))
@@ -162,23 +164,24 @@ class ArtifactCLI(unittest.TestCase):
 
     def test_source_archive_rejects_missing_or_stale_relocated_typing(self):
         path = self.paths["sdist"]
-        stub = (REPO / "rusty-haystack/rusty_haystack.pyi").read_bytes()
         root = f"rusty_haystack-{VERSION}"
-        for mode in ("missing-root", "stale"):
-            with self.subTest(mode=mode):
-                data = stub if mode == "missing-root" else b"class StaleAPI: ...\n"
-                files = {root + "/Cargo.lock": LOCK,
-                         root + "/PKG-INFO": f"Name: rusty-haystack\nVersion: {VERSION}\n".encode(),
-                         root + "/rusty-haystack/rusty_haystack.pyi": data}
-                if mode == "stale": files[root + "/rusty_haystack.pyi"] = data
-                tar(path, files)
-                def changed(record):
-                    record["artifact"] = {"filename": path.name, "size": path.stat().st_size, "sha256": sha(path.read_bytes())}
-                    if "typing_stub_sha256" in record["details"]:
-                        record["details"]["typing_stub_sha256"] = sha(data)
-                self.mutate_receipt("sdist", changed)
-                result = self.verify(success=False)
-                self.assertIn("typing", result["error"])
+        for name in ("__init__.pyi", "kinds.pyi", "py.typed"):
+            for mode in ("missing", "stale"):
+                with self.subTest(name=name, mode=mode):
+                    changed_typing = dict(TYPING)
+                    if mode == "missing": changed_typing.pop(name)
+                    else: changed_typing[name] = b"stale typing\n"
+                    files = {root + "/Cargo.lock": LOCK,
+                             root + "/PKG-INFO": f"Name: rusty-haystack\nVersion: {VERSION}\n".encode(),
+                             root + "/rusty_haystack/__init__.py": b"from .rusty_haystack import *\n",
+                             **{root + "/rusty_haystack/" + key: data for key, data in changed_typing.items()}}
+                    tar(path, files)
+                    def changed(record):
+                        record["artifact"] = {"filename": path.name, "size": path.stat().st_size, "sha256": sha(path.read_bytes())}
+                        record["details"]["typing_files_sha256"] = {key: sha(data) for key, data in changed_typing.items()}
+                    self.mutate_receipt("sdist", changed)
+                    result = self.verify(success=False)
+                    self.assertIn("typing", result["error"])
 
     def test_tag_guard_uses_parsed_version(self):
         self.assertEqual(self.invoke("version", "--repo", REPO, "--tag", "v" + VERSION), {"version": VERSION})

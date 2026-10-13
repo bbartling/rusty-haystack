@@ -31,18 +31,13 @@ def manifest_in(root):
     return manifest
 
 
-def prepare_source_typing(root, expected_stub):
-    """Maturin relocates pyproject; preserve its exact stub at that project root."""
-    nested = manifest_in(root).parent / "rusty_haystack.pyi"
-    expected = a.digest(expected_stub)
-    a.require(nested.is_file() and not nested.is_symlink() and a.digest(nested) == expected, "source archive typing does not match the current source stub")
-    destination = root / "rusty_haystack.pyi"
-    if destination.exists():
-        a.require(destination.is_file() and not destination.is_symlink() and a.digest(destination) == expected, "conflicting source archive root typing stub")
-    else:
-        with nested.open("rb") as source, destination.open("xb") as output:
-            shutil.copyfileobj(source, output)
-    a.require(a.digest(destination) == expected, "source archive typing copy changed bytes")
+def prepare_source_typing(root, expected_package):
+    """Verify Maturin relocated the one explicit Python package intact."""
+    package = root / "rusty_haystack"
+    expected = a.typing_hashes(expected_package)
+    a.require(a.typing_hashes(package) == expected, "source archive typing does not match the current source package")
+    a.require((package / "__init__.py").is_file() and not (package / "__init__.py").is_symlink(), "source archive package loader is missing")
+    a.require(a.digest(package / "__init__.py") == a.digest(expected_package / "__init__.py"), "source archive package loader mismatch")
     return expected
 
 
@@ -52,7 +47,7 @@ def repair_sdist(raw, output, work, source_lock, base_env):
     roots = list(extracted.iterdir())
     a.require(len(roots) == 1 and roots[0].is_dir(), "invalid source archive root")
     root = roots[0]
-    prepare_source_typing(root, source_lock.parent / "rusty-haystack/rusty_haystack.pyi")
+    prepare_source_typing(root, source_lock.parent / "rusty-haystack/rusty_haystack")
     locks = list(root.rglob("Cargo.lock"))
     a.require(len(locks) == 1, "source archive lock inventory mismatch")
     lock = locks[0]
