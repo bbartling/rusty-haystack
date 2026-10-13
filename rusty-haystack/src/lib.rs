@@ -1,3 +1,5 @@
+mod async_bridge;
+mod async_client;
 mod auth;
 mod client;
 mod codecs;
@@ -6,6 +8,7 @@ mod data;
 pub mod exceptions;
 mod filter;
 mod graph;
+mod http_owner;
 mod kinds;
 mod ontology;
 mod rich_kinds;
@@ -60,6 +63,8 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<graph::PySharedGraph>()?;
     m.add_class::<filter::PyFilter>()?;
     m.add_class::<ontology::PyDefNamespace>()?;
+
+    m.add_class::<async_client::PyAsyncHaystackClient>()?;
 
     // Top-level codec/filter functions
     m.add_function(wrap_pyfunction!(codecs::encode_grid, m)?)?;
@@ -171,6 +176,7 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ── Submodule: client ──
     add_submodule(m, "client", |sub| {
+        sub.add_class::<async_client::PyAsyncHaystackClient>()?;
         sub.add_class::<client::PyHaystackClient>()?;
         sub.add_class::<client::PyWsClient>()?;
         sub.add_class::<client::PyTlsConfig>()?;

@@ -228,8 +228,13 @@ impl HttpTransport {
     }
 }
 
-impl Transport for HttpTransport {
-    async fn call(&self, op: &str, req: &HGrid) -> Result<HGrid, ClientError> {
+impl HttpTransport {
+    pub(crate) async fn call_bounded(
+        &self,
+        op: &str,
+        req: &HGrid,
+        response_limit: Option<usize>,
+    ) -> Result<HGrid, ClientError> {
         crate::config::validate_http_url(&self.base_url)?;
         if op.is_empty()
             || !op
@@ -490,7 +495,29 @@ impl Transport for HttpTransport {
             }
             .map_err(|_| ClientError::Codec("invalid entity response envelope".into()));
         }
-        let resp_body = response.text().await.map_err(crate::error::http_error)?;
+        let resp_body = if let Some(limit) = response_limit {
+            if response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+            {
+                return Err(ClientError::Codec(
+                    "read response exceeds byte limit".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(crate::error::http_error)? {
+                if chunk.len() > limit.saturating_sub(bytes.len()) {
+                    return Err(ClientError::Codec(
+                        "read response exceeds byte limit".into(),
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            String::from_utf8(bytes)
+                .map_err(|_| ClientError::Codec("invalid HTTP response text".into()))?
+        } else {
+            response.text().await.map_err(crate::error::http_error)?
+        };
         let grid = codec
             .decode_grid(&resp_body)
             .map_err(|_| ClientError::Codec("invalid HTTP response grid".into()))?;
@@ -502,6 +529,12 @@ impl Transport for HttpTransport {
         }
 
         Ok(grid)
+    }
+}
+
+impl Transport for HttpTransport {
+    async fn call(&self, op: &str, req: &HGrid) -> Result<HGrid, ClientError> {
+        self.call_bounded(op, req, None).await
     }
 
     async fn close(&self) -> Result<(), ClientError> {

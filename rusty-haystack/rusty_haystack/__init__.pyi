@@ -9,6 +9,7 @@ from typing import Iterator, TypeAlias, TypeVar, overload
 from . import kinds as kinds, data as data, codecs as codecs, filter as filter
 from . import units as units, graph as graph, ontology as ontology, auth as auth
 from . import client as client, server as server
+from .client import AsyncHaystackClient as AsyncHaystackClient
 from .codecs import encode_grid as encode_grid, decode_grid as decode_grid
 from .codecs import encode_scalar as encode_scalar, decode_scalar as decode_scalar
 from .codecs import encode_typed_value as encode_typed_value, decode_typed_value as decode_typed_value

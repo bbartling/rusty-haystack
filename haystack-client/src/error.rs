@@ -33,7 +33,7 @@ pub enum ClientError {
     #[error("request timed out after {0:?}")]
     Timeout(std::time::Duration),
 
-    /// WebSocket concurrent request limit exceeded (backpressure).
+    /// Concurrent request limit exceeded (backpressure).
     #[error("too many in-flight requests")]
     TooManyRequests,
 }

@@ -44,6 +44,14 @@ pub struct PyTlsConfig {
 
 #[pymethods]
 impl PyTlsConfig {
+    /// Trust an additional PEM CA without requiring a client identity.
+    #[staticmethod]
+    fn with_ca(ca_pem: &[u8]) -> Self {
+        Self {
+            inner: TlsConfig::with_ca(ca_pem.to_vec()),
+        }
+    }
+
     /// Load TLS client certificate, key, and optional CA from file paths.
     #[staticmethod]
     #[pyo3(signature = (cert_path, key_path, ca_path = None))]
