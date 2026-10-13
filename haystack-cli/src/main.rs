@@ -33,6 +33,9 @@ enum Commands {
     },
     /// Start the Haystack HTTP API server
     Serve {
+        /// PostgreSQL TOML configuration (requires a build with --features postgres)
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["file", "demo"], requires = "users")]
+        postgres_config: Option<String>,
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
@@ -281,6 +284,7 @@ fn main() {
             filter,
         } => commands::export::run(&format, output.as_deref(), filter.as_deref()),
         Commands::Serve {
+            postgres_config,
             port,
             file,
             users,
@@ -288,6 +292,7 @@ fn main() {
             demo,
             cors_origins,
         } => commands::serve::run(commands::serve::ServeConfig {
+            postgres_config: postgres_config.as_deref(),
             port,
             file: file.as_deref(),
             users_file: users.as_deref(),

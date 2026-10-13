@@ -9,6 +9,10 @@ committed database cut; bounded periodic refresh supplies idle convergence.
 This profile makes no general serializability, rolling mixed-version, geographic
 replication, backup, power-loss, performance or production deployment claim.
 
+For an installed standalone server with explicit configuration and a disposable
+authenticated HTTP write/history/restart recipe, see
+[standalone PostgreSQL](standalone-postgres.md).
+
 ## Select and own the application
 
 Call `haystack_app::postgres::application(config, catalog, policies, limits).await`

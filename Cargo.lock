@@ -2139,6 +2139,8 @@ version = "0.9.0"
 dependencies = [
  "clap",
  "env_logger",
+ "reqwest",
+ "rusty-haystack-app",
  "rusty-haystack-client",
  "rusty-haystack-core",
  "rusty-haystack-server",
