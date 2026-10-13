@@ -3,6 +3,7 @@ pub mod export;
 pub mod import;
 pub mod info;
 pub mod libs;
+pub mod mcp;
 pub mod serve;
 pub mod specs;
 pub mod user;

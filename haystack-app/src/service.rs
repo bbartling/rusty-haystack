@@ -32,7 +32,10 @@ use parking_lot::{Mutex, MutexGuard};
 use sha2::Sha256;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -389,6 +392,39 @@ enum TypedInvocation {
 pub(crate) struct WorkLease {
     _permit: OwnedSemaphorePermit,
     _guard: Option<WorkGuard>,
+    // Fields are dropped in declaration order: signal only after the permit
+    // and application registration have actually been released.
+    completion: CompletionGuard,
+}
+#[derive(Default)]
+struct Completion {
+    done: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+struct CompletionGuard(Arc<Completion>);
+impl Default for CompletionGuard {
+    fn default() -> Self {
+        Self(Arc::new(Completion::default()))
+    }
+}
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+        self.0.changed.notify_waiters();
+    }
+}
+impl Completion {
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 impl Drop for ReadAdmission {
     fn drop(&mut self) {
@@ -585,6 +621,17 @@ impl ReadAdmission {
     pub async fn read(self, request: ReadRequest) -> Result<ReadPage, ReadError> {
         self.run(Input::Request(request)).await
     }
+    /// As `read`, but retain the caller until the worker's admission and
+    /// application registration have actually been released, including after
+    /// cancellation. Adapters can keep their transport quota through this
+    /// cleanup boundary. A blocked borrowed runtime may delay completion;
+    /// dropping this future still does not claim that its worker has stopped.
+    pub async fn read_joined(mut self, request: ReadRequest) -> Result<ReadPage, ReadError> {
+        let completion = self.retain_work()?.completion.0.clone();
+        let result = self.run(Input::Request(request)).await;
+        completion.wait().await;
+        result
+    }
     pub async fn read_wire(
         self,
         operation: ReadOperation,
@@ -616,6 +663,7 @@ impl ReadAdmission {
             budget.lease = Some(Arc::new(WorkLease {
                 _permit: self.permit.take().expect("live admission"),
                 _guard: self.guard.take(),
+                completion: CompletionGuard::default(),
             }));
         }
         Ok((self.principal.take().expect("live admission"), budget))
@@ -630,6 +678,7 @@ impl ReadAdmission {
             budget.lease = Some(Arc::new(WorkLease {
                 _permit: self.permit.take().expect("live admission"),
                 _guard: self.guard.take(),
+                completion: CompletionGuard::default(),
             }));
         }
         Ok(budget.lease.as_ref().expect("installed lease").clone())

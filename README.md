@@ -80,6 +80,7 @@ The document includes `x-rusty-haystack-json-schema`, a standalone Draft 2020-12
 | [haystack-core](haystack-core/) | Values, codecs, filters, units, graph, ontology, Xeto admission and fitting |
 | [haystack-app](haystack-app/) | Scoped reads, selected mutations/history/subscriptions/commands, catalog activation, lifecycle and resource ownership |
 | [haystack-server](haystack-server/) | Axum HTTP adapters, SCRAM authentication and WebSocket transport |
+| [haystack-mcp](haystack-mcp/) | Optional bounded read-only MCP pipe adapter over the shared application |
 | [haystack-client](haystack-client/) | Async HTTP/WebSocket client, SCRAM and TLS configuration |
 | [haystack-cli](haystack-cli/) | The `haystack` command: data tools, server, client and user management |
 | [rusty-haystack](rusty-haystack/) | `rusty_haystack` Python extension with selected core, graph, codec, client and server APIs |

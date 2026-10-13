@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "haystack-core",
     "haystack-app",
+    "haystack-mcp",
     "rusty-haystack",
     "haystack-cli",
     "haystack-server",
@@ -25,6 +26,7 @@ categories = ["encoding", "network-programming"]
 haystack-core = { package = "rusty-haystack-core", version = "0.9.0", path = "haystack-core" }
 haystack-client = { package = "rusty-haystack-client", version = "0.9.0", path = "haystack-client" }
 haystack-app = { package = "rusty-haystack-app", version = "0.9.0", path = "haystack-app" }
+haystack-mcp = { package = "rusty-haystack-mcp", version = "0.9.0", path = "haystack-mcp" }
 haystack-server = { package = "rusty-haystack-server", version = "0.9.0", path = "haystack-server" }
 axum = "0.8"
 # Direct consumers request only std; transitive consumers may enable SIMD.
@@ -40,6 +42,7 @@ crc32fast = "1.5.2"
 futures-util = "0.3"
 hmac = "0.13"
 indexmap = "2"
+libc = "0.2"
 log = "0.4"
 parking_lot = "0.12"
 pbkdf2 = "0.13"
@@ -47,6 +50,7 @@ pyo3 = "0.29"
 rand = "0.10"
 regex = "1"
 regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "unicode", "dfa-build", "dfa-search"] }
+rmcp = { version = "=3.5.1", default-features = false }
 reqwest = { version = "0.13", default-features = false }
 rcgen = { version = "0.14.10", default-features = false }
 roaring = "0.11"

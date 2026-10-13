@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Qualify an installed MCP CLI with independent JSON Schema and pipe observers."""
+import argparse
+import array
+import fcntl
+import json
+import os
+from pathlib import Path
+import queue
+import signal
+import select
+import subprocess
+import tempfile
+import threading
+import termios
+import time
+
+from jsonschema import Draft202012Validator
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def fixture(directory, *, large=False, timeout=2000):
+    dataset = directory / "entities.trio"
+    dataset.write_text('id: @fixture-a\nsite\ndis: "Fixture Site"\nsecret: "DO_NOT_DISCLOSE"\n'
+                       + ('large: "' + 'x' * 50000 + '"\n' if large else '')
+                       + '\n---\nid: @hidden\nsite\ndis: "Hidden"\n')
+    config = directory / "mcp.toml"
+    config.write_text(f'version = 1\ndataset_file = "entities.trio"\ndataset_format = "trio"\n'
+                      'principal = "fixture-reader"\nentity_ids = ["fixture-a"]\nhidden_tags = ["secret"]\n'
+                      f'request_timeout_ms = {timeout}\n')
+    return config
+
+
+class Session:
+    def __init__(self, binary, config):
+        self.child = subprocess.Popen([str(binary), "mcp", "stdio", "--config", str(config)],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.messages = queue.Queue(maxsize=32)
+        self.reader = None
+
+    def read_output(self):
+        def read():
+            try:
+                while True:
+                    line = self.child.stdout.readline(1024 * 1024 + 1)
+                    if not line:
+                        return
+                    require(len(line) <= 1024 * 1024 and line.endswith(b"\n"), "unbounded protocol output")
+                    self.messages.put(json.loads(line), timeout=3)
+            except BaseException as error:
+                self.messages.put(error, timeout=3)
+        self.reader = threading.Thread(target=read, daemon=True)
+        self.reader.start()
+
+    def send(self, value):
+        self.child.stdin.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
+        self.child.stdin.flush()
+
+    def receive(self):
+        value = self.messages.get(timeout=5)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def initialize(self):
+        self.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "independent-wire", "version": "1"}}})
+        response = self.receive()
+        require(response["result"]["protocolVersion"] == "2025-11-25", "wrong legacy negotiation")
+        require(response["result"]["capabilities"] == {"tools": {}}, "unexpected capabilities")
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def finish(self, expected=0):
+        code = self.child.wait(timeout=6)
+        if self.reader:
+            self.reader.join(timeout=2)
+            require(not self.reader.is_alive(), "stdout observer did not terminate")
+        stderr = self.child.stderr.read(65537)
+        require(len(stderr) < 65537, "unbounded stderr")
+        require(code == expected if expected == 0 else code != 0, "unexpected process exit")
+        if expected == 0:
+            require(b"all admitted work released" in stderr, "missing joined cleanup receipt")
+        require(b"DO_NOT_DISCLOSE" not in stderr, "private fixture content leaked")
+        return stderr
+
+    def close(self):
+        if self.child.poll() is None:
+            self.child.kill()
+            self.child.wait(timeout=5)
+        for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
+            stream.close()
+        if self.reader:
+            self.reader.join(timeout=2)
+            require(not self.reader.is_alive(), "fixture reader leaked")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def result(response, schema):
+    value = response["result"]["structuredContent"]
+    require(json.loads(response["result"]["content"][0]["text"]) == value, "text/structured disagreement")
+    Draft202012Validator(schema).validate(value)
+    require(value["profile"] == "haystack-h4-json-v1", "unexpected output profile")
+    return value
+
+
+def qualify(binary, directory):
+    config = fixture(directory)
+    with Session(binary, config) as session:
+        session.read_output()
+        session.initialize()
+        session.send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = {tool["name"]: tool for tool in session.receive()["result"]["tools"]}
+        require(set(tools) == {"haystack_read", "haystack_query"}, "wrong tool inventory")
+        for tool in tools.values():
+            Draft202012Validator.check_schema(tool["inputSchema"])
+            Draft202012Validator.check_schema(tool["outputSchema"])
+            require(tool["annotations"] == {"readOnlyHint": True, "destructiveHint": False,
+                                          "idempotentHint": True, "openWorldHint": False}, "wrong tool annotations")
+        for name, arguments in [("haystack_read", {"ids": ["fixture-a"]}), ("haystack_query", {"filter": "site"})]:
+            Draft202012Validator(tools[name]["inputSchema"]).validate(arguments)
+            session.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+            page = result(session.receive(), tools[name]["outputSchema"])
+            require(page["ok"] and page["complete"] and page["cursor"] is None and page["row_count"] == 1, "incorrect scoped page")
+            require("Fixture Site" in json.dumps(page) and "DO_NOT_DISCLOSE" not in json.dumps(page)
+                    and "Hidden" not in json.dumps(page), "scope or projection failed")
+        invalid = {"ids": ["fixture-a"], "principal": "admin"}
+        require(not Draft202012Validator(tools["haystack_read"]["inputSchema"]).is_valid(invalid), "schema permits authority injection")
+        session.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "haystack_read", "arguments": invalid}})
+        require(session.receive()["error"]["code"] == -32602, "runtime permits authority injection")
+        session.child.stdin.close()
+        session.finish()
+    print("PASS installed discovery, independent input/output schemas, useful reads, scope, EOF cleanup", flush=True)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        with Session(binary, config) as session:
+            session.read_output()
+            session.initialize()
+            session.child.send_signal(signum)  # stdin deliberately stays open
+            session.finish()
+    print("PASS SIGTERM/SIGINT with stdin open and joined process cleanup", flush=True)
+    with Session(binary, config) as session:
+        session.child.stdout.close()
+        session.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "broken", "version": "1"}}})
+        session.finish(expected=1)
+    config = fixture(directory, large=True, timeout=300)
+    with Session(binary, config) as session:
+        # Drain only initialization; the large tool result fills the actual OS
+        # pipe with no observer. A process exit proves no blocking stdin thread.
+        session.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "slow", "version": "1"}}})
+        require(json.loads(session.child.stdout.readline()) ["id"] == 0, "initialization failed")
+        session.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "haystack_read", "arguments": {"ids": ["fixture-a"]}}})
+        session.child.wait(timeout=5)
+        session.finish(expected=1)
+    print("PASS broken output and OS pipe backpressure have finite failed shutdown", flush=True)
+    config = fixture(directory, large=True, timeout=2000)
+    for stop in ("eof", signal.SIGINT, signal.SIGTERM):
+        with Session(binary, config) as session:
+            session.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "blocked-stop", "version": "1"}}})
+            require(json.loads(session.child.stdout.readline())["id"] == 0, "initialization failed")
+            session.send({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "haystack_read", "arguments": {"ids": ["fixture-a"]}}})
+            require(select.select([session.child.stdout], [], [], 2)[0], "response never reached the pipe")
+            prefix = os.read(session.child.stdout.fileno(), 32)
+            require(len(prefix) > 0 and b"\n" not in prefix, "expected a partial physical response")
+            time.sleep(0.05)
+            queued = array.array("i", [0])
+            fcntl.ioctl(session.child.stdout.fileno(), termios.FIONREAD, queued, True)
+            first = queued[0]
+            time.sleep(0.1)
+            fcntl.ioctl(session.child.stdout.fileno(), termios.FIONREAD, queued, True)
+            require(0 < first == queued[0] < 100000 and session.child.poll() is None,
+                    "large undrained response did not stabilize in the output pipe")
+            if stop == "eof":
+                session.child.stdin.close()
+            else:
+                session.child.send_signal(stop)
+            session.finish()
+    print("PASS EOF/SIGINT/SIGTERM during observed partial blocked output exit zero after joined cleanup", flush=True)
+    for config_fifo in (True, False):
+        fifo = directory / ("config-private.fifo" if config_fifo else "dataset-private.fifo")
+        os.mkfifo(fifo, 0o600)
+        if config_fifo:
+            launch = fifo
+        else:
+            launch = directory / "fifo-dataset.toml"
+            launch.write_text('version = 1\ndataset_file = "dataset-private.fifo"\ndataset_format = "trio"\n'
+                              'principal = "fixture-reader"\nentity_ids = ["fixture-a"]\n')
+        checked = subprocess.run([str(binary), "mcp", "stdio", "--config", str(launch)],
+                                 capture_output=True, timeout=2)
+        require(checked.returncode != 0 and not checked.stdout and b"must be regular files" in checked.stderr
+                and b"private.fifo" not in checked.stderr, "FIFO launch did not fail promptly and safely")
+    print("PASS configuration and dataset FIFOs without writers are rejected promptly", flush=True)
+    bad = directory / "bad.toml"
+    bad.write_text('version = 99\npassword = "DO_NOT_DISCLOSE"\n')
+    checked = subprocess.run([str(binary), "mcp", "stdio", "--config", str(bad)], capture_output=True, timeout=5)
+    require(checked.returncode != 0 and not checked.stdout and b"DO_NOT_DISCLOSE" not in checked.stderr, "configuration diagnostics leak")
+    checked = subprocess.run([str(binary), "mcp", "stdio", "--config", str(config)], stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+    require(checked.returncode != 0 and b"requires Unix pipe stdin" in checked.stderr, "non-pipe profile was accepted")
+    print("PASS bounded configuration errors and non-pipe launch rejection", flush=True)
+
+
+def install(directory):
+    installation = directory / "install"
+    subprocess.run(["cargo", "+1.99.0", "install", "--locked", "--path", "haystack-cli", "--features", "mcp", "--debug",
+                    "--root", str(installation), "--target-dir", str(ROOT / "target")], cwd=ROOT, check=True, timeout=600)
+    return installation / "bin" / "haystack"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, help="Use an explicit existing binary; omit for a real temporary Cargo install")
+    args = parser.parse_args()
+    require(os.name == "posix", "selected qualification requires Unix pipes")
+    with tempfile.TemporaryDirectory(prefix="haystack-mcp-") as scratch:
+        directory = Path(scratch)
+        binary = args.binary.resolve() if args.binary else install(directory)
+        qualify(binary, directory)
+    print("PASS task-owned processes, pipes and fixture data removed" + ("; temporary installation removed" if not args.binary else ""), flush=True)
+
+
+if __name__ == "__main__":
+    main()
