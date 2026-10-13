@@ -477,6 +477,49 @@ fn queued_blocking_read_timeout_does_not_join_unrelated_runtime_work() {
     drop(runtime);
 }
 
+#[test]
+fn joined_read_waits_for_cancelled_worker_capture_release() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = runtime.spawn_blocking(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    runtime.block_on(async {
+        let owner = builder().start(runtime.handle()).unwrap();
+        owner.ready().await.unwrap();
+        let handle = owner.handle();
+        let reads = handle.read_service();
+        let cancel = CancellationToken::new();
+        let mut context = context();
+        context.cancellation = cancel.clone();
+        let admission = reads.begin(context).await.unwrap();
+        let mut joined = tokio::spawn(admission.read_joined(request()));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let waiting = tokio::time::timeout(Duration::from_millis(30), &mut joined)
+            .await
+            .is_err();
+        let before = (reads.load().admitted, handle.outstanding_tasks());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(waiting);
+        assert_eq!(before.0, 1);
+        assert!(before.1 > 0);
+        assert_eq!(joined.await.unwrap().unwrap_err(), ReadError::Cancelled);
+        assert_eq!(reads.load().admitted, 0);
+        assert_eq!(handle.outstanding_tasks(), 0);
+        owner.close().await.unwrap();
+        owner.terminated().await;
+    });
+}
+
 struct Paused {
     entered: std::sync::mpsc::Sender<()>,
     release: Arc<Barrier>,

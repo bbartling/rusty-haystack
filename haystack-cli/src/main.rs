@@ -11,6 +11,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Serve read-only MCP tools (requires a build with --features mcp)
+    Mcp {
+        #[command(subcommand)]
+        action: commands::mcp::Action,
+    },
     /// Back up, restore and select a PostgreSQL authority in one database
     Storage {
         #[command(subcommand)]
@@ -282,6 +287,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Mcp { action } => commands::mcp::run(action),
         Commands::Import { file, format } => commands::import::run(&file, format.as_deref()),
         Commands::Export {
             format,
