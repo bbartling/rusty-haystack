@@ -7,7 +7,7 @@ from typing import assert_type
 import rusty_haystack as rh
 from rusty_haystack import Buf, CodecError, Coord, Float, HDateTime, HDict, HGrid, HList, Int, Nominal, NoneValue, Number
 from rusty_haystack.auth import generate_nonce
-from rusty_haystack.client import HaystackClient, TlsConfig
+from rusty_haystack.client import AsyncHaystackClient, HaystackClient, TlsConfig
 from rusty_haystack.codecs import decode_typed_value, encode_typed_value
 from rusty_haystack.data import HCol
 from rusty_haystack.filter import CmpOp, Filter, Path as FilterPath
@@ -59,3 +59,26 @@ except CodecError:
     pass
 else:
     raise AssertionError("rich values were silently projected by an H4 codec")
+
+# The installed async surface is Future-valued, including context management.
+# The network consumer below is a separate executable fixture in this gate.
+import asyncio
+
+assert AsyncHaystackClient is rh.AsyncHaystackClient
+async def async_surface(client: AsyncHaystackClient) -> None:
+    connected = client.connect(deadline=asyncio.get_running_loop().time() + 2)
+    assert_type(connected, asyncio.Future[None])
+    await connected
+    read = client.read("site", limit=1)
+    assert_type(read, asyncio.Future[HGrid])
+    assert_type(await asyncio.ensure_future(read), HGrid)
+    assert_type(client.close(), asyncio.Future[None])
+    async with rh.AsyncHaystackClient("http://localhost:1", "user", "password") as owned:
+        assert_type(owned, AsyncHaystackClient)
+
+async def close_unconnected_owner() -> None:
+    client = rh.AsyncHaystackClient("http://localhost:1", "user", "password")
+    await client.close()
+    assert client.closed
+
+asyncio.run(close_unconnected_owner())

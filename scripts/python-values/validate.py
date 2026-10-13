@@ -59,11 +59,13 @@ def main():
     manifest.write_text(json.dumps(artifacts.typing_sources(REPO), sort_keys=True))
     version = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     installed = json.loads(run([str(python), "-I", str(REPO / "scripts/release/consumer.py"), "--prefix", str(venv), "--version", version, "--typing-manifest", str(manifest)], work, "installed-layout", cwd=scratch))
-    for name in ("positive.py", "negative.py"):
+    for name in ("positive.py", "negative.py", "async-runtime.py"):
         shutil.copyfile(Path(__file__).with_name(name), scratch / name)
+    shutil.copyfile(REPO / "rusty-haystack/tests/async_peer.py", scratch / "async_peer.py")
     shutil.copyfile(REPO / "haystack-core/tests/fixtures/typed-v1-entity.json", scratch / "typed-v1-entity.json")
     (scratch / "pyrightconfig.json").write_text(json.dumps({"typeCheckingMode": "strict", "pythonVersion": "3.11", "extraPaths": []}))
     run([str(python), "-I", str(scratch / "positive.py")], work, "positive-runtime", cwd=scratch)
+    async_runtime = json.loads(run([str(python), "-I", str(scratch / "async-runtime.py")], work, "async-runtime", cwd=scratch))
     command = [checker, "--pythonpath", str(python), "--outputjson"]
     positive = json.loads(run(command + ["positive.py"], work, "positive-static", cwd=scratch))
     # PyO3 registers these modules in sys.modules; no Python source file exists
@@ -82,7 +84,7 @@ def main():
     actual_lines = {item["range"]["start"]["line"] for item in diagnostics if item["severity"] == "error" and Path(item["file"]).resolve() == scratch / "negative.py"}
     if actual_lines != expected_lines or any(item["severity"] != "error" or Path(item["file"]).resolve() != scratch / "negative.py" for item in diagnostics):
         raise AssertionError("negative static diagnostics did not match the marked consumer lines")
-    result = {"wheel": str(wheel), "wheel_sha256": artifacts.digest(wheel), "checker": CHECKER, "static_python_floor": "3.11", "positive_errors": 0, "native_submodule_source_warnings": source_warnings, "negative_lines_rejected": len(expected_lines), "installed": installed}
+    result = {"wheel": str(wheel), "wheel_sha256": artifacts.digest(wheel), "checker": CHECKER, "static_python_floor": "3.11", "positive_errors": 0, "native_submodule_source_warnings": source_warnings, "negative_lines_rejected": len(expected_lines), "installed": installed, "async_runtime": async_runtime}
     (work / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, sort_keys=True))
 

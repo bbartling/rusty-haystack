@@ -19,6 +19,33 @@ pub struct HaystackClient<T: Transport> {
 }
 
 impl HaystackClient<HttpTransport> {
+    /// Read with a byte budget checked before decoding and a strict row bound.
+    /// Unlike the server's advisory limit, an over-limit response is rejected.
+    pub async fn read_bounded(
+        &self,
+        filter: &str,
+        limit: usize,
+        max_response_bytes: usize,
+    ) -> Result<HGrid, ClientError> {
+        if limit == 0 || max_response_bytes == 0 {
+            return Err(ClientError::Connection(
+                "read bounds must be positive".into(),
+            ));
+        }
+        let grid = self
+            .transport
+            .call_bounded(
+                "read",
+                &read_request(filter, Some(limit)),
+                Some(max_response_bytes),
+            )
+            .await?;
+        if grid.rows.len() > limit {
+            return Err(ClientError::Codec("read response exceeds row limit".into()));
+        }
+        Ok(grid)
+    }
+
     /// Attach scoped subscriptions using this HTTP client's existing private
     /// bearer and exact server authority. No new authentication session is made.
     /// WebSocket TLS uses system/public roots and does not inherit custom
@@ -221,18 +248,7 @@ impl<T: Transport> HaystackClient<T> {
     /// `"temp > 72"`). Returns a grid of matching entity dicts. Pass `limit` to
     /// cap the number of results. Returns an empty grid if nothing matches.
     pub async fn read(&self, filter: &str, limit: Option<usize>) -> Result<HGrid, ClientError> {
-        let mut row = HDict::new();
-        row.set("filter", Kind::Str(filter.to_string()));
-        if let Some(lim) = limit {
-            row.set("limit", Kind::Number(Number::unitless(lim as f64)));
-        }
-        let cols = if limit.is_some() {
-            vec![HCol::new("filter"), HCol::new("limit")]
-        } else {
-            vec![HCol::new("filter")]
-        };
-        let grid = HGrid::from_parts(HDict::new(), cols, vec![row]);
-        self.call("read", &grid).await
+        self.call("read", &read_request(filter, limit)).await
     }
 
     /// Call the `read` op with a list of entity ref ids.
@@ -515,6 +531,19 @@ impl<T: crate::entity::EntityTransport> HaystackClient<T> {
     pub(crate) fn transport_entity_check(&self) -> Result<(), ClientError> {
         self.transport.check_entity_submission()
     }
+}
+
+fn read_request(filter: &str, limit: Option<usize>) -> HGrid {
+    let mut row = HDict::new();
+    row.set("filter", Kind::Str(filter.to_string()));
+    if let Some(limit) = limit {
+        row.set("limit", Kind::Number(Number::unitless(limit as f64)));
+    }
+    let mut cols = vec![HCol::new("filter")];
+    if limit.is_some() {
+        cols.push(HCol::new("limit"));
+    }
+    HGrid::from_parts(HDict::new(), cols, vec![row])
 }
 
 #[cfg(test)]

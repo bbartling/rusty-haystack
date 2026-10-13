@@ -19,3 +19,13 @@ rh.HDict({"bad": object()})  # reject
 rh.HList([object()])  # reject
 rh.encode_typed_value(object())  # reject
 rh.HaystackClient  # reject: lives only in the client submodule
+
+import asyncio
+async_client = rh.AsyncHaystackClient("http://localhost:1", "user", "password")
+async_client.read("site", limit=None)  # reject
+async_client.read("site", deadline="later")  # reject
+async_client.close(1.0)  # reject
+async_client.closed = True  # reject
+async_client.state = "open"  # reject
+asyncio.create_task(async_client.read("site"))  # reject: Future is not a coroutine
+rh.AsyncHaystackClient("http://localhost:1", "user", "password", timeout="slow")  # reject
