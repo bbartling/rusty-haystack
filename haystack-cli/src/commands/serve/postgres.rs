@@ -3,7 +3,7 @@ use haystack_app::{
     ApplicationOwner, CatalogKind, FunctionIdentity, HistoryMutationPolicy,
     HistoryOperationIdentity, HistorySchema, HistoryWriteRequest, MutationPolicy, PolicySnapshot,
     Principal, ReadError, ReadOperation, ReadPolicy,
-    postgres::{self, PostgresConfig, PostgresLimits, PostgresPolicies, PostgresTransport},
+    postgres::{self, PostgresPolicies},
 };
 use haystack_core::{
     codecs::entity::{EntityBatchRequest, OperationIdentity},
@@ -12,83 +12,7 @@ use haystack_core::{
     xeto::catalog::Catalog,
 };
 use haystack_server::{HaystackServer, auth::AuthManager, cors::CorsPolicy};
-use serde::Deserialize;
-use std::{io::Read, path::Path, sync::Arc};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Configuration {
-    host: String,
-    port: u16,
-    database: String,
-    username: String,
-    schema: String,
-    password_env: String,
-    transport: Transport,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
-enum Transport {
-    VerifyFull { additional_ca_file: Option<String> },
-    LoopbackPlaintext,
-}
-
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
-        .map_err(|_| "unreadable PostgreSQL configuration or CA file")?;
-    if bytes.len() as u64 > limit {
-        return Err("PostgreSQL configuration or CA file exceeds size limit".into());
-    }
-    Ok(bytes)
-}
-
-fn load(path: &Path) -> Result<PostgresConfig, String> {
-    let bytes = read_bounded(path, 65_536)?;
-    let source =
-        std::str::from_utf8(&bytes).map_err(|_| "invalid PostgreSQL TOML configuration")?;
-    // Do not return TOML errors: they can quote credentials or complete source lines.
-    let config: Configuration =
-        toml::from_str(source).map_err(|_| "invalid PostgreSQL TOML configuration")?;
-    if config.password_env.is_empty()
-        || !config
-            .password_env
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err("invalid PostgreSQL password environment variable name".into());
-    }
-    let password = std::env::var(&config.password_env)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or("PostgreSQL password environment variable is missing, empty or non-Unicode")?;
-    let transport = match config.transport {
-        Transport::LoopbackPlaintext => PostgresTransport::LoopbackPlaintext,
-        Transport::VerifyFull { additional_ca_file } => PostgresTransport::VerifyFull {
-            additional_ca_pem: additional_ca_file
-                .map(|file| {
-                    // Relative CA paths belong to this configuration's directory.
-                    read_bounded(
-                        &path.parent().unwrap_or(Path::new(".")).join(file),
-                        1024 * 1024,
-                    )
-                })
-                .transpose()?,
-        },
-    };
-    Ok(PostgresConfig {
-        host: config.host,
-        port: config.port,
-        database: config.database,
-        username: config.username,
-        password: Some(password),
-        schema: config.schema,
-        transport,
-        limits: PostgresLimits::default(),
-    })
-}
+use std::{path::Path, sync::Arc};
 
 pub(super) async fn start(
     path: &str,
@@ -97,19 +21,19 @@ pub(super) async fn start(
     auth: AuthManager,
     cors: CorsPolicy,
 ) -> Result<ApplicationOwner, String> {
-    let config = load(Path::new(path))?;
+    let loaded = crate::commands::postgres_config::load(Path::new(path))?;
+    let config = loaded.config;
     let catalog = Catalog::load_http_pinned().map_err(|_| "cannot load pinned HTTP catalog")?;
-    let builder = postgres::application(
-        config,
-        catalog,
-        PostgresPolicies {
-            reads: Arc::new(Permissions),
-            entities: Arc::new(Permissions),
-            history: Arc::new(Permissions),
-        },
-        Default::default(),
-    )
-    .await
+    let policies = PostgresPolicies {
+        reads: Arc::new(Permissions),
+        entities: Arc::new(Permissions),
+        history: Arc::new(Permissions),
+    };
+    let builder = if loaded.selected {
+        postgres::selected_application(config, catalog, policies, Default::default()).await
+    } else {
+        postgres::application(config, catalog, policies, Default::default()).await
+    }
     .map_err(|error| error.to_string())?;
     // The server replaces this unused graph with the application's read-only view.
     // Do not install a namespace: the durable authority owns its pinned catalog.

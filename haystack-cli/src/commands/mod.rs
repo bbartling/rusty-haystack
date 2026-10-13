@@ -7,3 +7,7 @@ pub mod serve;
 pub mod specs;
 pub mod user;
 pub mod validate;
+
+#[cfg(feature = "postgres")]
+pub(crate) mod postgres_config;
+pub mod storage;

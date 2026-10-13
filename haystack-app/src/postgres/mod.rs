@@ -1,4 +1,5 @@
 //! Optional bounded PostgreSQL authority for the shared application services.
+pub mod admin;
 mod config;
 pub(crate) mod history_value;
 mod recovery;
@@ -122,7 +123,33 @@ pub async fn application(
     // escaped yet; a failed delivery awaits database closure in this worker.
     let (send, receive) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        match construct(config, catalog, policies, limits).await {
+        match construct(config, catalog, policies, limits, None).await {
+            Ok((builder, backend)) => {
+                if let Err(undelivered) = send.send(Ok(builder)) {
+                    let _ = backend.close().await;
+                    drop(undelivered);
+                }
+            }
+            Err(error) => {
+                let _ = send.send(Err(error));
+            }
+        }
+    });
+    receive.await.map_err(|_| PostgresError::Unavailable)?
+}
+/// Resolve and pin the committed authority named by a control-schema config.
+/// There is no fallback to a literal schema or a stale previous selection.
+pub async fn selected_application(
+    mut config: PostgresConfig,
+    catalog: Catalog,
+    policies: PostgresPolicies,
+    limits: PostgresServiceLimits,
+) -> Result<ApplicationBuilder, PostgresError> {
+    let expected = admin::selected(config.clone()).await?;
+    config.schema = expected.schema.clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        match construct(config, catalog, policies, limits, Some(expected)).await {
             Ok((builder, backend)) => {
                 if let Err(undelivered) = send.send(Ok(builder)) {
                     let _ = backend.close().await;
@@ -141,6 +168,7 @@ async fn construct(
     catalog: Catalog,
     policies: PostgresPolicies,
     limits: PostgresServiceLimits,
+    expected: Option<admin::Authority>,
 ) -> Result<(ApplicationBuilder, Arc<storage::Backend>), PostgresError> {
     let catalog =
         Arc::new(ActivatedCatalog::new(catalog, None).map_err(|_| PostgresError::Incompatible)?);
@@ -157,6 +185,16 @@ async fn construct(
             return Err(error);
         }
     };
+    if expected.as_ref().is_some_and(|pin| {
+        pin.schema != opened.config.schema
+            || pin.dataset != recovered.dataset
+            || pin.incarnation != recovered.graph.state().incarnation
+            || pin.epoch != recovered.generation
+    }) {
+        use sqlx::Connection;
+        let _ = opened.connection.close().await;
+        return Err(PostgresError::Conflict);
+    }
     let backend = opened.finish(recovered.generation).await?;
     let result = async {
         let candidate = backend

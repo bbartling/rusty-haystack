@@ -300,3 +300,75 @@ async fn installed_standalone_authorized_workflow() {
     client.close().await.unwrap();
     viewer.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires runner-owned installed selector server and restored PostgreSQL authority"]
+async fn installed_standalone_restore_selected_authority() {
+    let url = required("HAYSTACK_STANDALONE_URL");
+    let password = required("HAYSTACK_STANDALONE_PASSWORD");
+    let state = PathBuf::from(required("HAYSTACK_STANDALONE_STATE"));
+    let client = HaystackClient::connect(&url, "operator", &password)
+        .await
+        .unwrap();
+    let original: EntityBatchRequest = entity::from_grid(
+        &ZincCodec
+            .decode_grid(&std::fs::read_to_string(state.join("entity.zinc")).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let old_history = history_mutation::request_from_grid(
+        &ZincCodec
+            .decode_grid(&std::fs::read_to_string(state.join("history.zinc")).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let feed = client
+        .entity_changes(&ChangesRequest {
+            cursor: None,
+            max_diffs: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(feed.dataset, original.identity.dataset);
+    assert_ne!(feed.incarnation, original.identity.incarnation);
+    assert_eq!(feed.head, original.expected_revision + 1);
+    assert_eq!(feed.floor, feed.head);
+    assert!(feed.changes.is_empty());
+    assert_eq!(
+        client.read("point", Some(10)).await.unwrap().rows,
+        vec![point()]
+    );
+    let history = client
+        .his_read_scoped(&HistoryReadRequest {
+            id: "standalone_point".into(),
+            range: "2026-01-01,2026-01-02".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.terminal, HistoryTerminal::Complete);
+    assert_eq!(history.samples, samples());
+    assert_ne!(
+        history.metadata.history.authority,
+        old_history.identity.authority
+    );
+    assert_ne!(
+        history.metadata.history.incarnation,
+        old_history.identity.incarnation
+    );
+    assert_eq!(
+        history.metadata.history.generation,
+        old_history.expected_generation + 1
+    );
+    assert!(!matches!(
+        client.reconcile_entity(&original.identity).await.unwrap(),
+        MutationOutcome::Committed(_)
+    ));
+    assert!(!matches!(
+        client
+            .reconcile_history(&old_history.identity)
+            .await
+            .unwrap(),
+        HistoryWriteOutcome::Committed(_)
+    ));
+    client.close().await.unwrap();
+}

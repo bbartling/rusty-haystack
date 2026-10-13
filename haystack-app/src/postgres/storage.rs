@@ -48,73 +48,28 @@ impl Opened {
         .await
         .map_err(|_| PostgresError::Deadline)?
         .map_err(|_| PostgresError::Connection)?;
-        let initialized=tokio::time::timeout(config.limits.transaction_timeout,async {
-        let safe = sqlx::query("SELECT current_setting('server_version_num')::int AS version, current_setting('fsync') AS fsync, current_setting('synchronous_commit') AS sync, current_setting('full_page_writes') AS full")
-            .fetch_one(&mut connection).await.map_err(|_| PostgresError::Connection)?;
-        if safe
-            .try_get::<i32, _>("version")
-            .map_err(|_| PostgresError::Durability)?
-            < 180000
-            || safe
-                .try_get::<String, _>("fsync")
-                .map_err(|_| PostgresError::Durability)?
-                != "on"
-            || safe
-                .try_get::<String, _>("sync")
-                .map_err(|_| PostgresError::Durability)?
-                != "on"
-            || safe
-                .try_get::<String, _>("full")
-                .map_err(|_| PostgresError::Durability)?
-                != "on"
-        {
-            return Err(PostgresError::Durability);
-        }
-        sqlx::query(
-            "SELECT pg_advisory_lock(hashtextextended(current_database() || ':' || $1, 0))",
-        )
-        .bind(&config.schema)
-        .execute(&mut connection)
-        .await
-        .map_err(|_| PostgresError::Connection)?;
-        sqlx::query("BEGIN ISOLATION LEVEL READ COMMITTED").execute(&mut connection).await.map_err(|_| PostgresError::Connection)?;
-        // The identifier has passed the ASCII allowlist before interpolation.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE SCHEMA IF NOT EXISTS \"{}\"",
-            config.schema
-        )))
-        .execute(&mut connection)
-        .await
-        .map_err(|_| PostgresError::Incompatible)?;
-        sqlx::raw_sql(SCHEMA)
+        let initialized = tokio::time::timeout(config.limits.transaction_timeout, async {
+            check_durability(&mut connection).await?;
+            sqlx::query(
+                "SELECT pg_advisory_lock(hashtextextended(current_database() || ':' || $1, 0))",
+            )
+            .bind(&config.schema)
             .execute(&mut connection)
             .await
-            .map_err(|_| PostgresError::Incompatible)?;
-        // This is the sole supported transition. Holding the original
-        // exclusive key prevents coexistence with a live format-1 owner.
-        let format: Option<i32> = sqlx::query_scalar("SELECT format FROM metadata WHERE singleton=1")
-            .fetch_optional(&mut connection).await.map_err(|_|PostgresError::Incompatible)?;
-        match format {
-            Some(1) => { sqlx::raw_sql("ALTER TABLE metadata DROP CONSTRAINT metadata_format_check; ALTER TABLE metadata ADD CONSTRAINT metadata_format_check CHECK(format=2) NOT VALID; UPDATE metadata SET format=2; ALTER TABLE metadata VALIDATE CONSTRAINT metadata_format_check;").execute(&mut connection).await.map_err(|_|PostgresError::Incompatible)?; }
-            Some(2) | None => {},
-            _ => return Err(PostgresError::Incompatible),
-        }
-        // A pre-existing unlogged table does not become logged through IF NOT
-        // EXISTS. Check every authority table, not merely our metadata row.
-        let tables = sqlx::query("SELECT relname, relpersistence::text AS persistence FROM pg_class JOIN pg_namespace ON pg_namespace.oid = relnamespace WHERE nspname = $1 AND relname = ANY($2)")
-            .bind(&config.schema).bind(TABLES.as_slice()).fetch_all(&mut connection).await
-            .map_err(|_| PostgresError::Incompatible)?;
-        if tables.len() != TABLES.len()
-            || tables
-                .iter()
-                .any(|row| row.try_get::<String, _>("persistence").ok().as_deref() != Some("p"))
-        {
-            return Err(PostgresError::Durability);
-        }
-        validate_schema(&mut connection, &config.schema).await?;
-        sqlx::query("COMMIT").execute(&mut connection).await.map_err(|_|PostgresError::Connection)?;
-        Ok(())
-        }).await.unwrap_or(Err(PostgresError::Deadline));
+            .map_err(|_| PostgresError::Connection)?;
+            sqlx::query("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut connection)
+                .await
+                .map_err(|_| PostgresError::Connection)?;
+            initialize_schema(&mut connection, &config.schema).await?;
+            sqlx::query("COMMIT")
+                .execute(&mut connection)
+                .await
+                .map_err(|_| PostgresError::Connection)?;
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(PostgresError::Deadline));
         if let Err(error) = initialized {
             let _ = tokio::time::timeout(config.limits.statement_timeout, connection.close()).await;
             return Err(error);
@@ -165,6 +120,76 @@ impl Opened {
         }))
     }
 }
+pub(super) async fn check_durability(connection: &mut PgConnection) -> Result<(), PostgresError> {
+    let safe = sqlx::query("SELECT current_setting('server_version_num')::int AS version, current_setting('fsync') AS fsync, current_setting('synchronous_commit') AS sync, current_setting('full_page_writes') AS full")
+            .fetch_one(&mut *connection).await.map_err(|_| PostgresError::Connection)?;
+    if safe
+        .try_get::<i32, _>("version")
+        .map_err(|_| PostgresError::Durability)?
+        < 180000
+        || safe
+            .try_get::<String, _>("fsync")
+            .map_err(|_| PostgresError::Durability)?
+            != "on"
+        || safe
+            .try_get::<String, _>("sync")
+            .map_err(|_| PostgresError::Durability)?
+            != "on"
+        || safe
+            .try_get::<String, _>("full")
+            .map_err(|_| PostgresError::Durability)?
+            != "on"
+    {
+        return Err(PostgresError::Durability);
+    }
+    Ok(())
+}
+
+/// Caller owns the exclusive schema gate and a SQL transaction.
+pub(super) async fn initialize_schema(
+    connection: &mut PgConnection,
+    schema: &str,
+) -> Result<(), PostgresError> {
+    // The identifier has passed the ASCII allowlist before interpolation.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA IF NOT EXISTS \"{}\"",
+        schema
+    )))
+    .execute(&mut *connection)
+    .await
+    .map_err(|_| PostgresError::Incompatible)?;
+    sqlx::raw_sql(SCHEMA)
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| PostgresError::Incompatible)?;
+    // This is the sole supported transition. The exclusive gate drains old owners; format 3 fences their later admissions.
+    let format: Option<i32> = sqlx::query_scalar("SELECT format FROM metadata WHERE singleton=1")
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| PostgresError::Incompatible)?;
+    match format {
+        Some(1 | 2) => {
+            sqlx::raw_sql("ALTER TABLE metadata ADD COLUMN IF NOT EXISTS authority_state text NOT NULL DEFAULT 'active' CHECK(authority_state IN ('active','quiesced','staged','retired')); ALTER TABLE metadata ADD COLUMN IF NOT EXISTS operation text; ALTER TABLE metadata DROP CONSTRAINT metadata_format_check; ALTER TABLE metadata ADD CONSTRAINT metadata_format_check CHECK(format=3) NOT VALID; UPDATE metadata SET format=3; ALTER TABLE metadata VALIDATE CONSTRAINT metadata_format_check;").execute(&mut *connection).await.map_err(|_|PostgresError::Incompatible)?;
+        }
+        Some(3) | None => {}
+        _ => return Err(PostgresError::Incompatible),
+    }
+    // A pre-existing unlogged table does not become logged through IF NOT
+    // EXISTS. Check every authority table, not merely our metadata row.
+    let tables = sqlx::query("SELECT relname, relpersistence::text AS persistence FROM pg_class JOIN pg_namespace ON pg_namespace.oid = relnamespace WHERE nspname = $1 AND relname = ANY($2)")
+            .bind(schema).bind(TABLES.as_slice()).fetch_all(&mut *connection).await
+            .map_err(|_| PostgresError::Incompatible)?;
+    if tables.len() != TABLES.len()
+        || tables
+            .iter()
+            .any(|row| row.try_get::<String, _>("persistence").ok().as_deref() != Some("p"))
+    {
+        return Err(PostgresError::Durability);
+    }
+    validate_schema(&mut *connection, schema).await?;
+    Ok(())
+}
+
 impl Backend {
     pub(crate) fn seal(&self) {
         self.sealed.store(true, Ordering::Release);
@@ -263,9 +288,9 @@ impl Backend {
         let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
             self.schema_shared(&mut transaction).await?;
             let statement = if write {
-                "SELECT owner_generation,format FROM metadata WHERE singleton=1 FOR UPDATE"
+                "SELECT owner_generation,format,authority_state FROM metadata WHERE singleton=1 FOR UPDATE"
             } else {
-                "SELECT owner_generation,format FROM metadata WHERE singleton=1 FOR SHARE"
+                "SELECT owner_generation,format,authority_state FROM metadata WHERE singleton=1 FOR SHARE"
             };
             let row = sqlx::query(statement)
                 .fetch_one(&mut *transaction)
@@ -282,7 +307,8 @@ impl Backend {
                 || row
                     .try_get::<i32, _>("format")
                     .map_err(|_| PostgresError::Incompatible)?
-                    != 2
+                    != 3
+                || row.try_get::<String, _>("authority_state").map_err(|_| PostgresError::Incompatible)? != "active"
             {
                 self.seal();
                 return Err(PostgresError::Incompatible);
@@ -344,7 +370,7 @@ impl Backend {
     }
 }
 
-const TABLES: [&str; 7] = [
+pub(super) const TABLES: [&str; 7] = [
     "metadata",
     "entities",
     "entity_changes",
@@ -353,7 +379,7 @@ const TABLES: [&str; 7] = [
     "history_samples",
     "history_changes",
 ];
-// Format 2 is an exact supported relation contract, not merely IF NOT EXISTS.
+// Format 3 is an exact supported relation contract, not merely IF NOT EXISTS.
 const PRIMARY_KEYS: &[(&str, &[&str])] = &[
     ("metadata", &["singleton"]),
     ("entities", &["id"]),
@@ -390,7 +416,7 @@ pub(super) async fn validate_schema(
         connection,
         schema,
         "SELECT p.oid::bigint FROM pg_constraint p JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='metadata' AND p.conname='metadata_format_check' AND p.contype='c' AND p.convalidated AND p.oid::bigint>$2 ORDER BY p.oid LIMIT 1",
-        "CHECK ((format = 2))",
+        "CHECK ((format = 3))",
         "schema-format-constraint",
     ).await?;
     let history_reference = constraint_definition_exists(
@@ -453,7 +479,7 @@ async fn constraint_definition_exists(
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS metadata (
  singleton smallint PRIMARY KEY CHECK(singleton = 1),
- format integer NOT NULL CHECK(format = 2),
+ format integer NOT NULL CHECK(format = 3),
  dataset bytea NOT NULL CHECK(octet_length(dataset)=16),
  incarnation bytea NOT NULL CHECK(octet_length(incarnation)=16),
  revision numeric(20,0) NOT NULL CHECK(revision >= 0),
@@ -462,7 +488,9 @@ CREATE TABLE IF NOT EXISTS metadata (
  history_authority bytea NOT NULL CHECK(octet_length(history_authority)=16),
  history_sequence numeric(20,0) NOT NULL CHECK(history_sequence >= 0),
  owner_generation bigint NOT NULL CHECK(owner_generation > 0),
- catalog text NOT NULL, cursor_key bytea NOT NULL CHECK(octet_length(cursor_key)=32)
+ catalog text NOT NULL, cursor_key bytea NOT NULL CHECK(octet_length(cursor_key)=32),
+ authority_state text NOT NULL DEFAULT 'active' CHECK(authority_state IN ('active','quiesced','staged','retired')),
+ operation text
 );
 CREATE TABLE IF NOT EXISTS entities (id text PRIMARY KEY, payload bytea NOT NULL);
 CREATE TABLE IF NOT EXISTS entity_changes (revision numeric(20,0) PRIMARY KEY, payload bytea NOT NULL);

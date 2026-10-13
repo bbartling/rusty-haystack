@@ -110,3 +110,5 @@ entity and history durability through the shared application services. It includ
 verified TLS, durable operation receipts, coherent admission refresh, periodic
 cache convergence, restart recovery and bounded entity snapshot sessions. Default/core builds remain unchanged. See the
 [PostgreSQL contract and qualification profile](docs/postgres-durability.md).
+The [backup and restore workflow](docs/postgres-recovery.md) uses a durable selector
+and recoverable journal for distinct schemas in the same database.

@@ -84,6 +84,7 @@ For a disposable PostgreSQL instance already listening at `127.0.0.1:55432`,
 with database and login both named `haystack_local`, create `postgres.toml`:
 
 ```toml
+version = 1
 host = "127.0.0.1"
 port = 55432
 database = "haystack_local"
@@ -184,3 +185,11 @@ activation, backup, migration tooling, power-loss recovery, production security
 or release-artifact qualification follows from these checks. The required
 Ubuntu PostgreSQL CI job runs both recipes; a local run establishes only its
 actual host and revision. See the [support matrix](support-matrix.md).
+
+## Recoverable backup and selection
+
+The same installed executable supports `haystack storage` and version-1
+`selector_schema` configuration. See [PostgreSQL backup and authority selection](postgres-recovery.md)
+for maintenance windows, canonical archives, reusable restore intents and
+interruption recovery. The disposable standalone runner also checks archived
+restore through a selector, fresh authority identities and rejection of old receipts.

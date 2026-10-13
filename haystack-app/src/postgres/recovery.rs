@@ -38,11 +38,13 @@ impl Opened {
             let incarnation: [u8;16] = rand::random();
             let history: [u8;16] = rand::random();
             let cursor: [u8;32] = rand::random();
-            sqlx::query("INSERT INTO metadata VALUES (1,2,$1,$2,0,1,0,$3,0,1,$4,$5)")
+            sqlx::query("INSERT INTO metadata VALUES (1,3,$1,$2,0,1,0,$3,0,1,$4,$5,'active',NULL)")
                 .bind(dataset.as_slice()).bind(incarnation.as_slice()).bind(history.as_slice())
                 .bind(catalog.selection_identity()).bind(cursor.as_slice()).execute(&mut *tx).await
                 .map_err(crate::postgres::storage::read_error)?;
         }
+        let active: bool = sqlx::query_scalar("SELECT authority_state='active' FROM metadata WHERE singleton=1").fetch_one(&mut *tx).await.map_err(crate::postgres::storage::read_error)?;
+        if !active { return Err(PostgresError::Unavailable); }
         let recovered = read_graph(&mut tx, catalog, self.config.limits.recovery).await?;
         Ok(recovered)
         }.await;
@@ -73,7 +75,7 @@ pub(crate) async fn read_graph(
     if meta
         .try_get::<i32, _>("format")
         .map_err(|_| PostgresError::Incompatible)?
-        != 2
+        != 3
         || get("catalog")? != catalog.selection_identity()
     {
         return Err(PostgresError::Incompatible);

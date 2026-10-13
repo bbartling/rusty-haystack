@@ -196,7 +196,7 @@ def qualify(fixtures, fixture, toolchain):
     schema = f"standalone_{fixtures.token}"
     config = directory / "postgres.toml"
     # JSON strings are also valid TOML basic strings for these generated inputs.
-    fields = {"host": connection["tls_server_name"], "port": connection["port"],
+    fields = {"version": 1, "host": connection["tls_server_name"], "port": connection["port"],
               "database": connection["database"], "username": connection["user"],
               "schema": schema, "password_env": "HAYSTACK_POSTGRES_PASSWORD"}
     private_write(config, "\n".join(f"{key} = {json.dumps(value)}" for key, value in fields.items())
@@ -247,6 +247,50 @@ def qualify(fixtures, fixture, toolchain):
             print(f"Standalone {phase}: authorized HTTP flow passed; signal exit 0, listener and database sessions released", flush=True)
         finally:
             server.close()
+
+    # The same installed executable publishes an archive, ends that maintenance
+    # operation, and reuses the unchanged file for a fresh restore intent.
+    control = f"control_{fixtures.token}"
+    target = f"restored_{fixtures.token}"
+    unused = f"unused_{fixtures.token}"
+    selector = directory / "selector.toml"
+    selected_fields = {key: value for key, value in fields.items() if key != "schema"}
+    selected_fields["selector_schema"] = control
+    private_write(selector, "\n".join(f"{key} = {json.dumps(value)}" for key, value in selected_fields.items())
+                  + '\n[transport]\nmode = "verify-full"\nadditional_ca_file = "ca.crt"\n')
+    archive = directory / "backup.haystack"
+    admin = [str(binary), "storage"]
+    export = admin + ["export", "--config", str(selector), "--operation", "archive",
+                      "--source", schema, "--target", unused, "--output", str(archive)]
+    checked(export, environment, timeout=60)
+    checked(export, environment, timeout=60)  # Identical no-clobber publication retry.
+    checked(admin + ["verify", "--backup", str(archive)], environment, timeout=30)
+    checked(admin + ["cancel", "--config", str(selector), "--operation", "archive"], environment, timeout=60)
+    checked(admin + ["restore", "--config", str(selector), "--operation", "restore",
+                     "--target", target, "--backup", str(archive)], environment, timeout=60)
+    target_config = directory / "target.toml"
+    private_write(target_config, config.read_text().replace(f'schema = "{schema}"', f'schema = "{target}"'))
+    for rejected_config in (config, target_config):
+        rejected = Server(binary, rejected_config, users, environment, directory)
+        try:
+            if rejected.process.wait(timeout=30) == 0 or "Listening on" in rejected.process.stdout.read():
+                raise FixtureError("quiesced source or staged target became serveable")
+        finally:
+            rejected.close()
+    checked(admin + ["activate", "--config", str(selector), "--operation", "restore"], environment, timeout=60)
+    checked(admin + ["reconcile", "--config", str(selector), "--operation", "restore"], environment, timeout=30)
+    selected = Server(binary, selector, users, environment, directory)
+    try:
+        environment["HAYSTACK_STANDALONE_URL"] = selected.ready()
+        checked(cargo + ["nextest", "run", "--locked", "-p", "rusty-haystack-cli", "--features", "postgres",
+                         "--test", "standalone_postgres", "-E", "test(=installed_standalone_restore_selected_authority)",
+                         "--run-ignored", "ignored-only", "--no-tests", "fail", "--test-threads", "1"], environment, timeout=120)
+        selected.stop(signal.SIGTERM)
+        for owned_schema in (schema, target, control):
+            wait_for_database_cleanup(fixtures, owned_schema)
+        print("Standalone archived restore: selector served fresh authority, exact retained data and invalid old receipts; sessions released", flush=True)
+    finally:
+        selected.close()
 
 
 def main():

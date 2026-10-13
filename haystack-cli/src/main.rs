@@ -11,6 +11,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Back up, restore and select a PostgreSQL authority in one database
+    Storage {
+        #[command(subcommand)]
+        action: commands::storage::Action,
+    },
     /// Import entities from a file (Zinc, Trio, JSON format)
     Import {
         /// Path to the input file
@@ -300,6 +305,7 @@ fn main() {
             demo,
             cors_origins,
         }),
+        Commands::Storage { action } => commands::storage::run(action),
         Commands::Validate {
             file,
             format,

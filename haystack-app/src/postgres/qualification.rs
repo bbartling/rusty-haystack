@@ -2094,3 +2094,5 @@ async fn removed_schema_validation_probe(history: bool) {
         "validation of the intact owned schema must not deparse a removed unrelated relation: {result:?}"
     );
 }
+
+mod administration;

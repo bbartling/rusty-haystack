@@ -261,7 +261,7 @@ async fn recover(
         .graph
         .read(|graph| graph.activated_catalog().cloned())
         .ok_or(ReadError::Unavailable)?;
-    let meta=sqlx::query("SELECT format,CASE WHEN octet_length(incarnation)=16 THEN incarnation END AS incarnation,revision::text,catalog_generation::text,owner_generation,CASE WHEN octet_length(catalog)<=1048576 THEN catalog END AS catalog FROM metadata WHERE singleton=1")
+    let meta=sqlx::query("SELECT format,authority_state,CASE WHEN octet_length(incarnation)=16 THEN incarnation END AS incarnation,revision::text,catalog_generation::text,owner_generation,CASE WHEN octet_length(catalog)<=1048576 THEN catalog END AS catalog FROM metadata WHERE singleton=1")
         .fetch_one(&mut **tx).await.map_err(|_|ReadError::Unavailable)?;
     let get = |name| {
         meta.try_get::<String, _>(name)
@@ -274,7 +274,8 @@ async fn recover(
         || meta
             .try_get::<i32, _>("format")
             .map_err(|_| ReadError::Unavailable)?
-            != 2
+            != 3
+        || get("authority_state")? != "active"
         || get("catalog")? != catalog.selection_identity()
     {
         return Err(ReadError::Unavailable);
