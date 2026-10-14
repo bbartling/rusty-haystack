@@ -343,11 +343,15 @@ def main():
         qualify(binary, directory, issuer)
         qualify_rich(binary, directory, issuer)
         qualify_discovery_floor(binary, directory, issuer)
+        from history import qualify_http as qualify_history_http
+        qualify_history_http(binary, directory, issuer)
         if args.features == "mcp,mcp-http":
             from qualify import qualify as qualify_stdio, qualify_rich as qualify_rich_stdio, qualify_discovery_floor as qualify_discovery_floor_stdio
             qualify_stdio(binary, directory)
             qualify_rich_stdio(binary, directory)
             qualify_discovery_floor_stdio(binary, directory)
+            from history import qualify_stdio as qualify_history_stdio
+            qualify_history_stdio(binary, directory)
     print("PASS fixture processes, sockets, keys and data removed" + ("; fresh temporary installation removed" if not args.binary else ""), flush=True)
 
 

@@ -52,6 +52,7 @@ mod http;
 
 #[cfg(any(feature = "mcp", feature = "mcp-http"))]
 mod selected {
+    mod history;
     use haystack_app::*;
     #[cfg(feature = "mcp")]
     use haystack_core::graph::SharedGraph;
@@ -60,6 +61,7 @@ mod selected {
         kinds::{Kind, NominalScalar},
         xeto::catalog::{ActivatedCatalog, Catalog},
     };
+    pub(super) use history::select_history;
     #[cfg(feature = "mcp")]
     use serde::Deserialize;
     use std::{collections::BTreeSet, io::Read, path::Path, sync::Arc};
@@ -77,22 +79,29 @@ mod selected {
         output_profile: haystack_mcp::OutputProfile,
         #[serde(default)]
         nominal_specs: Vec<String>,
+        #[serde(default)]
+        history_file: Option<std::path::PathBuf>,
+        #[serde(default)]
+        history_read: bool,
         principal: String,
         entity_ids: Vec<String>,
         #[serde(default)]
         hidden_tags: Vec<String>,
         #[serde(default = "timeout")]
         request_timeout_ms: u64,
-        #[serde(default = "response_bytes")]
-        max_response_bytes: usize,
+        #[serde(default)]
+        max_response_bytes: Option<usize>,
     }
     #[cfg(feature = "mcp")]
     fn timeout() -> u64 {
         10_000
     }
-    #[cfg(feature = "mcp")]
-    fn response_bytes() -> usize {
-        1024 * 1024
+    pub(super) fn response_bytes(selected: Option<usize>, history: bool) -> usize {
+        selected.unwrap_or(if history {
+            haystack_mcp::HISTORY_RESPONSE_BYTES
+        } else {
+            1024 * 1024
+        })
     }
     #[derive(Clone)]
     pub(super) struct Scope {
@@ -100,6 +109,7 @@ mod selected {
         pub(super) ids: BTreeSet<String>,
         pub(super) hidden: BTreeSet<String>,
         pub(super) types: Option<Arc<NominalScope>>,
+        pub(super) history: bool,
     }
     pub(super) struct NominalScope {
         names: BTreeSet<String>,
@@ -172,6 +182,7 @@ mod selected {
         }
         fn operation(&self, operation: ReadOperation) -> bool {
             operation == ReadOperation::Read
+                || (self.history && operation == ReadOperation::History)
         }
         fn entity(&self, id: &str) -> bool {
             self.ids.contains(id)
@@ -244,7 +255,10 @@ mod selected {
     pub fn run(path: &Path) -> Result<(), String> {
         let config: Config =
             toml::from_str(&bounded(path, 65_536)?).map_err(|_| "invalid MCP configuration")?;
+        let max_response_bytes =
+            response_bytes(config.max_response_bytes, config.history_file.is_some());
         if config.version != 1
+            || (config.history_read && config.history_file.is_none())
             || config.principal.is_empty()
             || config.principal.len() > 256
             || config.entity_ids.len() > 512
@@ -259,8 +273,11 @@ mod selected {
                 .iter()
                 .any(|tag| tag.is_empty() || tag.len() > 256)
             || !(10..=60_000).contains(&config.request_timeout_ms)
-            || !(config.output_profile.min_response_bytes()..=16 * 1024 * 1024)
-                .contains(&config.max_response_bytes)
+            || !(config
+                .output_profile
+                .selected_min_response_bytes(config.history_file.is_some())
+                ..=16 * 1024 * 1024)
+                .contains(&max_response_bytes)
         {
             return Err("invalid MCP configuration".into());
         }
@@ -274,15 +291,17 @@ mod selected {
             ids: config.entity_ids.into_iter().collect(),
             hidden: config.hidden_tags.into_iter().collect(),
             types: nominal_scope(observation.as_ref(), &config.nominal_specs)?,
+            history: config.history_read,
         });
         let limits = haystack_mcp::Limits {
             request_timeout: Duration::from_millis(config.request_timeout_ms),
-            max_response_bytes: config.max_response_bytes,
+            max_response_bytes,
             ..Default::default()
         };
         let builder =
             ApplicationBuilder::new(SharedGraph::new(graph), scope, ReadLimits::default())
                 .map_err(|_| "invalid MCP application configuration")?;
+        let builder = select_history(builder, path, config.history_file.as_deref())?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(8)

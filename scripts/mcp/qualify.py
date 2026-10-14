@@ -307,6 +307,8 @@ def main():
         qualify(binary, directory)
         qualify_rich(binary, directory)
         qualify_discovery_floor(binary, directory)
+        from history import qualify_stdio as qualify_history
+        qualify_history(binary, directory)
     print("PASS task-owned processes, pipes and fixture data removed" + ("; temporary installation removed" if not args.binary else ""), flush=True)
 
 

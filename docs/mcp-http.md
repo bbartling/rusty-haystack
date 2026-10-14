@@ -5,6 +5,8 @@ The optional `http` feature of `rusty-haystack-mcp` serves the existing
 `2026-07-28`. The CLI selects it with `mcp-http`. HTTP-only builds do not enable
 stdio, PostgreSQL, Python bindings, tasks, or new read/write capabilities. Select
 `mcp,mcp-http` to install both independent CLI commands.
+An explicitly selected history service adds [`haystack_history`](mcp-history.md)
+under the same authenticated transport and each subject's History permission.
 
 This is a **numeric loopback HTTP/1 deployment profile for a trusted local
 embedding**. It uses one POST per connection and bounded JSON responses. Clients
@@ -79,6 +81,13 @@ Output defaults to `haystack-h4-json-v1`. To select the
 the appropriate `[[subjects]]` table. Every rich tool call must acknowledge the
 profile. The installed HTTP fixture validates both profiles with independent
 schemas and a decoder for the selected rich values.
+
+Optional history uses top-level `history_file = "history.json"`, containing a
+bounded trusted `typed-payload-v1` sample Grid, and `history_read = true` inside
+each authorized `[[subjects]]` table. Ordinary entity permission does not grant
+History. The selected history default/minimum response budget is 2 MiB for both
+profiles; entity-only 8 KiB H4/16 KiB Jeto floors remain unchanged. See the
+[history configuration and result contract](mcp-history.md).
 
 ## Token and request authority
 

@@ -1,6 +1,6 @@
 # Read-only MCP over stdio
 
-The optional `rusty-haystack-mcp` crate exposes two tools over the managed
+The optional `rusty-haystack-mcp` crate exposes two entity tools over the managed
 application read service: `haystack_query` and `haystack_read`. Select its `stdio`
 feature explicitly. The standalone CLI selects it with `--features mcp`; ordinary
 core, application and CLI builds do not activate MCP. PostgreSQL, Python bindings
@@ -11,8 +11,9 @@ The adapter uses official `rmcp = 3.5.1`, with default features disabled and onl
 its server support selected in production. It supports exactly MCP `2026-07-28`
 discovery and `2025-11-25` initialization. Client metadata negotiates protocol
 behavior; it cannot select a principal, scope, dataset, path, URL or command.
-No history, mutation, command, resource, prompt, sampling, elicitation or task
-capability is exposed.
+Explicitly selecting a history service adds the bounded
+[`haystack_history` tool](mcp-history.md). No mutation, command, resource, prompt,
+sampling, elicitation or task capability is exposed.
 
 ## Standalone launch
 
@@ -63,6 +64,10 @@ Output defaults to `haystack-h4-json-v1`. The optional top-level
 [rich-value profile](mcp-rich-values.md), with fixed boxed schemas and a required
 profile acknowledgment on every tool call. Dataset format does not select output.
 
+For history, select a bounded `history_file` and explicitly grant
+`history_read = true`; see [the history profile](mcp-history.md). Without that
+provider selection, discovery and the existing two-tool launch behavior are unchanged.
+
 Example host command array:
 
 ```json
@@ -75,7 +80,7 @@ clear installation error.
 
 ## Tools and result profile
 
-Both tools publish fixed input/output schemas and read-only, non-destructive,
+The entity tools publish fixed input/output schemas and read-only, non-destructive,
 idempotent, closed-world annotations. Annotations are discovery hints; the shared
 policy enforces access. Each takes optional `projection` (tag names), `page_size`
 and `cursor`. `haystack_query` requires a Haystack `filter` string;
@@ -124,6 +129,10 @@ and a maximally escaped 128-byte request ID; smaller configurations fail before
 serving. Shared read budgets independently bound query parsing,
 IDs, rows, graph work, retained bytes, values, cursor storage and duration. Its
 default duration is five seconds, which may be tighter than transport delivery.
+Selecting history raises the default and minimum full response budget to 2 MiB
+for either output profile; the maximum remains 16 MiB. This covers the selected
+three-tool inventory and shared history encoding headroom. Per-call history
+data limits and diagnostic limits are described in [the history profile](mcp-history.md).
 
 Frame collection is bounded before JSON materialization. The reader independently
 processes cancellation while execution or output is busy. Admission and response

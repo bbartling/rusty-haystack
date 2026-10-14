@@ -1,4 +1,6 @@
-use super::selected::{Scope, bounded, initialize_profile, load_graph, nominal_scope};
+use super::selected::{
+    Scope, bounded, initialize_profile, load_graph, nominal_scope, response_bytes, select_history,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use haystack_app::*;
 use haystack_core::graph::SharedGraph;
@@ -20,6 +22,8 @@ struct Config {
     dataset_format: String,
     #[serde(default)]
     output_profile: haystack_mcp::OutputProfile,
+    #[serde(default)]
+    history_file: Option<PathBuf>,
     listen: SocketAddr,
     issuer: String,
     required_scope: String,
@@ -31,8 +35,8 @@ struct Config {
     allowed_origins: Vec<String>,
     #[serde(default = "timeout")]
     request_timeout_ms: u64,
-    #[serde(default = "response_bytes")]
-    max_response_bytes: usize,
+    #[serde(default)]
+    max_response_bytes: Option<usize>,
     #[serde(default = "connections")]
     max_connections: usize,
     #[serde(default = "in_flight")]
@@ -40,9 +44,6 @@ struct Config {
 }
 fn timeout() -> u64 {
     10_000
-}
-fn response_bytes() -> usize {
-    1024 * 1024
 }
 fn connections() -> usize {
     32
@@ -66,6 +67,8 @@ struct Subject {
     hidden_tags: Vec<String>,
     #[serde(default)]
     nominal_specs: Vec<String>,
+    #[serde(default)]
+    history_read: bool,
 }
 struct Policy(BTreeMap<String, Arc<Scope>>);
 impl ReadPolicy for Policy {
@@ -84,13 +87,19 @@ impl ReadPolicy for Policy {
 pub(super) fn run(path: &Path) -> Result<(), String> {
     let config: Config =
         toml::from_str(&bounded(path, 65_536)?).map_err(|_| "invalid MCP HTTP configuration")?;
+    let max_response_bytes =
+        response_bytes(config.max_response_bytes, config.history_file.is_some());
     if config.version != 1
+        || (config.history_file.is_none() && config.subjects.iter().any(|s| s.history_read))
         || !config.listen.ip().is_loopback()
         || !(1..=512).contains(&config.subjects.len())
         || !(1..=16).contains(&config.keys.len())
         || !(10..=60_000).contains(&config.request_timeout_ms)
-        || !(config.output_profile.min_response_bytes()..=16 * 1024 * 1024)
-            .contains(&config.max_response_bytes)
+        || !(config
+            .output_profile
+            .selected_min_response_bytes(config.history_file.is_some())
+            ..=16 * 1024 * 1024)
+            .contains(&max_response_bytes)
         || !(1..=128).contains(&config.max_connections)
         || !(1..=128).contains(&config.max_in_flight)
     {
@@ -121,6 +130,7 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
             ids: subject.entity_ids.iter().cloned().collect(),
             hidden: subject.hidden_tags.iter().cloned().collect(),
             types: nominal_scope(observation.as_ref(), &subject.nominal_specs)?,
+            history: subject.history_read,
         });
         if scopes.insert(subject.subject.clone(), scope).is_some() {
             return Err("duplicate MCP HTTP subject".into());
@@ -147,6 +157,7 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
         ReadLimits::default(),
     )
     .map_err(|_| "invalid MCP HTTP application configuration")?;
+    let builder = select_history(builder, path, config.history_file.as_deref())?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(8)
@@ -175,7 +186,8 @@ async fn session(
     http.max_connections = config.max_connections;
     http.limits.max_in_flight = config.max_in_flight;
     http.limits.request_timeout = Duration::from_millis(config.request_timeout_ms);
-    http.limits.max_response_bytes = config.max_response_bytes;
+    http.limits.max_response_bytes =
+        response_bytes(config.max_response_bytes, config.history_file.is_some());
     let verifier = Arc::new(
         JwtVerifier::new(JwtConfig {
             issuer: config.issuer,

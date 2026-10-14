@@ -1,4 +1,5 @@
 #![cfg(feature = "stdio")]
+mod history_support;
 use haystack_app::*;
 use haystack_core::{
     data::HDict,
@@ -67,6 +68,405 @@ impl PolicySnapshot for Scope {
 fn principal_for_test() -> Principal {
     Principal::TrustedEmbedding {
         subject: "fixture".into(),
+    }
+}
+
+#[tokio::test]
+async fn selected_history_is_discoverable_and_preserves_a_limited_prefix() {
+    use haystack_core::codecs::{Codec, zinc::ZincCodec};
+    let graph = SharedGraph::new(EntityGraph::new());
+    let mut point = HDict::new();
+    point.set("id", Kind::Ref(HRef::from_val("p")));
+    point.set("his", Kind::Marker);
+    point.set("kind", Kind::Str("Bool".into()));
+    point.set("tz", Kind::Str("UTC".into()));
+    graph.add(point).unwrap();
+    let builder =
+        ApplicationBuilder::new(graph, Arc::new(AllowAll), ReadLimits::default()).unwrap();
+    let store = Arc::new(HisStore::new());
+    let values = ["2024-06-01T00:00:00Z UTC", "2024-06-01T00:00:01Z UTC"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            let Kind::DateTime(ts) = ZincCodec.decode_scalar(ts).unwrap() else {
+                panic!()
+            };
+            HisItem {
+                ts: ts.dt,
+                val: if i == 0 { Kind::Bool(true) } else { Kind::NA },
+            }
+        })
+        .collect();
+    store.write("p", values).unwrap();
+    let history = HistoryService::new(
+        builder.handle().read_service(),
+        store,
+        HistoryLimits::default(),
+    )
+    .unwrap();
+    let owner = builder
+        .owned_history(history)
+        .unwrap()
+        .start(&tokio::runtime::Handle::current())
+        .unwrap();
+    owner.ready().await.unwrap();
+    let (mut wire, task) = wire(
+        &owner,
+        Limits {
+            max_response_bytes: 2 * 1024 * 1024,
+            ..Limits::default()
+        },
+        2 * 1024 * 1024,
+    );
+    initialize(&mut wire).await;
+    wire.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await;
+    let listed = wire.receive().await;
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "haystack_history")
+    );
+    let result = wire.call(3, "haystack_history", json!({"id":"p","start":"2024-06-01T00:00:00Z UTC","end":"2024-06-01T00:00:02Z UTC","max_rows":1,"max_bytes":2 * 1024 * 1024,"timeout_ms":1000})).await;
+    assert_eq!(result["result"]["isError"], true);
+    assert_eq!(result["result"]["structuredContent"]["row_count"], 1);
+    assert_eq!(result["result"]["structuredContent"]["complete"], false);
+    drop(wire);
+    assert_eq!(task.await.unwrap().unwrap().admitted, 3);
+    close(owner).await;
+}
+async fn history_app(probe: Arc<history_support::Probe>) -> ApplicationOwner {
+    let builder = ApplicationBuilder::new(
+        probe.graph.clone(),
+        Arc::new(AllowAll),
+        ReadLimits::default(),
+    )
+    .unwrap()
+    .shutdown_policy(ShutdownPolicy {
+        drain_timeout: Duration::ZERO,
+        stop_timeout: Duration::from_secs(2),
+    });
+    let history = HistoryService::new(
+        builder.handle().read_service(),
+        probe,
+        HistoryLimits {
+            batch_rows: 1,
+            ..HistoryLimits::default()
+        },
+    )
+    .unwrap();
+    let owner = builder
+        .owned_history(history)
+        .unwrap()
+        .start(&tokio::runtime::Handle::current())
+        .unwrap();
+    owner.ready().await.unwrap();
+    owner
+}
+
+#[tokio::test]
+async fn history_stdio_slow_consumer_holds_delivery_until_deadline_or_eof() {
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        for event in ["deadline", "eof"] {
+            let probe = history_support::Probe::new(None);
+            let owner = history_app(probe.clone()).await;
+            let (mut wire, task) = wire_profile(
+                &owner,
+                Limits {
+                    max_response_bytes: haystack_mcp::HISTORY_RESPONSE_BYTES,
+                    request_timeout: Duration::from_secs(3),
+                    ..Limits::default()
+                },
+                128,
+                profile,
+            );
+            initialize(&mut wire).await;
+            let mut arguments = history_support::args(profile);
+            arguments["timeout_ms"] = json!(250);
+            wire.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"haystack_history","arguments":arguments}})).await;
+            let mut prefix = [0; 32];
+            tokio::time::timeout(Duration::from_secs(1), wire.input.read_exact(&mut prefix))
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(probe.closed(), 1);
+            assert_eq!(probe.closes(), 1);
+            assert_eq!(probe.pulls(), 3, "the three one-row batches have finished");
+            assert_eq!(owner.handle().read_service().load().admitted, 0);
+            assert!(
+                owner.handle().outstanding_tasks() > 0,
+                "physical response must still own transport work"
+            );
+            assert!(!task.is_finished());
+            if event == "eof" {
+                wire.output.shutdown().await.unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if event == "deadline" {
+                assert_eq!(result.unwrap_err(), McpError::Deadline);
+            } else {
+                let report = result.unwrap();
+                assert_eq!(report.admitted, report.released);
+            }
+            assert_eq!(
+                probe.pulls(),
+                3,
+                "slow output cannot trigger more provider pulls"
+            );
+            assert_eq!(owner.handle().outstanding_tasks(), 0);
+            close(owner).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_stdio_profiles_floor_empty_limits_failure_and_invalid_arguments() {
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        let probe = history_support::Probe::new(None);
+        let owner = history_app(probe.clone()).await;
+        let (mut wire, task) = wire_profile(
+            &owner,
+            Limits {
+                max_response_bytes: haystack_mcp::HISTORY_RESPONSE_BYTES,
+                ..Limits::default()
+            },
+            haystack_mcp::HISTORY_RESPONSE_BYTES,
+            profile,
+        );
+        initialize(&mut wire).await;
+        let id = "\u{1}".repeat(128);
+        wire.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/list"}))
+            .await;
+        let discovery = wire.receive().await;
+        assert_eq!(discovery["result"]["tools"].as_array().unwrap().len(), 3);
+        assert!(
+            serde_json::to_vec(&discovery).unwrap().len() <= haystack_mcp::HISTORY_RESPONSE_BYTES
+        );
+        let args = history_support::args(profile);
+        wire.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"haystack_history","arguments":args}})).await;
+        let full = wire.receive().await;
+        assert_eq!(full["id"], id);
+        assert!(serde_json::to_vec(&full).unwrap().len() <= haystack_mcp::HISTORY_RESPONSE_BYTES);
+        let full = history_support::decoded(&full, profile);
+        assert_eq!(full.terminal, HistoryTerminal::Complete);
+        assert_eq!(
+            full.samples
+                .iter()
+                .map(|s| s.val.clone())
+                .collect::<Vec<_>>(),
+            [Kind::Bool(true), Kind::NA, Kind::Bool(false)]
+        );
+        let mut limited = args.clone();
+        limited["max_rows"] = json!(1);
+        let partial =
+            history_support::decoded(&wire.call(5, "haystack_history", limited).await, profile);
+        assert_eq!(partial.samples.len(), 1);
+        assert_eq!(
+            partial.terminal,
+            HistoryTerminal::Limited(HistoryReason::Rows)
+        );
+        let mut empty = args.clone();
+        empty["end"] = empty["start"].clone();
+        let empty =
+            history_support::decoded(&wire.call(6, "haystack_history", empty).await, profile);
+        assert!(empty.samples.is_empty());
+        assert_eq!(empty.terminal, HistoryTerminal::Complete);
+        let opens = probe.opens();
+        let mut tiny = args.clone();
+        tiny["max_bytes"] = json!(1);
+        assert_eq!(
+            wire.call(7, "haystack_history", tiny).await["result"]["structuredContent"]["error"]["code"],
+            "budget"
+        );
+        for (field, value) in [
+            ("max_rows", json!(0)),
+            ("max_bytes", json!(0)),
+            ("timeout_ms", json!(0)),
+            ("max_rows", Value::Null),
+            ("start", json!("today")),
+            ("end", json!("2023-01-01T00:00:00Z UTC")),
+            ("cursor", json!("opaque")),
+        ] {
+            let mut invalid = args.clone();
+            invalid[field] = value;
+            assert_eq!(
+                wire.call(8, "haystack_history", invalid).await["error"]["code"],
+                -32602
+            );
+        }
+        if profile == haystack_mcp::OutputProfile::Jeto {
+            let mut missing = args.clone();
+            missing.as_object_mut().unwrap().remove("profile");
+            assert_eq!(
+                wire.call(8, "haystack_history", missing).await["error"]["code"],
+                -32602
+            );
+        }
+        assert_eq!(probe.opens(), opens);
+        probe.fail_after(probe.pulls() + 1);
+        let failed = history_support::decoded(
+            &wire.call(9, "haystack_history", args.clone()).await,
+            profile,
+        );
+        assert_eq!(failed.samples.len(), 1);
+        assert_eq!(
+            failed.terminal,
+            HistoryTerminal::Failed(HistoryReason::Provider)
+        );
+        probe.fail_after(usize::MAX);
+        let graph = probe.graph.clone();
+        let mut point = graph.get("a").unwrap();
+        point.set("kind", Kind::Str("Str".into()));
+        graph.update("a", point).unwrap();
+        probe
+            .store
+            .write(
+                "a",
+                vec![HisItem {
+                    ts: chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z").unwrap(),
+                    val: Kind::Str("x".repeat(300_000)),
+                }],
+            )
+            .unwrap();
+        // Replace the series so the oversized first row cannot masquerade as
+        // empty complete, and no value-sized response is ever produced.
+        let oversized =
+            history_support::decoded(&wire.call(10, "haystack_history", args).await, profile);
+        assert!(oversized.samples.is_empty());
+        assert_eq!(
+            oversized.terminal,
+            HistoryTerminal::Limited(HistoryReason::Bytes)
+        );
+        finished(wire, task).await;
+        assert_eq!(probe.opens(), probe.closes());
+        close(owner).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_stdio_cancel_and_teardown_retain_gated_provider_and_request_id() {
+    use history_support::Stage;
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        for stage in [Stage::Open, Stage::Pull, Stage::Close] {
+            let probe = history_support::Probe::new(Some(stage));
+            let owner = history_app(probe.clone()).await;
+            let (mut wire, mut task) = wire_profile(
+                &owner,
+                Limits {
+                    max_response_bytes: haystack_mcp::HISTORY_RESPONSE_BYTES,
+                    max_in_flight: 1,
+                    ..Limits::default()
+                },
+                64 * 1024,
+                profile,
+            );
+            initialize(&mut wire).await;
+            wire.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"haystack_history","arguments":history_support::args(profile)}})).await;
+            probe.wait().await;
+            wire.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}})).await;
+            let duplicate = wire
+                .call(7, "haystack_history", history_support::args(profile))
+                .await;
+            assert_eq!(duplicate["error"]["data"]["reason"], "duplicate_request_id");
+            let pressure = wire
+                .call(8, "haystack_history", history_support::args(profile))
+                .await;
+            assert_eq!(pressure["error"]["data"]["reason"], "capacity");
+            drop(wire);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), &mut task)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(owner.handle().read_service().load().admitted, 1);
+            assert_eq!(
+                owner.handle().history_service().unwrap().active_sessions(),
+                1
+            );
+            assert_eq!(probe.closed(), 0);
+            probe.release();
+            let report = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.admitted, report.released);
+            assert_eq!(probe.closes(), 1);
+            assert_eq!(probe.closed(), 1);
+            assert_eq!(owner.handle().read_service().load().admitted, 0);
+            assert_eq!(
+                owner.handle().history_service().unwrap().active_sessions(),
+                0
+            );
+            close(owner).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_stdio_generation_and_graph_changes_preserve_an_explicit_prefix() {
+    for graph_change in [false, true] {
+        let profile = haystack_mcp::OutputProfile::Jeto;
+        let probe = history_support::Probe::new(Some(history_support::Stage::Pull));
+        probe.gate_after(1);
+        let owner = history_app(probe.clone()).await;
+        let (mut wire, task) = wire_profile(
+            &owner,
+            Limits {
+                max_response_bytes: haystack_mcp::HISTORY_RESPONSE_BYTES,
+                ..Limits::default()
+            },
+            64 * 1024,
+            profile,
+        );
+        initialize(&mut wire).await;
+        wire.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"haystack_history","arguments":history_support::args(profile)}})).await;
+        probe.wait().await;
+        if graph_change {
+            let graph = probe.graph.clone();
+            let mut row = graph.get("a").unwrap();
+            row.set("dis", Kind::Str("changed".into()));
+            graph.update("a", row).unwrap();
+        } else {
+            probe
+                .store
+                .write(
+                    "a",
+                    vec![HisItem {
+                        ts: chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:02Z").unwrap(),
+                        val: Kind::Bool(true),
+                    }],
+                )
+                .unwrap();
+        }
+        probe.release();
+        let result = history_support::decoded(&wire.receive().await, profile);
+        assert_eq!(result.samples.len(), 1);
+        assert_eq!(
+            result.terminal,
+            HistoryTerminal::Interrupted(if graph_change {
+                HistoryReason::MetadataChanged
+            } else {
+                HistoryReason::GenerationChanged
+            })
+        );
+        finished(wire, task).await;
+        close(owner).await;
     }
 }
 fn graph() -> SharedGraph {

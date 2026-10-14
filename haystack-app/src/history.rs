@@ -98,6 +98,42 @@ pub struct HistoryService {
     clock: Arc<dyn HistoryClock>,
 }
 impl HistoryService {
+    /// Strict shared schema validation for bounded trusted launch fixtures.
+    /// This does not grant request authority or open a provider.
+    pub fn point_schema(point: &haystack_core::data::HDict) -> Result<HistorySchema, ReadError> {
+        let mut budget = Budget::new(
+            Arc::new(crate::ReadLimits::default()),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            crate::CancellationToken::new(),
+        );
+        crate::history_admission::schema(point, &mut budget)
+    }
+    /// Validate the finite DateTime-only subset used by bounded agent tools.
+    /// Both boundaries use the shared Zinc/range parser; no relative dates or
+    /// open-ended shorthand are admitted by this adapter contract.
+    pub fn finite_request(
+        id: String,
+        start: &str,
+        end: &str,
+    ) -> Result<HistoryReadRequest, ReadError> {
+        use haystack_core::codecs::{Codec, zinc::ZincCodec};
+        if id.is_empty() || id.len() > 256 || start.len() + end.len() + 1 > 1024 {
+            return Err(ReadError::InvalidQuery("invalid finite history request"));
+        }
+        for boundary in [start, end] {
+            if !matches!(
+                ZincCodec.decode_scalar(boundary.trim()),
+                Ok(haystack_core::kinds::Kind::DateTime(_))
+            ) {
+                return Err(ReadError::InvalidQuery(
+                    "explicit DateTime boundaries required",
+                ));
+            }
+        }
+        let range = format!("{start},{end}");
+        parse_range(&range, "UTC", chrono::Utc::now().fixed_offset())?;
+        Ok(HistoryReadRequest { id, range })
+    }
     pub fn new(
         reads: ReadService,
         provider: Arc<dyn HistoryProvider>,
@@ -973,6 +1009,16 @@ pub struct HistoryReadSession {
     cancel_on_drop: bool,
 }
 impl HistoryReadSession {
+    /// Actual coordinator completion without cancelling the request token
+    /// needed by a subsequent encoding stage. A terminal alone is not a join.
+    pub(crate) async fn completed(&mut self) -> Option<HistoryTerminal> {
+        while !*self.done.borrow() {
+            if self.done.changed().await.is_err() {
+                break;
+            }
+        }
+        *self.terminal.borrow()
+    }
     /// Exactly one requested batch, with no speculative fetch. `&mut self`
     /// prevents multiple outstanding pulls for the same session.
     pub async fn next(&mut self) -> HistoryBatch {
