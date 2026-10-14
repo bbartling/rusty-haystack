@@ -286,6 +286,14 @@ impl Context {
     pub fn contains(&self, name: &str) -> bool {
         self.types.contains_key(name)
     }
+    /// Whether an already admitted name is represented by a nominal scalar,
+    /// including enums. This does not construct or admit any declaration.
+    pub fn is_nominal(&self, name: &str) -> bool {
+        matches!(
+            self.types.get(name),
+            Some(Class::Nominal(_) | Class::Enum(_))
+        )
+    }
     // Binary search uses no allocation and at most log2(n)+2 comparisons.
     // Reserve their worst-case common-prefix scans before scalar membership.
     pub(super) fn enum_work(&self, bytes: usize) -> usize {

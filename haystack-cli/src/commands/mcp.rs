@@ -55,7 +55,11 @@ mod selected {
     use haystack_app::*;
     #[cfg(feature = "mcp")]
     use haystack_core::graph::SharedGraph;
-    use haystack_core::{graph::EntityGraph, kinds::NominalScalar};
+    use haystack_core::{
+        graph::EntityGraph,
+        kinds::{Kind, NominalScalar},
+        xeto::catalog::{ActivatedCatalog, Catalog},
+    };
     #[cfg(feature = "mcp")]
     use serde::Deserialize;
     use std::{collections::BTreeSet, io::Read, path::Path, sync::Arc};
@@ -69,6 +73,10 @@ mod selected {
         version: u32,
         dataset_file: PathBuf,
         dataset_format: String,
+        #[serde(default)]
+        output_profile: haystack_mcp::OutputProfile,
+        #[serde(default)]
+        nominal_specs: Vec<String>,
         principal: String,
         entity_ids: Vec<String>,
         #[serde(default)]
@@ -91,6 +99,61 @@ mod selected {
         pub(super) principal: Principal,
         pub(super) ids: BTreeSet<String>,
         pub(super) hidden: BTreeSet<String>,
+        pub(super) types: Option<Arc<NominalScope>>,
+    }
+    pub(super) struct NominalScope {
+        names: BTreeSet<String>,
+        observation: Arc<ActivatedCatalog>,
+    }
+    pub(super) fn initialize_profile(
+        graph: &mut EntityGraph,
+        profile: haystack_mcp::OutputProfile,
+    ) -> Result<Option<Arc<ActivatedCatalog>>, String> {
+        if profile == haystack_mcp::OutputProfile::H4 {
+            return Ok(None);
+        }
+        let catalog =
+            Catalog::load_http_pinned().map_err(|_| "MCP typed catalog is unavailable")?;
+        let base = graph.namespace_arc().cloned();
+        let observation = Arc::new(
+            ActivatedCatalog::new(catalog, base.as_deref())
+                .map_err(|_| "MCP typed context is unavailable")?,
+        );
+        graph
+            .compare_initialize_catalog(graph.state(), base.as_ref(), observation.clone())
+            .map_err(|_| "MCP typed context changed during launch")?;
+        Ok(Some(observation))
+    }
+    pub(super) fn nominal_scope(
+        observation: Option<&Arc<ActivatedCatalog>>,
+        names: &[String],
+    ) -> Result<Option<Arc<NominalScope>>, String> {
+        let Some(observation) = observation else {
+            return if names.is_empty() {
+                Ok(None)
+            } else {
+                Err("nominal_specs requires the Jeto output profile".into())
+            };
+        };
+        let context = &observation
+            .callable("sys.api::readById")
+            .ok_or("MCP typed context is unavailable")?
+            .context;
+        if names.len() > 256
+            || names
+                .iter()
+                .any(|name| name.len() > 256 || !context.is_nominal(name))
+        {
+            return Err("nominal_specs must name admitted nominal scalar declarations".into());
+        }
+        let unique = names.iter().cloned().collect::<BTreeSet<_>>();
+        if unique.len() != names.len() {
+            return Err("duplicate nominal_specs entry".into());
+        }
+        Ok(Some(Arc::new(NominalScope {
+            names: unique,
+            observation: observation.clone(),
+        })))
     }
     impl ReadPolicy for Scope {
         fn snapshot(&self, principal: &Principal) -> Result<Arc<dyn PolicySnapshot>, ReadError> {
@@ -122,11 +185,24 @@ mod selected {
         fn reference_display(&self, target: &str) -> bool {
             self.ids.contains(target)
         }
-        fn catalog(&self, _: CatalogKind, _: &str) -> bool {
-            false
+        fn catalog(&self, kind: CatalogKind, name: &str) -> bool {
+            self.types.as_ref().is_some_and(|scope| match kind {
+                CatalogKind::Spec => scope.names.contains(name),
+                CatalogKind::Library => scope.names.iter().any(|qname| {
+                    qname
+                        .split_once("::")
+                        .is_some_and(|(library, _)| library == name)
+                }),
+                _ => false,
+            })
         }
-        fn nominal_provenance(&self, _: &NominalScalar) -> bool {
-            false
+        fn nominal_provenance(&self, value: &NominalScalar) -> bool {
+            self.types.as_ref().is_some_and(|scope| {
+                let origin = scope.observation.catalog().provenance();
+                scope.names.contains(value.spec())
+                    && value.catalog() == origin.repository
+                    && value.revision() == origin.commit
+            })
         }
     }
     pub(super) fn bounded(path: &Path, max: usize) -> Result<String, String> {
@@ -187,7 +263,8 @@ mod selected {
         {
             return Err("invalid MCP configuration".into());
         }
-        let graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
+        let mut graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
+        let observation = initialize_profile(&mut graph, config.output_profile)?;
         let principal = Principal::TrustedEmbedding {
             subject: config.principal,
         };
@@ -195,6 +272,7 @@ mod selected {
             principal: principal.clone(),
             ids: config.entity_ids.into_iter().collect(),
             hidden: config.hidden_tags.into_iter().collect(),
+            types: nominal_scope(observation.as_ref(), &config.nominal_specs)?,
         });
         let limits = haystack_mcp::Limits {
             request_timeout: Duration::from_millis(config.request_timeout_ms),
@@ -210,7 +288,7 @@ mod selected {
             .enable_all()
             .build()
             .map_err(|_| "cannot create MCP runtime")?;
-        let result = runtime.block_on(session(builder, principal, limits));
+        let result = runtime.block_on(session(builder, principal, limits, config.output_profile));
         drop(runtime);
         result
     }
@@ -223,6 +301,7 @@ mod selected {
             "zinc" => "text/zinc",
             "trio" => "text/trio",
             "json" => "application/json",
+            "typed-payload-v1" => "typed-payload-v1",
             _ => return Err("unsupported MCP dataset format".into()),
         };
         let file = if dataset_file.is_absolute() {
@@ -246,10 +325,26 @@ mod selected {
                 _ => {}
             }
         }
-        let grid = haystack_core::codecs::codec_for(mime)
-            .expect("selected codec")
-            .decode_grid(&content)
-            .map_err(|_| "invalid MCP dataset")?;
+        let grid = if mime == "typed-payload-v1" {
+            let value = haystack_core::codecs::typed::decode_with_limits(
+                content.as_bytes(),
+                haystack_core::codecs::typed::PayloadLimits {
+                    max_bytes: 4 * 1024 * 1024,
+                    max_depth: 64,
+                    max_nodes: 100_000,
+                },
+            )
+            .map_err(|_| "invalid MCP typed-payload-v1 dataset")?;
+            let Kind::Grid(grid) = value else {
+                return Err("MCP typed-payload-v1 dataset must contain a Grid".into());
+            };
+            *grid
+        } else {
+            haystack_core::codecs::codec_for(mime)
+                .expect("selected codec")
+                .decode_grid(&content)
+                .map_err(|_| "invalid MCP dataset")?
+        };
         if grid.rows.len() > 10_000 {
             return Err("dataset row count exceeds its limit".into());
         }
@@ -261,6 +356,7 @@ mod selected {
         builder: ApplicationBuilder,
         principal: Principal,
         limits: haystack_mcp::Limits,
+        profile: haystack_mcp::OutputProfile,
     ) -> Result<(), String> {
         use std::os::fd::AsFd;
         use tokio::{
@@ -295,6 +391,7 @@ mod selected {
             input,
             output,
             limits,
+            profile,
             stop.clone(),
         );
         tokio::pin!(serving);
@@ -320,6 +417,7 @@ mod selected {
         _: ApplicationBuilder,
         _: Principal,
         _: haystack_mcp::Limits,
+        _: haystack_mcp::OutputProfile,
     ) -> Result<(), String> {
         Err("MCP stdio requires the Unix pipe platform profile".into())
     }

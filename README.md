@@ -129,7 +129,7 @@ Follow that document's prerequisites before running the recipe. [PostgreSQL dura
 
 ## Read-only MCP tools
 
-Both MCP transports expose only `haystack_query` and `haystack_read`, with fixed schemas and bounded H4 JSON results. They share application read policy, hidden-tag/reference filtering and principal-bound continuation checks. No write, history, command, resource, prompt or task capability is exposed.
+Both MCP transports expose only `haystack_query` and `haystack_read`, with fixed schemas and bounded H4 JSON results by default. An explicit launch may select the [rich Jeto profile](docs/mcp-rich-values.md) for exact typed scalars, admitted nominal provenance and Buf values. They share application read policy, hidden-tag/reference filtering and principal-bound continuation checks. No write, history, command, resource, prompt or task capability is exposed.
 
 [Stdio](docs/mcp-stdio.md) uses an explicit trusted launch principal and dataset scope. A host launches the installed command with cancellable **Unix pipes on both stdin and stdout**; an interactive terminal or regular-file redirection is not the selected runtime profile. It supports the documented modern discovery and legacy initialization revisions.
 

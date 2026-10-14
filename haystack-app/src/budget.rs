@@ -211,6 +211,32 @@ impl Budget {
     }
 }
 
+/// Map codec charges onto the original cumulative application admission.
+pub(crate) struct JetoMeter<'a>(pub &'a mut Budget);
+impl haystack_core::codecs::jeto::Meter for JetoMeter<'_> {
+    type Error = ReadError;
+    fn charge(&mut self, cost: haystack_core::codecs::jeto::Charge) -> Result<(), ReadError> {
+        use haystack_core::codecs::jeto::Charge;
+        self.0.check()?;
+        match cost {
+            // Raw transport bytes were already reserved before collection. The
+            // core parser reports the document length for an additional ceiling
+            // check, without renewing or double-charging that input allowance.
+            Charge::Input(n) if n > self.0.limits.max_input_bytes => {
+                Err(ReadError::Budget(BudgetKind::Input))
+            }
+            Charge::Output(n) if n > self.0.limits.max_output_bytes => {
+                Err(ReadError::Budget(BudgetKind::Output))
+            }
+            Charge::Input(_) | Charge::Output(_) => Ok(()),
+            Charge::Work(n) => self.0.charge(BudgetKind::Work, n),
+            Charge::Retained(n) => self.0.charge(BudgetKind::Retained, n),
+            Charge::Nodes(n) => self.0.charge(BudgetKind::Values, n),
+            Charge::Depth(n) => self.0.depth(n),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

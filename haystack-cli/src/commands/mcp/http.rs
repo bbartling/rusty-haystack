@@ -1,4 +1,4 @@
-use super::selected::{Scope, bounded, load_graph};
+use super::selected::{Scope, bounded, initialize_profile, load_graph, nominal_scope};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use haystack_app::*;
 use haystack_core::graph::SharedGraph;
@@ -18,6 +18,8 @@ struct Config {
     version: u32,
     dataset_file: PathBuf,
     dataset_format: String,
+    #[serde(default)]
+    output_profile: haystack_mcp::OutputProfile,
     listen: SocketAddr,
     issuer: String,
     required_scope: String,
@@ -62,6 +64,8 @@ struct Subject {
     entity_ids: Vec<String>,
     #[serde(default)]
     hidden_tags: Vec<String>,
+    #[serde(default)]
+    nominal_specs: Vec<String>,
 }
 struct Policy(BTreeMap<String, Arc<Scope>>);
 impl ReadPolicy for Policy {
@@ -91,6 +95,8 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
     {
         return Err("invalid MCP HTTP configuration".into());
     }
+    let mut graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
+    let observation = initialize_profile(&mut graph, config.output_profile)?;
     let mut scopes = BTreeMap::new();
     for subject in &config.subjects {
         if subject.subject.is_empty()
@@ -113,6 +119,7 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
             ),
             ids: subject.entity_ids.iter().cloned().collect(),
             hidden: subject.hidden_tags.iter().cloned().collect(),
+            types: nominal_scope(observation.as_ref(), &subject.nominal_specs)?,
         });
         if scopes.insert(subject.subject.clone(), scope).is_some() {
             return Err("duplicate MCP HTTP subject".into());
@@ -133,7 +140,6 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
     let builder = ApplicationBuilder::new(
         SharedGraph::new(graph),
         Arc::new(Policy(scopes)),
@@ -164,6 +170,7 @@ async fn session(
             .map_err(|_| "cannot read MCP HTTP listener address")?,
     );
     http.allowed_origins = config.allowed_origins;
+    http.output_profile = config.output_profile;
     http.max_connections = config.max_connections;
     http.limits.max_in_flight = config.max_in_flight;
     http.limits.request_timeout = Duration::from_millis(config.request_timeout_ms);

@@ -1,7 +1,11 @@
 //! Pinned executable HTTP profile using the core contextual Jeto codec.
 //! Codec context is derived from the admitted signature at service setup;
 //! every allocating request stage shares the original read admission.
-use crate::{BudgetKind, H4Codec, OutputProfile, ReadError, ReadOutput, budget::Budget, output};
+use crate::{
+    BudgetKind, H4Codec, OutputProfile, ReadError, ReadOutput,
+    budget::{Budget, JetoMeter},
+    output,
+};
 use haystack_core::{
     codecs::{codec_for, jeto, zinc},
     data::HDict,
@@ -410,30 +414,6 @@ fn response_media(
 /// observation from the admitted function slots and selected data declarations.
 pub(crate) type WireProfile = haystack_core::xeto::catalog::CallableContext;
 use haystack_core::xeto::catalog::ARGUMENTS;
-struct JetoMeter<'a>(&'a mut Budget);
-impl jeto::Meter for JetoMeter<'_> {
-    type Error = ReadError;
-    fn charge(&mut self, cost: jeto::Charge) -> Result<(), ReadError> {
-        use jeto::Charge;
-        self.0.check()?;
-        match cost {
-            // Raw transport bytes were already reserved before collection. The
-            // core parser reports the document length for an additional ceiling
-            // check, without renewing or double-charging that input allowance.
-            Charge::Input(n) if n > self.0.limits.max_input_bytes => {
-                Err(ReadError::Budget(BudgetKind::Input))
-            }
-            Charge::Output(n) if n > self.0.limits.max_output_bytes => {
-                Err(ReadError::Budget(BudgetKind::Output))
-            }
-            Charge::Input(_) | Charge::Output(_) => Ok(()),
-            Charge::Work(n) => self.0.charge(BudgetKind::Work, n),
-            Charge::Retained(n) => self.0.charge(BudgetKind::Retained, n),
-            Charge::Nodes(n) => self.0.charge(BudgetKind::Values, n),
-            Charge::Depth(n) => self.0.depth(n),
-        }
-    }
-}
 fn codec_error(error: jeto::Error<ReadError>, output: bool) -> ApiError {
     match error {
         jeto::Error::Budget(error) => error.into(),

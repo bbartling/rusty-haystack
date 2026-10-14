@@ -1252,7 +1252,15 @@ impl Inner {
                 };
                 let cursor = pending.as_ref().map(|(_, token)| token.as_str());
                 let grid = output::grid(rows, complete, cursor, view.budget)?;
-                let output = output::encode(grid, prepared.identity.profile, view.budget)?;
+                let output = if prepared.identity.profile == OutputProfile::Jeto {
+                    output::jeto(
+                        grid,
+                        graph.activated_catalog().ok_or(ReadError::Unavailable)?,
+                        view.budget,
+                    )?
+                } else {
+                    output::encode(grid, prepared.identity.profile, view.budget)?
+                };
                 if let Some((nonce, _)) = &pending {
                     let after = last.ok_or(ReadError::Unavailable)?;
                     self.insert(

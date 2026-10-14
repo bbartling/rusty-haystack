@@ -158,6 +158,9 @@ pub(crate) fn encode(
     grid_bound(&grid, &mut bound, budget, 1, strict)?;
     match profile {
         OutputProfile::Typed => Ok(ReadOutput::Typed(grid)),
+        // Contextual output is only available through the coherent catalog
+        // transaction below, never from an unbound post-read conversion.
+        OutputProfile::Jeto => Err(ReadError::Unavailable),
         OutputProfile::H4(codec) => {
             // Legacy encoders build scalar strings, JSON trees and the final
             // buffer. This conservative reservation includes those temporaries.
@@ -174,6 +177,125 @@ pub(crate) fn encode(
                 body: body.into_bytes(),
                 codec,
             })
+        }
+    }
+}
+
+pub(crate) fn jeto(
+    grid: HGrid,
+    observation: &haystack_core::xeto::catalog::ActivatedCatalog,
+    budget: &mut Budget,
+) -> Result<ReadOutput, ReadError> {
+    use haystack_core::codecs::jeto;
+    #[cfg(test)]
+    if let Some(hook) = &budget.typed_encode_hook {
+        hook();
+    }
+    budget.check()?;
+    // The admitted readById codec context already contains every selected
+    // concrete data declaration. Borrow only its codec context: this does not
+    // execute that function or infer permission to invoke it.
+    let context = &observation
+        .callable("sys.api::readById")
+        .ok_or(ReadError::Unavailable)?
+        .context;
+    let provenance = crate::ReadProvenance {
+        repository: budget.copy_string(context.catalog())?,
+        revision: budget.copy_string(context.revision())?,
+        selection: budget.copy_string(observation.selection_identity())?,
+    };
+    let body = jeto::encode_metered(
+        &Kind::Grid(Box::new(grid)),
+        context,
+        Some("sys::Grid"),
+        jeto::Boxing::All,
+        &mut crate::budget::JetoMeter(budget),
+    )
+    .map_err(|error| match error {
+        jeto::Error::Budget(error) => error,
+        jeto::Error::Allocation => ReadError::Unavailable,
+        _ => ReadError::Projection,
+    })?
+    .into_exact()
+    .map_err(|_| ReadError::Projection)?;
+    let bytes = body
+        .len()
+        .saturating_add(provenance.repository.len())
+        .saturating_add(provenance.revision.len())
+        .saturating_add(provenance.selection.len());
+    if bytes > budget.limits.max_output_bytes {
+        return Err(ReadError::Budget(BudgetKind::Output));
+    }
+    budget.check()?;
+    Ok(ReadOutput::Jeto { body, provenance })
+}
+
+#[cfg(test)]
+mod rich_tests {
+    use crate::*;
+    use haystack_core::graph::{EntityGraph, SharedGraph};
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupted_jeto_encoding_retains_admission_until_actual_worker_exit() {
+        for deadline in [false, true] {
+            let service = ReadService::new(
+                SharedGraph::new(EntityGraph::new()),
+                Arc::new(AllowAll),
+                ReadLimits {
+                    max_concurrent: 1,
+                    max_queued: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let cancel = CancellationToken::new();
+            let mut admission = service
+                .begin(ReadContext::new(
+                    Principal::Anonymous,
+                    std::time::Instant::now()
+                        + Duration::from_millis(if deadline { 200 } else { 3000 }),
+                    cancel.clone(),
+                ))
+                .await
+                .unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            admission.budget_mut().typed_encode_hook = Some(Arc::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+            }));
+            let worker = tokio::spawn(admission.read_joined(ReadRequest::new(
+                ReadQuery::Filter("*".into()),
+                OutputProfile::Jeto,
+            )));
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            if deadline {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            } else {
+                cancel.cancel();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !worker.is_finished(),
+                "joined read must retain its real worker"
+            );
+            assert_eq!(service.load().admitted, 1);
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                worker.await.unwrap().unwrap_err(),
+                if deadline {
+                    ReadError::Deadline
+                } else {
+                    ReadError::Cancelled
+                }
+            );
+            assert_eq!(service.load().admitted, 0);
         }
     }
 }

@@ -107,7 +107,7 @@ async fn handle(
         ReadOutput::H4 { body, codec } => {
             Ok(([(axum::http::header::CONTENT_TYPE, codec.mime())], body).into_response())
         }
-        ReadOutput::Typed(_) => Err(ReadError::Projection),
+        ReadOutput::Typed(_) | ReadOutput::Jeto { .. } => Err(ReadError::Projection),
     }
 }
 pub(super) fn codec(mime: &str) -> H4Codec {
