@@ -61,8 +61,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo +1.99.0 clippy --locked --workspace --exclude rusty-haystack --all-targets -- -D warnings
       - run: cargo +1.99.0 clippy --locked -p rusty-haystack-core --features chrono-tz --all-targets -- -D warnings
-      - run: cargo +1.99.0 clippy --locked -p rusty-haystack-mcp --features stdio --all-targets -- -D warnings
-      - run: cargo +1.99.0 clippy --locked -p rusty-haystack-cli --features mcp --all-targets -- -D warnings
+      - run: cargo +1.99.0 clippy --locked -p rusty-haystack-mcp --features stdio,http --all-targets -- -D warnings
+      - run: cargo +1.99.0 clippy --locked -p rusty-haystack-cli --features mcp,mcp-http --all-targets -- -D warnings
 
   # The tested policy expands main to all three OSes and dev to Ubuntu.
   # A retargeted PR uses its current base branch, including on `edited`.
@@ -89,6 +89,16 @@ jobs:
         run: |
           cargo +1.99.0 test --locked -p rusty-haystack-mcp --features stdio
           cargo +1.99.0 test --locked -p rusty-haystack-cli --features mcp
+      - name: Test the selected MCP HTTP profile
+        if: runner.os != 'Windows'
+        run: |
+          cargo +1.99.0 test --locked -p rusty-haystack-mcp --features http
+          cargo +1.99.0 test --locked -p rusty-haystack-cli --features mcp-http
+      - name: Test combined MCP profiles
+        if: runner.os != 'Windows'
+        run: |
+          cargo +1.99.0 test --locked -p rusty-haystack-mcp --features stdio,http
+          cargo +1.99.0 test --locked -p rusty-haystack-cli --features mcp,mcp-http
 
   # Separate package invocations prevent workspace members from unifying extra
   # dependency features into core's supported minimal/default builds.
@@ -200,6 +210,10 @@ jobs:
         run: uv run --locked --project scripts/schema-client --python 3.12 python scripts/schema-client/validate.py
       - name: Qualify installed MCP schemas, scope, signals and pipe cleanup
         run: uv run --locked --project scripts/schema-client --python 3.12 python scripts/mcp/qualify.py
+      - name: Qualify installed authenticated MCP HTTP and combined profiles
+        run: |
+          uv run --locked --project scripts/schema-client --python 3.12 python scripts/mcp/qualify_http.py
+          uv run --locked --project scripts/schema-client --python 3.12 python scripts/mcp/qualify_http.py --features mcp,mcp-http
 
   deny:
     name: Cargo Deny

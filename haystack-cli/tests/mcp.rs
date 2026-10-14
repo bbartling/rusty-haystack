@@ -106,3 +106,47 @@ fn fifo_config_and_dataset_without_a_writer_fail_promptly() {
         "FIFO launch blocked before regular-file validation (config_fifo): {blocked:?}"
     );
 }
+
+#[test]
+fn mcp_http_help_describes_explicit_loopback_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
+        .args(["mcp", "http", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--config <FILE>"));
+    assert!(help.contains("loopback"));
+}
+#[cfg(not(feature = "mcp-http"))]
+#[test]
+fn mcp_http_disabled_fails_before_configuration_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
+        .args(["mcp", "http", "--config", "/not-an-existing-http-config"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("--features mcp-http")
+    );
+}
+#[cfg(feature = "mcp-http")]
+#[test]
+fn mcp_http_invalid_configuration_is_sanitized() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("http.toml");
+    std::fs::write(&path, "version = 99\ncredential = 'do-not-echo-this'\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
+        .args(["mcp", "http", "--config"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("invalid MCP HTTP configuration"));
+    assert!(!error.contains("do-not-echo-this"));
+}

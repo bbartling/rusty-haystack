@@ -194,7 +194,7 @@ async fn named_whole_grid_and_get_read_preserve_number_na_fraction_and_metadata(
     let grid = response_grid(
         http.post(format!("{}/ph.api::hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&read_json())
+            .json_body(&read_json())
             .send()
             .await
             .unwrap(),
@@ -252,7 +252,7 @@ async fn writes_preserve_duplicate_order_and_reconcile_without_resubmission() {
     let send = || {
         http.post(format!("{}/ph.api::hisWrite", running.url))
             .header("Xeto-Version", "5")
-            .json(&named(&mutation::request_grid(&request).unwrap()))
+            .json_body(&named(&mutation::request_grid(&request).unwrap()))
     };
     let grid = response_grid(send().send().await.unwrap()).await;
     assert!(grid.rows.is_empty());
@@ -277,7 +277,7 @@ async fn writes_preserve_duplicate_order_and_reconcile_without_resubmission() {
     let read = response_grid(
         http.post(format!("{}/hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&read_json())
+            .json_body(&read_json())
             .send()
             .await
             .unwrap(),
@@ -408,7 +408,7 @@ async fn partial_reads_require_control_and_unselected_writes_are_hidden() {
     let response = http
         .post(format!("{}/hisRead", running.url))
         .header("Xeto-Version", "5")
-        .json(&read_json())
+        .json_body(&read_json())
         .send()
         .await
         .unwrap();
@@ -421,7 +421,7 @@ async fn partial_reads_require_control_and_unselected_writes_are_hidden() {
     let grid = response_grid(
         http.post(format!("{}/ph.api::hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&named(&request))
+            .json_body(&named(&request))
             .send()
             .await
             .unwrap(),
@@ -447,7 +447,7 @@ async fn partial_reads_require_control_and_unselected_writes_are_hidden() {
     let response = http
         .post(format!("{}/ph.api::hisWrite", running.url))
         .header("Xeto-Version", "5")
-        .json(&json!({"req":{}}))
+        .json_body(&json!({"req":{}}))
         .send()
         .await
         .unwrap();
@@ -455,11 +455,13 @@ async fn partial_reads_require_control_and_unselected_writes_are_hidden() {
     running.close().await;
 }
 
+// Use a distinct name so reqwest/json feature unification cannot shadow this
+// standalone-test helper with RequestBuilder::json.
 trait JsonRequest {
-    fn json(self, value: &Value) -> Self;
+    fn json_body(self, value: &Value) -> Self;
 }
 impl JsonRequest for reqwest::RequestBuilder {
-    fn json(self, value: &Value) -> Self {
+    fn json_body(self, value: &Value) -> Self {
         self.header("Content-Type", "application/json")
             .body(value.to_string())
     }
@@ -495,7 +497,7 @@ async fn default_limits_thousand_sample_page_returns_truthful_bounded_control() 
         client()
             .post(format!("{}/ph.api::hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&named(&request))
+            .json_body(&named(&request))
             .send()
             .await
             .unwrap(),
@@ -544,7 +546,7 @@ async fn write_controls_types_column_context_and_exact_timezone_are_not_coerced(
         let response = http
             .post(format!("{}/ph.api::hisWrite", running.url))
             .header("Xeto-Version", "5")
-            .json(&body)
+            .json_body(&body)
             .send()
             .await
             .unwrap();
@@ -566,7 +568,7 @@ async fn write_controls_types_column_context_and_exact_timezone_are_not_coerced(
     assert_eq!(
         http.post(format!("{}/ph.api::hisWrite", running.url))
             .header("Xeto-Version", "5")
-            .json(&invalid_context)
+            .json_body(&invalid_context)
             .send()
             .await
             .unwrap()
@@ -589,7 +591,7 @@ async fn write_controls_types_column_context_and_exact_timezone_are_not_coerced(
         assert_eq!(
             http.post(format!("{}/ph.api::hisWrite", running.url))
                 .header("Xeto-Version", "5")
-                .json(&body)
+                .json_body(&body)
                 .send()
                 .await
                 .unwrap()
@@ -603,7 +605,7 @@ async fn write_controls_types_column_context_and_exact_timezone_are_not_coerced(
     let grid = response_grid(
         http.post(format!("{}/ph.api::hisWrite", running.url))
             .header("Xeto-Version", "5")
-            .json(&named(&mutation::request_grid(&wrong_zone).unwrap()))
+            .json_body(&named(&mutation::request_grid(&wrong_zone).unwrap()))
             .send()
             .await
             .unwrap(),
@@ -624,7 +626,7 @@ async fn write_controls_types_column_context_and_exact_timezone_are_not_coerced(
     let grid = response_grid(
         http.post(format!("{}/hisWrite", running.url))
             .header("Xeto-Version", "5")
-            .json(&valid)
+            .json_body(&valid)
             .send()
             .await
             .unwrap(),
@@ -698,7 +700,7 @@ async fn independent_coarse_write_permission_is_required_even_with_allow_all_mut
             http.post(format!("{}/{path}", running.url))
                 .header("Xeto-Version", "5")
                 .header("Authorization", "BEARER authToken=fixture-read")
-                .json(&body)
+                .json_body(&body)
                 .send()
                 .await
                 .unwrap()
@@ -711,7 +713,7 @@ async fn independent_coarse_write_permission_is_required_even_with_allow_all_mut
         http.post(format!("{}/ph.api::hisWrite", running.url))
             .header("Xeto-Version", "5")
             .header("Authorization", "BEARER authToken=fixture-write")
-            .json(&body)
+            .json_body(&body)
             .send()
             .await
             .unwrap(),
@@ -725,7 +727,7 @@ async fn independent_coarse_write_permission_is_required_even_with_allow_all_mut
         http.post(format!("{}/hisRead", running.url))
             .header("Xeto-Version", "5")
             .header("Authorization", "BEARER authToken=fixture-write")
-            .json(&read_json())
+            .json_body(&read_json())
             .send()
             .await
             .unwrap()
@@ -813,7 +815,7 @@ async fn provider_failure_is_explicit_and_plain_read_never_reports_success() {
     assert_eq!(
         http.post(format!("{}/hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&read_json())
+            .json_body(&read_json())
             .send()
             .await
             .unwrap()
@@ -828,7 +830,7 @@ async fn provider_failure_is_explicit_and_plain_read_never_reports_success() {
     let result = response_grid(
         http.post(format!("{}/hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&named(&grid))
+            .json_body(&named(&grid))
             .send()
             .await
             .unwrap(),
@@ -854,7 +856,7 @@ async fn point_zone_conversion_exclusive_boundary_and_lossless_projection_match_
     let grid = response_grid(
         http.post(format!("{}/hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&body)
+            .json_body(&body)
             .send()
             .await
             .unwrap(),
@@ -869,7 +871,7 @@ async fn point_zone_conversion_exclusive_boundary_and_lossless_projection_match_
     let grid = response_grid(
         http.post(format!("{}/hisRead", running.url))
             .header("Xeto-Version", "5")
-            .json(&body)
+            .json_body(&body)
             .send()
             .await
             .unwrap(),
@@ -880,7 +882,7 @@ async fn point_zone_conversion_exclusive_boundary_and_lossless_projection_match_
         .post(format!("{}/hisRead", running.url))
         .header("Xeto-Version", "5")
         .header("Accept", "application/json;box=none")
-        .json(&body)
+        .json_body(&body)
         .send()
         .await
         .unwrap();

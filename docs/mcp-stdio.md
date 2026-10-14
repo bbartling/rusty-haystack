@@ -4,7 +4,8 @@ The optional `rusty-haystack-mcp` crate exposes two tools over the managed
 application read service: `haystack_query` and `haystack_read`. Select its `stdio`
 feature explicitly. The standalone CLI selects it with `--features mcp`; ordinary
 core, application and CLI builds do not activate MCP. PostgreSQL, Python bindings
-and an HTTP listener are unnecessary for this profile.
+and an HTTP listener are unnecessary for this profile. The independent
+[authenticated HTTP profile](mcp-http.md) uses the `http`/CLI `mcp-http` feature.
 
 The adapter uses official `rmcp = 3.5.1`, with default features disabled and only
 its server support selected in production. It supports exactly MCP `2026-07-28`

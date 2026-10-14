@@ -6,16 +6,40 @@ pub enum Action {
         #[arg(long, value_name = "FILE")]
         config: std::path::PathBuf,
     },
+    /// Serve authenticated, bounded MCP over a local loopback HTTP listener
+    Http {
+        /// Version 1 TOML containing dataset, listener, issuer, keys and subjects
+        #[arg(long, value_name = "FILE")]
+        config: std::path::PathBuf,
+    },
 }
 pub fn run(action: Action) {
-    #[cfg(feature = "mcp")]
     let result = match action {
-        Action::Stdio { config } => selected::run(&config),
-    };
-    #[cfg(not(feature = "mcp"))]
-    let result: Result<(), String> = {
-        let _ = action;
-        Err("MCP support is not installed; rebuild rusty-haystack-cli with --features mcp".into())
+        Action::Stdio { config } => {
+            #[cfg(feature = "mcp")]
+            {
+                selected::run(&config)
+            }
+            #[cfg(not(feature = "mcp"))]
+            {
+                let _ = config;
+                Err::<(), String>(
+                    "MCP support is not installed; rebuild rusty-haystack-cli with --features mcp"
+                        .into(),
+                )
+            }
+        }
+        Action::Http { config } => {
+            #[cfg(feature = "mcp-http")]
+            {
+                http::run(&config)
+            }
+            #[cfg(not(feature = "mcp-http"))]
+            {
+                let _ = config;
+                Err::<(),String>("MCP HTTP support is not installed; rebuild rusty-haystack-cli with --features mcp-http".into())
+            }
+        }
     };
     if let Err(error) = result {
         eprintln!("MCP error: {error}");
@@ -23,22 +47,22 @@ pub fn run(action: Action) {
     }
 }
 
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-http")]
+mod http;
+
+#[cfg(any(feature = "mcp", feature = "mcp-http"))]
 mod selected {
     use haystack_app::*;
-    use haystack_core::{
-        graph::{EntityGraph, SharedGraph},
-        kinds::NominalScalar,
-    };
+    #[cfg(feature = "mcp")]
+    use haystack_core::graph::SharedGraph;
+    use haystack_core::{graph::EntityGraph, kinds::NominalScalar};
+    #[cfg(feature = "mcp")]
     use serde::Deserialize;
-    use std::{
-        collections::BTreeSet,
-        io::Read,
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
-    };
+    use std::{collections::BTreeSet, io::Read, path::Path, sync::Arc};
 
+    #[cfg(feature = "mcp")]
+    use std::{path::PathBuf, time::Duration};
+    #[cfg(feature = "mcp")]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Config {
@@ -54,17 +78,19 @@ mod selected {
         #[serde(default = "response_bytes")]
         max_response_bytes: usize,
     }
+    #[cfg(feature = "mcp")]
     fn timeout() -> u64 {
         10_000
     }
+    #[cfg(feature = "mcp")]
     fn response_bytes() -> usize {
         1024 * 1024
     }
     #[derive(Clone)]
-    struct Scope {
-        principal: Principal,
-        ids: BTreeSet<String>,
-        hidden: BTreeSet<String>,
+    pub(super) struct Scope {
+        pub(super) principal: Principal,
+        pub(super) ids: BTreeSet<String>,
+        pub(super) hidden: BTreeSet<String>,
     }
     impl ReadPolicy for Scope {
         fn snapshot(&self, principal: &Principal) -> Result<Arc<dyn PolicySnapshot>, ReadError> {
@@ -103,7 +129,7 @@ mod selected {
             false
         }
     }
-    fn bounded(path: &Path, max: usize) -> Result<String, String> {
+    pub(super) fn bounded(path: &Path, max: usize) -> Result<String, String> {
         if !std::fs::metadata(path)
             .map_err(|_| "configuration or dataset is unreadable")?
             .is_file()
@@ -138,6 +164,7 @@ mod selected {
         }
         String::from_utf8(bytes).map_err(|_| "configuration or dataset is not UTF-8".into())
     }
+    #[cfg(feature = "mcp")]
     pub fn run(path: &Path) -> Result<(), String> {
         let config: Config =
             toml::from_str(&bounded(path, 65_536)?).map_err(|_| "invalid MCP configuration")?;
@@ -160,43 +187,7 @@ mod selected {
         {
             return Err("invalid MCP configuration".into());
         }
-        let mime = match config.dataset_format.as_str() {
-            "zinc" => "text/zinc",
-            "trio" => "text/trio",
-            "json" => "application/json",
-            _ => return Err("unsupported MCP dataset format".into()),
-        };
-        let file = if config.dataset_file.is_absolute() {
-            config.dataset_file.clone()
-        } else {
-            path.parent()
-                .unwrap_or(Path::new("."))
-                .join(&config.dataset_file)
-        };
-        let content = bounded(&file, 4 * 1024 * 1024)?;
-        // Conservative pre-parser container bound also counts delimiters in
-        // strings. A launch file can choose a different spelling if necessary.
-        let mut depth = 0usize;
-        for byte in content.bytes() {
-            match byte {
-                b'[' | b'{' | b'<' => {
-                    depth += 1;
-                    if depth > 64 {
-                        return Err("dataset nesting exceeds its limit".into());
-                    }
-                }
-                b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        let grid = haystack_core::codecs::codec_for(mime)
-            .expect("selected codec")
-            .decode_grid(&content)
-            .map_err(|_| "invalid MCP dataset")?;
-        if grid.rows.len() > 10_000 {
-            return Err("dataset row count exceeds its limit".into());
-        }
-        let graph = EntityGraph::from_grid(&grid, None).map_err(|_| "invalid MCP entity graph")?;
+        let graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
         let principal = Principal::TrustedEmbedding {
             subject: config.principal,
         };
@@ -223,7 +214,49 @@ mod selected {
         drop(runtime);
         result
     }
-    #[cfg(unix)]
+    pub(super) fn load_graph(
+        path: &Path,
+        dataset_file: &Path,
+        dataset_format: &str,
+    ) -> Result<EntityGraph, String> {
+        let mime = match dataset_format {
+            "zinc" => "text/zinc",
+            "trio" => "text/trio",
+            "json" => "application/json",
+            _ => return Err("unsupported MCP dataset format".into()),
+        };
+        let file = if dataset_file.is_absolute() {
+            dataset_file.to_path_buf()
+        } else {
+            path.parent().unwrap_or(Path::new(".")).join(dataset_file)
+        };
+        let content = bounded(&file, 4 * 1024 * 1024)?;
+        // Conservative pre-parser container bound also counts delimiters in
+        // strings. A launch file can choose a different spelling if necessary.
+        let mut depth = 0usize;
+        for byte in content.bytes() {
+            match byte {
+                b'[' | b'{' | b'<' => {
+                    depth += 1;
+                    if depth > 64 {
+                        return Err("dataset nesting exceeds its limit".into());
+                    }
+                }
+                b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let grid = haystack_core::codecs::codec_for(mime)
+            .expect("selected codec")
+            .decode_grid(&content)
+            .map_err(|_| "invalid MCP dataset")?;
+        if grid.rows.len() > 10_000 {
+            return Err("dataset row count exceeds its limit".into());
+        }
+        let graph = EntityGraph::from_grid(&grid, None).map_err(|_| "invalid MCP entity graph")?;
+        Ok(graph)
+    }
+    #[cfg(all(feature = "mcp", unix))]
     async fn session(
         builder: ApplicationBuilder,
         principal: Principal,
@@ -282,7 +315,7 @@ mod selected {
         eprintln!("MCP session terminated; all admitted work released");
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(all(feature = "mcp", not(unix)))]
     async fn session(
         _: ApplicationBuilder,
         _: Principal,

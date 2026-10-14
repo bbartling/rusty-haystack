@@ -19,11 +19,13 @@ path = "src/main.rs"
 [features]
 default = []
 postgres = ["haystack-app/postgres"]
-mcp = ["dep:haystack-mcp", "dep:libc"]
+mcp = ["dep:haystack-mcp", "haystack-mcp/stdio", "dep:libc"]
+mcp-http = ["dep:haystack-mcp", "haystack-mcp/http", "dep:libc", "dep:base64"]
 
 [dependencies]
 haystack-app.workspace = true
-haystack-mcp = { workspace = true, features = ["stdio"], optional = true }
+haystack-mcp = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 haystack-core.workspace = true
 haystack-server.workspace = true
 haystack-client.workspace = true
