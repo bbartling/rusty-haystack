@@ -183,14 +183,17 @@ occur, the original body exception propagates, with a cleanup note when possible
 
 Dropping the Python owner requests cleanup without blocking or making Python
 callbacks; it does not prove graceful completion. The process-wide asyncio bridge
-and legacy synchronous runtimes have separate lifetimes. Successful read conversion
-uses guarded Python attachment, and late bridge notification is skipped if Python
-cannot be attached. An isolated native subprocess test covers a completed read
-result before Python initialization, plus conversion after initialization; it does
-not finalize a live test interpreter or prove every finalization race safe. Selected
-host subprocess tests cover exit with unfinished work, but only awaited successful
-close is the native teardown receipt. The synchronous `HaystackClient` and
-`WsClient` remain blocking APIs with their existing ownership behavior.
+and legacy synchronous runtimes have separate lifetimes. Read conversion and result
+notification reserve Python attachment admission before waiting for the GIL.
+A private normal-exit hook seals admission and releases the GIL while admitted
+callbacks finish; later jobs cannot attach. Notifications whose owning event loop
+has already closed are discarded. This does not join every native operation or
+shut down the shared runtime. Abrupt/fatal exit, an unregistered exit hook,
+subinterpreters and arbitrary callbacks that block forever are outside this
+normal-exit boundary. Selected host subprocess tests cover unfinished work, but
+only awaited successful close is the native teardown receipt. The synchronous
+`HaystackClient` and `WsClient` remain blocking APIs with their existing ownership
+behavior.
 
 TLS uses verified system trust plus optional custom trust and identity. Pass
 `tls=TlsConfig.with_ca(ca_pem_bytes)` for an additional CA, or
@@ -312,7 +315,8 @@ errors keep their Python types. Context exit preserves an original body exceptio
 if cleanup or cleanup-note annotation also fails.
 
 Owner destruction requests native cleanup without blocking or Python callbacks;
-await close/termination for evidence. The existing guarded attachment and best
-effort interpreter-finalization limits still apply. Supervised unfinished exits
+await close/termination for evidence. The shared bridge's normal-exit admission
+and callback-drain boundary, with the limits described above, also applies here.
+Supervised unfinished exits
 and installed consumers qualify the selected macOS arm64/CPython 3.12 environment;
 Python 3.11 is the static typing floor, not an additional runtime qualification.

@@ -215,5 +215,6 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<exceptions::ApplicationError>(),
     )?;
 
+    async_bridge::register_shutdown(m.py())?;
     Ok(())
 }
