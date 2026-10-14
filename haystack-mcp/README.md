@@ -2,8 +2,11 @@
 
 Optional read-only MCP adapter over `haystack-app`. There are no default
 features. Select `stdio` to expose `serve`, `Limits`, `McpError` and `Report`.
-The adapter borrows the managed application/runtime and offers only
+The adapter borrows the managed application/runtime and offers
 `haystack_query` and `haystack_read` using the shared policy, cursors and budgets.
+An explicitly selected history service adds the optional
+[`haystack_history` tool](../docs/mcp-history.md), with finite per-call limits,
+retained-record completeness and joined provider cleanup.
 
 See [the MCP pipe profile](../docs/mcp-stdio.md) for launch configuration, schemas,
 lifecycle guarantees, protocol versions and qualification commands. Standalone

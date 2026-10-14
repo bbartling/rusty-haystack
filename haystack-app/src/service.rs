@@ -3,10 +3,12 @@ mod packages;
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres_snapshot;
 pub use packages::{ApplicationPackageError, PackagePreparationLimits, PreparedPackageAdmission};
+mod history_read;
 mod nav;
 mod system;
 mod typed_command;
 mod typed_history;
+pub use history_read::{HistoryReadOptions, HistoryReadOutput};
 mod typed_watch;
 use crate::{
     budget::Budget,

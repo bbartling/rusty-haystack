@@ -30,6 +30,15 @@ and admission capacity until an in-flight provider future and session cleanup
 actually finish. A public shutdown timeout is not a termination receipt.
 Providers must not detach untracked work from open, pull or close futures.
 
+Finite adapter collection uses `ReadAdmission::history_joined` with
+`HistoryReadOptions` and the exact selected `HistoryService`. It tightens the
+original row/output limits and absolute deadline, retains cumulative accounting,
+and joins provider work on every result and error path before releasing
+admission. Success waits without cancelling the token needed for encoding;
+`HistoryReadSession::close()` continues to mean cancellation plus cleanup.
+The MCP adapter retains its transport lease around this operation even if the
+SDK abandons its handler. See [bounded MCP history](mcp-history.md).
+
 The selected memory provider holds a point handle and cursor and copies only
 admitted batches. Global and per-principal session limits, source-sized batch
 and total row/byte/work budgets, read-service value/retention budgets, and the

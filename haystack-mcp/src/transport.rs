@@ -1,7 +1,7 @@
 use crate::{
     Limits, McpError, OutputProfile, Report,
     common::{depth_ok, encode},
-    handler::{Invocation, Lease, Service},
+    handler::{Invocation, Lease, RequestDeadline, Service},
 };
 use haystack_app::{ApplicationHandle, CancellationToken, Principal, WorkGuard};
 use parking_lot::Mutex;
@@ -29,7 +29,7 @@ use tokio::{
 pub(crate) struct Request {
     pub id: RequestId,
     principal: Principal,
-    pub deadline: Instant,
+    pub deadline: RequestDeadline,
     pub cancellation: CancellationToken,
     _permit: OwnedSemaphorePermit,
     pub work: WorkGuard,
@@ -50,7 +50,14 @@ impl Invocation for Request {
         &self.principal
     }
     fn deadline(&self) -> Instant {
-        self.deadline
+        self.deadline.get()
+    }
+    fn tighten_deadline(&self, deadline: Instant) {
+        if self.deadline.tighten(deadline)
+            && let Some(shared) = self._release.0.upgrade()
+        {
+            shared.changed.notify_waiters();
+        }
     }
     fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
@@ -115,7 +122,7 @@ impl Shared {
         let request = Arc::new(Request {
             id: id.clone(),
             principal: self.principal.clone(),
-            deadline: started + self.limits.request_timeout,
+            deadline: RequestDeadline::new(started + self.limits.request_timeout),
             cancellation: self.stop.child_token(),
             _permit: permit,
             work,
@@ -152,7 +159,7 @@ impl Shared {
             .lock()
             .requests
             .values()
-            .map(|request| request.deadline)
+            .map(|request| request.deadline.get())
             .chain(started.map(|time| time + self.limits.request_timeout))
             .min()
     }
@@ -485,7 +492,7 @@ impl Transport<RoleServer> for BoundedTransport {
         let request = id.and_then(|id| shared.request(id));
         let deadline = request.as_ref().map_or_else(
             || Instant::now() + shared.limits.request_timeout,
-            |request| request.deadline,
+            |request| request.deadline.get(),
         );
         let result = self.outbox.submit(message, request, deadline);
         if let Err(error) = &result
@@ -526,6 +533,11 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     limits.validate(profile)?;
+    if limits.max_response_bytes
+        < profile.selected_min_response_bytes(application.history_service().is_some())
+    {
+        return Err(McpError::Configuration);
+    }
     application
         .ready()
         .await
@@ -646,9 +658,11 @@ mod tests {
     use haystack_core::graph::{EntityGraph, SharedGraph};
 
     #[tokio::test]
-    async fn completed_request_deadline_is_revalidated_after_both_reader_races() {
+    async fn changed_request_deadline_is_revalidated_after_both_reader_races() {
         let mut failures = Vec::new();
-        for after_waiter in [false, true] {
+        for (after_waiter, tightened) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let owner = ApplicationBuilder::new(
                 SharedGraph::new(EntityGraph::new()),
                 Arc::new(AllowAll),
@@ -666,7 +680,7 @@ mod tests {
                     subject: "deadline-fixture".into(),
                 },
                 limits: Limits {
-                    request_timeout: Duration::from_millis(100),
+                    request_timeout: Duration::from_millis(if tightened { 3000 } else { 100 }),
                     ..Limits::default()
                 },
                 profile: OutputProfile::H4,
@@ -702,17 +716,28 @@ mod tests {
                 cancelled.clone(),
             ));
             let captured_deadline = snapshot.await.unwrap().unwrap();
-            shared.finish(&request);
+            if tightened {
+                request.tighten_deadline(Instant::now());
+                request.tighten_deadline(captured_deadline + Duration::from_secs(5));
+            } else {
+                shared.finish(&request);
+            }
             drop(request);
-            if after_waiter {
+            if after_waiter && !tightened {
                 // Both the completion notification and the old timer are ready.
                 tokio::time::sleep_until((captured_deadline + Duration::from_millis(20)).into())
                     .await;
             }
             resume.send(()).unwrap();
-            tokio::time::sleep_until((captured_deadline + Duration::from_millis(40)).into()).await;
-            let unexpectedly_closed = shared.stop.is_cancelled();
-            if !unexpectedly_closed {
+            if tightened {
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(100), shared.stop.cancelled()).await;
+            } else {
+                tokio::time::sleep_until((captured_deadline + Duration::from_millis(40)).into())
+                    .await;
+            }
+            let closed = shared.stop.is_cancelled();
+            if !closed && !tightened {
                 peer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
                     .await
                     .unwrap();
@@ -729,13 +754,13 @@ mod tests {
             assert_eq!(owner.handle().outstanding_tasks(), 0);
             owner.close().await.unwrap();
             assert!(owner.terminated().await.cleanup_errors.is_empty());
-            if unexpectedly_closed {
-                failures.push(after_waiter);
+            if closed != tightened {
+                failures.push((after_waiter, tightened));
             }
         }
         assert!(
             failures.is_empty(),
-            "completed requests triggered stale deadlines (after_waiter): {failures:?}"
+            "deadline changes were missed or stale deadlines fired (after_waiter, tightened): {failures:?}"
         );
     }
 }

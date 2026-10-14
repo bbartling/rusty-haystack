@@ -64,6 +64,329 @@ fn service(
     .unwrap()
 }
 
+fn joined_options(max_rows: usize) -> HistoryReadOptions {
+    HistoryReadOptions {
+        max_rows,
+        max_output_bytes: (2 * 1024 * 1024 - 2048) / 8,
+        deadline: std::time::Instant::now() + Duration::from_secs(5),
+    }
+}
+
+#[tokio::test]
+async fn joined_history_preserves_profile_values_partial_status_and_effective_bounds() {
+    use haystack_core::codecs::{codec_for, history, jeto};
+    for profile in [OutputProfile::H4(H4Codec::Json), OutputProfile::Jeto] {
+        let graph = graph("Number", "New_York");
+        let store = Arc::new(HisStore::new());
+        let values = [
+            (
+                "2024-11-03T01:30:00.123456789-04:00",
+                Kind::Number(Number::new(-0.0, Some("°C".into()))),
+            ),
+            ("2024-11-03T01:30:00.123456789-05:00", Kind::NA),
+            ("2024-11-03T01:30:01-05:00", number(7.25)),
+        ]
+        .into_iter()
+        .map(|(ts, val)| HisItem { ts: time(ts), val })
+        .collect();
+        store.write("p", values).unwrap();
+        let service = service(
+            store,
+            graph.clone(),
+            HistoryLimits {
+                batch_rows: 1,
+                ..HistoryLimits::default()
+            },
+        );
+        let request = HistoryService::finite_request(
+            "p".into(),
+            "2024-11-03T05:30:00Z UTC",
+            "2024-11-03T06:30:01Z UTC",
+        )
+        .unwrap();
+        for max_rows in [1, 20] {
+            let cancel = CancellationToken::new();
+            let admission = service
+                .read_service()
+                .begin(ReadContext::new(
+                    Principal::Anonymous,
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    cancel.clone(),
+                ))
+                .await
+                .unwrap();
+            let response = admission
+                .history_joined(
+                    service.clone(),
+                    request.clone(),
+                    joined_options(max_rows),
+                    profile,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !cancel.is_cancelled(),
+                "successful join must preserve the encoding/delivery token"
+            );
+            assert_eq!(service.active_sessions(), 0);
+            assert_eq!(service.read_service().load().admitted, 0);
+            let decoded = match response.output {
+                ReadOutput::H4 { body, codec } => {
+                    history::decode_result(&body, codec_for(codec.mime()).unwrap()).unwrap()
+                }
+                ReadOutput::Jeto { body, provenance } => {
+                    let observation = graph.read(|g| g.activated_catalog().unwrap().clone());
+                    let context = &observation.callable("sys.api::readById").unwrap().context;
+                    assert_eq!(provenance.revision, context.revision());
+                    let Kind::Grid(grid) =
+                        jeto::decode(&body, context, Some("sys::Grid"), jeto::Limits::default())
+                            .unwrap()
+                    else {
+                        panic!()
+                    };
+                    history::result_from_grid(&grid).unwrap()
+                }
+                _ => panic!(),
+            };
+            history::validate_for_request(&decoded, &request).unwrap();
+            assert_eq!(decoded.samples.len(), if max_rows == 1 { 1 } else { 2 });
+            assert_eq!(decoded.samples[0].ts.dt.timestamp_subsec_nanos(), 123456789);
+            assert_eq!(
+                decoded.samples[0].ts.dt.offset().local_minus_utc(),
+                -4 * 3600
+            );
+            let Kind::Number(value) = &decoded.samples[0].val else {
+                panic!()
+            };
+            assert_eq!(value.val.to_bits(), (-0.0f64).to_bits());
+            assert_eq!(value.unit.as_deref(), Some("°C"));
+            if max_rows > 1 {
+                assert_eq!(
+                    decoded.samples[1].ts.dt.offset().local_minus_utc(),
+                    -5 * 3600
+                );
+                assert_eq!(decoded.samples[1].val, Kind::NA);
+            }
+            assert_eq!(decoded.metadata.bounds.total_rows, max_rows as u64);
+            assert_eq!(
+                decoded.metadata.bounds.response_bytes,
+                joined_options(max_rows).max_output_bytes as u64
+            );
+            assert!(!decoded.metadata.capabilities.native_values);
+            assert!(!decoded.metadata.capabilities.snapshots);
+            assert_eq!(
+                response.terminal,
+                if max_rows == 1 {
+                    HistoryTerminal::Limited(HistoryReason::Rows)
+                } else {
+                    HistoryTerminal::Complete
+                }
+            );
+            assert_eq!(decoded.terminal, response.terminal);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum JoinStage {
+    Open,
+    Pull,
+    Close,
+}
+struct JoinProbe {
+    store: HisStore,
+    stage: JoinStage,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    opens: AtomicUsize,
+    pulls: AtomicUsize,
+    closes: AtomicUsize,
+    closed: AtomicUsize,
+}
+impl JoinProbe {
+    async fn gate(&self, stage: JoinStage) {
+        if self.stage == stage {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+    }
+    async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+}
+struct JoinProvider(Arc<JoinProbe>);
+struct JoinSession {
+    inner: Box<dyn HistorySession>,
+    probe: Arc<JoinProbe>,
+}
+impl HistoryProvider for JoinProvider {
+    fn open(
+        &self,
+        id: String,
+        start: DateTime<FixedOffset>,
+        end: DateTime<FixedOffset>,
+        budget: HistoryPullBudget,
+    ) -> HistoryFuture<'_, Box<dyn HistorySession>> {
+        Box::pin(async move {
+            let inner = self.0.store.open(id, start, end, budget).await?;
+            self.0.opens.fetch_add(1, Ordering::SeqCst);
+            self.0.gate(JoinStage::Open).await;
+            Ok(Box::new(JoinSession {
+                inner,
+                probe: self.0.clone(),
+            }) as Box<dyn HistorySession>)
+        })
+    }
+}
+impl HistorySession for JoinSession {
+    fn metadata(&self) -> &ProviderHistoryMetadata {
+        self.inner.metadata()
+    }
+    fn pull(&mut self, budget: HistoryPullBudget) -> HistoryFuture<'_, ProviderHistoryBatch> {
+        Box::pin(async move {
+            self.probe.pulls.fetch_add(1, Ordering::SeqCst);
+            self.probe.gate(JoinStage::Pull).await;
+            self.inner.pull(budget).await
+        })
+    }
+    fn close(&mut self) -> HistoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.probe.closes.fetch_add(1, Ordering::SeqCst);
+            self.probe.gate(JoinStage::Close).await;
+            let result = self.inner.close().await;
+            self.probe.closed.fetch_add(1, Ordering::SeqCst);
+            result
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_history_waits_for_actual_open_pull_and_close_after_each_stop() {
+    for stage in [JoinStage::Open, JoinStage::Pull, JoinStage::Close] {
+        for stop in ["cancel", "deadline", "owner"] {
+            let store = HisStore::new();
+            store.write("p", vec![item(0, number(1.25))]).unwrap();
+            let probe = Arc::new(JoinProbe {
+                store,
+                stage,
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+                opens: AtomicUsize::new(0),
+                pulls: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+                closed: AtomicUsize::new(0),
+            });
+            let builder = ApplicationBuilder::new(
+                graph("Number", "UTC"),
+                Arc::new(AllowAll),
+                ReadLimits {
+                    max_concurrent: 1,
+                    ..ReadLimits::default()
+                },
+            )
+            .unwrap()
+            .shutdown_policy(ShutdownPolicy {
+                drain_timeout: Duration::ZERO,
+                stop_timeout: Duration::from_secs(2),
+            });
+            let reads = builder.handle().read_service();
+            let history = HistoryService::new(
+                reads.clone(),
+                Arc::new(JoinProvider(probe.clone())),
+                HistoryLimits::default(),
+            )
+            .unwrap();
+            let owner = builder
+                .owned_history(history.clone())
+                .unwrap()
+                .start(&tokio::runtime::Handle::current())
+                .unwrap();
+            owner.ready().await.unwrap();
+            let cancel = CancellationToken::new();
+            let deadline = std::time::Instant::now()
+                + Duration::from_millis(if stop == "deadline" { 80 } else { 2000 });
+            let admission = reads
+                .begin(ReadContext::new(
+                    Principal::Anonymous,
+                    // The per-call deadline must tighten a longer original
+                    // admission, including while normal provider close waits.
+                    std::time::Instant::now() + Duration::from_secs(2),
+                    cancel.clone(),
+                ))
+                .await
+                .unwrap();
+            let mut options = joined_options(10);
+            options.deadline = deadline;
+            let provider_cancel = admission.cancellation();
+            let read_history = history.clone();
+            let task = tokio::spawn(async move {
+                admission
+                    .history_joined(read_history, request(), options, OutputProfile::Jeto)
+                    .await
+            });
+            probe.wait().await;
+            match stop {
+                "cancel" => cancel.cancel(),
+                "owner" => owner.request_close(),
+                _ => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+            }
+            // A real provider gate, not a slow sleep, is still closed. Give the
+            // coordinator time to publish a terminal/error and expose a false join.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if stop == "deadline" {
+                assert!(
+                    provider_cancel.is_cancelled(),
+                    "{stage:?}: tightened deadline did not signal provider cleanup"
+                );
+            }
+            assert!(
+                !task.is_finished(),
+                "{stage:?}/{stop}: a terminal was mistaken for completion"
+            );
+            assert_eq!(reads.load().admitted, 1, "{stage:?}/{stop}");
+            assert_eq!(history.active_sessions(), 1);
+            assert_eq!(probe.closed.load(Ordering::SeqCst), 0);
+            assert!(!owner.handle().is_terminated());
+            probe.release.add_permits(1);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(probe.closes.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.closed.load(Ordering::SeqCst), 1);
+            assert_eq!(history.active_sessions(), 0);
+            assert_eq!(reads.load().admitted, 0);
+            owner.close().await.unwrap();
+            assert!(owner.terminated().await.cleanup_errors.is_empty());
+        }
+    }
+}
+
+#[test]
+fn finite_history_request_rejects_shorthand_and_preserves_zero_width() {
+    let dt = "2024-06-01T00:00:00Z UTC";
+    assert!(HistoryService::finite_request("p".into(), dt, dt).is_ok());
+    for start in [
+        "today",
+        "2024-06-01",
+        "",
+        "2024-06-02T00:00:00Z UTC",
+        "2024-06-01T00:00:00Z New_York",
+    ] {
+        assert!(
+            HistoryService::finite_request("p".into(), start, dt).is_err(),
+            "{start}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn requested_batches_are_bounded_and_generation_is_per_point() {
     let store = Arc::new(HisStore::new());

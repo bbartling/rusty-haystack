@@ -1,4 +1,5 @@
 #![cfg(feature = "http")]
+mod history_support;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use haystack_app::*;
 use haystack_core::{
@@ -281,6 +282,7 @@ async fn legal_media_negotiation_reaches_sdk_without_losing_header_semantics() {
     assert_eq!(fixture.close().await.admitted, 4);
 }
 struct Gate {
+    history: AtomicBool,
     blocked: AtomicBool,
     entered: AtomicUsize,
     epoch: AtomicUsize,
@@ -295,6 +297,7 @@ impl Drop for Unblock {
 impl Gate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            history: AtomicBool::new(false),
             blocked: AtomicBool::new(false),
             entered: AtomicUsize::new(0),
             epoch: AtomicUsize::new(0),
@@ -351,6 +354,7 @@ impl PolicySnapshot for Scope {
     }
     fn operation(&self, operation: ReadOperation) -> bool {
         operation == ReadOperation::Read
+            || (operation == ReadOperation::History && self.gate.history.load(Ordering::SeqCst))
     }
     fn entity(&self, id: &str) -> bool {
         self.gate.evaluated.fetch_add(1, Ordering::SeqCst);
@@ -382,6 +386,12 @@ struct Fixture {
 }
 impl Fixture {
     async fn start(configure: impl FnOnce(&mut HttpConfig)) -> Self {
+        Self::start_selected(configure, None).await
+    }
+    async fn start_selected(
+        configure: impl FnOnce(&mut HttpConfig),
+        history: Option<Arc<history_support::Probe>>,
+    ) -> Self {
         let graph = SharedGraph::new(EntityGraph::new());
         for id in ["a", "b", "denied"] {
             let mut row = HDict::new();
@@ -392,11 +402,38 @@ impl Fixture {
             graph.add(row).unwrap();
         }
         let gate = Gate::new();
-        let owner =
-            ApplicationBuilder::new(graph, Arc::new(Policy(gate.clone())), ReadLimits::default())
+        let builder = ApplicationBuilder::new(
+            graph.clone(),
+            Arc::new(Policy(gate.clone())),
+            ReadLimits::default(),
+        )
+        .unwrap();
+        let builder = if let Some(provider) = history {
+            gate.history.store(true, Ordering::SeqCst);
+            let points = provider.graph.clone();
+            for id in ["a", "b", "denied"] {
+                graph.update(id, points.get(id).unwrap()).unwrap();
+            }
+            let service = HistoryService::new(
+                builder.handle().read_service(),
+                provider,
+                HistoryLimits {
+                    batch_rows: 1,
+                    ..HistoryLimits::default()
+                },
+            )
+            .unwrap();
+            builder
+                .owned_history(service)
                 .unwrap()
-                .start(&tokio::runtime::Handle::current())
-                .unwrap();
+                .shutdown_policy(ShutdownPolicy {
+                    drain_timeout: Duration::ZERO,
+                    stop_timeout: Duration::from_secs(2),
+                })
+        } else {
+            builder
+        };
+        let owner = builder.start(&tokio::runtime::Handle::current()).unwrap();
         owner.ready().await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -453,7 +490,9 @@ impl Fixture {
                 },
             )
             .await;
-        if self.gate.epoch.load(Ordering::SeqCst) == 99 {
+        if self.owner.state() != ApplicationState::Running {
+            assert!(matches!(read, Err(ReadError::Closed)));
+        } else if self.gate.epoch.load(Ordering::SeqCst) == 99 {
             assert!(matches!(read, Err(ReadError::Forbidden)));
         } else {
             assert!(
@@ -857,6 +896,233 @@ async fn wait_for(mut predicate: impl FnMut() -> bool) {
     .await
     .expect("fixture state never reached");
 }
+#[tokio::test]
+async fn history_http_profiles_discovery_floor_scopes_and_partial_results() {
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        let probe = history_support::Probe::new(None);
+        let fixture = Fixture::start_selected(
+            |config| {
+                config.output_profile = profile;
+                config.limits.max_response_bytes = haystack_mcp::HISTORY_RESPONSE_BYTES;
+            },
+            Some(probe.clone()),
+        )
+        .await;
+        let mut discovery = request("tools/list", json!({}));
+        discovery["id"] = json!("\u{1}".repeat(128));
+        let listed = fixture.post(discovery).await;
+        assert_eq!(listed.status, 200);
+        assert_eq!(
+            listed.json()["result"]["tools"].as_array().unwrap().len(),
+            3
+        );
+        let args = history_support::args(profile);
+        let call = |args| {
+            request(
+                "tools/call",
+                json!({"name":"haystack_history","arguments":args}),
+            )
+        };
+        let full =
+            history_support::decoded(&fixture.post(call(args.clone())).await.json(), profile);
+        assert_eq!(full.samples.len(), 3);
+        assert_eq!(full.terminal, HistoryTerminal::Complete);
+        assert_eq!(full.samples[1].val, Kind::NA);
+        let mut limited = args.clone();
+        limited["max_rows"] = json!(1);
+        let limited = history_support::decoded(&fixture.post(call(limited)).await.json(), profile);
+        assert_eq!(limited.samples.len(), 1);
+        assert_eq!(
+            limited.terminal,
+            HistoryTerminal::Limited(HistoryReason::Rows)
+        );
+        let mut empty = args.clone();
+        empty["end"] = empty["start"].clone();
+        let empty = history_support::decoded(&fixture.post(call(empty)).await.json(), profile);
+        assert!(empty.samples.is_empty());
+        assert_eq!(empty.terminal, HistoryTerminal::Complete);
+        let opens = probe.opens();
+        for id in ["denied", "missing"] {
+            let mut denied = args.clone();
+            denied["id"] = json!(id);
+            assert_eq!(
+                fixture.post(call(denied)).await.json()["result"]["structuredContent"]["error"]["code"],
+                "unavailable"
+            );
+        }
+        let mut bob = claims(fixture.verifier.resource());
+        bob["sub"] = json!("bob");
+        let crossed = fixture
+            .raw(
+                "POST",
+                "/mcp",
+                &token(&bob),
+                &call(args.clone()).to_string(),
+                &[],
+                &[],
+            )
+            .await;
+        assert_eq!(
+            crossed.json()["result"]["structuredContent"]["error"]["code"],
+            "unavailable"
+        );
+        fixture.gate.history.store(false, Ordering::SeqCst);
+        assert_eq!(
+            fixture.post(call(args.clone())).await.json()["result"]["structuredContent"]["error"]["code"],
+            "forbidden"
+        );
+        fixture.gate.history.store(true, Ordering::SeqCst);
+        let mut tiny = args.clone();
+        tiny["max_bytes"] = json!(1);
+        assert_eq!(
+            fixture.post(call(tiny)).await.json()["result"]["structuredContent"]["error"]["code"],
+            "budget"
+        );
+        let mut invalid = args.clone();
+        invalid["start"] = json!("yesterday");
+        assert_eq!(
+            fixture.post(call(invalid)).await.json()["error"]["code"],
+            -32602
+        );
+        assert_eq!(probe.opens(), opens);
+        probe.fail_after(probe.pulls() + 1);
+        let failed = history_support::decoded(&fixture.post(call(args)).await.json(), profile);
+        assert_eq!(failed.samples.len(), 1);
+        assert_eq!(
+            failed.terminal,
+            HistoryTerminal::Failed(HistoryReason::Provider)
+        );
+        fixture.close().await;
+        assert_eq!(probe.opens(), probe.closes());
+        assert_eq!(probe.closes(), probe.closed());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_http_disconnect_deadline_and_owner_stop_join_every_provider_stage() {
+    use history_support::Stage;
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        for stage in [Stage::Open, Stage::Pull, Stage::Close] {
+            for event in ["disconnect", "deadline", "owner"] {
+                let probe = history_support::Probe::new(Some(stage));
+                let fixture = Fixture::start_selected(
+                    |config| {
+                        config.output_profile = profile;
+                        config.limits.max_response_bytes = haystack_mcp::HISTORY_RESPONSE_BYTES;
+                        config.limits.max_in_flight = 1;
+                        config.limits.request_timeout =
+                            Duration::from_millis(if event == "deadline" { 150 } else { 3000 });
+                    },
+                    Some(probe.clone()),
+                )
+                .await;
+                let mut peer = TcpStream::connect(fixture.address).await.unwrap();
+                let body = request(
+                    "tools/call",
+                    json!({"name":"haystack_history","arguments":history_support::args(profile)}),
+                )
+                .to_string();
+                peer.write_all(&wire(
+                    fixture.address,
+                    "POST",
+                    "/mcp",
+                    &fixture.token(),
+                    &body,
+                    &[],
+                    &[],
+                ))
+                .await
+                .unwrap();
+                probe.wait().await;
+                assert_eq!(
+                    fixture.post(request("tools/list", json!({}))).await.status,
+                    503
+                );
+                if event == "owner" {
+                    fixture.owner.request_close();
+                }
+                if event == "deadline" {
+                    tokio::time::sleep(Duration::from_millis(180)).await;
+                }
+                drop(peer);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert_eq!(
+                    fixture.owner.handle().read_service().load().admitted,
+                    1,
+                    "{profile:?}/{stage:?}/{event}"
+                );
+                assert_eq!(
+                    fixture
+                        .owner
+                        .handle()
+                        .history_service()
+                        .unwrap()
+                        .active_sessions(),
+                    1
+                );
+                assert_eq!(probe.closed(), 0);
+                assert!(!fixture.task.is_finished());
+                probe.release();
+                wait_for(|| fixture.owner.handle().read_service().load().admitted == 0).await;
+                assert_eq!(probe.closes(), 1);
+                assert_eq!(probe.closed(), 1);
+                assert_eq!(
+                    fixture
+                        .owner
+                        .handle()
+                        .history_service()
+                        .unwrap()
+                        .active_sessions(),
+                    0
+                );
+                fixture.close().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_http_policy_change_withholds_previously_collected_samples() {
+    let probe = history_support::Probe::new(Some(history_support::Stage::Pull));
+    probe.gate_after(1);
+    let fixture = Fixture::start_selected(
+        |config| {
+            config.output_profile = haystack_mcp::OutputProfile::Jeto;
+            config.limits.max_response_bytes = haystack_mcp::HISTORY_RESPONSE_BYTES;
+        },
+        Some(probe.clone()),
+    )
+    .await;
+    let mut peer = TcpStream::connect(fixture.address).await.unwrap();
+    let body = request("tools/call", json!({"name":"haystack_history","arguments":history_support::args(haystack_mcp::OutputProfile::Jeto)})).to_string();
+    peer.write_all(&wire(
+        fixture.address,
+        "POST",
+        "/mcp",
+        &fixture.token(),
+        &body,
+        &[],
+        &[],
+    ))
+    .await
+    .unwrap();
+    probe.wait().await;
+    fixture.gate.epoch.store(1, Ordering::SeqCst);
+    probe.release();
+    let result = read_reply(&mut peer).await.json();
+    assert_eq!(
+        result["result"]["structuredContent"]["error"]["code"],
+        "unavailable"
+    );
+    assert!(result["result"]["structuredContent"].get("grid").is_none());
+    fixture.close().await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_deadline_and_stop_retain_real_worker_until_joined() {
     for event in ["disconnect", "deadline", "stop"] {
@@ -1227,6 +1493,116 @@ async fn blocked_socket_delivery_keeps_native_lease_until_deadline_or_stop() {
             remainder.len() < 1_900_000,
             "response unexpectedly completed through undrained socket"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_http_slow_consumer_retains_transport_work_after_actual_provider_close() {
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        for event in ["deadline", "stop"] {
+            let probe = history_support::Probe::new(None);
+            let fixture = Fixture::start_selected(
+                |config| {
+                    config.output_profile = profile;
+                    config.limits.max_response_bytes = 16 * 1024 * 1024;
+                    config.limits.request_timeout = Duration::from_secs(3);
+                },
+                Some(probe.clone()),
+            )
+            .await;
+            let graph = fixture
+                .owner
+                .handle()
+                .read_service()
+                .native_graph()
+                .unwrap();
+            let mut point = graph.get("a").unwrap();
+            point.set("kind", Kind::Str("Str".into()));
+            graph.update("a", point).unwrap();
+            let start = chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z").unwrap();
+            probe
+                .store
+                .write(
+                    "a",
+                    (0..3)
+                        .map(|i| HisItem {
+                            ts: start + chrono::Duration::seconds(i),
+                            val: Kind::Str("\u{1}".repeat(50_000)),
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(1024).unwrap();
+            let mut peer = socket.connect(fixture.address).await.unwrap();
+            let mut arguments = history_support::args(profile);
+            arguments["max_bytes"] = json!(16 * 1024 * 1024);
+            arguments["timeout_ms"] = json!(500);
+            let body = request(
+                "tools/call",
+                json!({"name":"haystack_history","arguments":arguments}),
+            )
+            .to_string();
+            peer.write_all(&wire(
+                fixture.address,
+                "POST",
+                "/mcp",
+                &fixture.token(),
+                &body,
+                &[],
+                &[],
+            ))
+            .await
+            .unwrap();
+            let mut prefix = [0; 32];
+            tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut prefix))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(prefix.starts_with(b"HTTP/1.1 200"));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(probe.closed(), 1);
+            assert_eq!(probe.closes(), 1);
+            // One large sample is admitted; the next pull reaches the
+            // conservative cumulative work allowance and closes normally.
+            assert_eq!(probe.pulls(), 2);
+            assert_eq!(fixture.owner.handle().read_service().load().admitted, 0);
+            assert!(
+                fixture.owner.handle().outstanding_tasks() > 1,
+                "{profile:?}/{event}: socket response did not block"
+            );
+            if event == "stop" {
+                fixture.stop.cancel();
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    wait_for(|| fixture.owner.handle().outstanding_tasks() == 1),
+                )
+                .await
+                .expect("per-call deadline did not tighten native delivery");
+            }
+            let report = fixture.close().await;
+            assert_eq!(report.admitted, 1);
+            assert_eq!(report.released, 1);
+            assert_eq!(report.suppressed, 1);
+            assert_eq!(
+                probe.pulls(),
+                2,
+                "blocked output cannot resume provider collection"
+            );
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), peer.read_to_end(&mut rest))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                rest.len() < 1_900_000,
+                "undrained response unexpectedly completed"
+            );
+        }
     }
 }
 

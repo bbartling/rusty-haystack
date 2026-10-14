@@ -1,7 +1,7 @@
 use crate::{
     AuthError, JwtVerifier, Limits, McpError, Report,
     common::{encode, strict_json},
-    handler::{Invocation, Lease, Tools},
+    handler::{Invocation, Lease, RequestDeadline, Tools},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use haystack_app::{ApplicationHandle, CancellationToken, Principal, WorkGuard};
@@ -108,7 +108,7 @@ struct Shared {
 }
 struct Admitted {
     principal: Principal,
-    deadline: Instant,
+    deadline: Arc<RequestDeadline>,
     cancellation: CancellationToken,
     _permit: OwnedSemaphorePermit,
     work: WorkGuard,
@@ -137,7 +137,10 @@ impl Invocation for Admitted {
         &self.principal
     }
     fn deadline(&self) -> Instant {
-        self.deadline
+        self.deadline.get()
+    }
+    fn tighten_deadline(&self, deadline: Instant) {
+        self.deadline.tighten(deadline);
     }
     fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
@@ -170,6 +173,13 @@ pub async fn serve_http(
     stop: CancellationToken,
 ) -> Result<Report, McpError> {
     config.limits.validate(config.output_profile)?;
+    if config.limits.max_response_bytes
+        < config
+            .output_profile
+            .selected_min_response_bytes(application.history_service().is_some())
+    {
+        return Err(McpError::Configuration);
+    }
     let address = listener.local_addr().map_err(|_| McpError::Io)?;
     if !address.ip().is_loopback()
         || config.resource != format!("http://{address}/mcp")
@@ -245,7 +255,7 @@ pub async fn serve_http(
                 let connection=accepted_connection(
                     socket, deadline,
                     shared.config.max_header_bytes, shared.stop.clone(),
-                    move |deadline| service_fn(move |request| handle(request,request_shared.clone(),sdk.clone(),request_slot.clone(),deadline)),
+                    move |deadline| service_fn(move |request| handle(request,request_shared.clone(),sdk.clone(),request_slot.clone(),deadline.clone())),
                 );
                 tasks.spawn(async move {
                     let _permit=permit;
@@ -296,11 +306,12 @@ fn accepted_connection<F, S>(
     make_service: F,
 ) -> impl Future<Output = bool>
 where
-    F: FnOnce(Instant) -> S,
+    F: FnOnce(Arc<RequestDeadline>) -> S,
     S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>,
 {
     // The deadline was stamped synchronously at accept, before any setup or
     // spawn. Do not restart that budget on the future's first executor poll.
+    let deadline = Arc::new(RequestDeadline::new(deadline));
     let configured = {
         let socket_ref = socket2::SockRef::from(&socket);
         // The OS may round/double these requested kernel buffer bounds.
@@ -312,7 +323,7 @@ where
         if !configured {
             return false;
         }
-        let service = make_service(deadline);
+        let service = make_service(deadline.clone());
         let mut builder = http1::Builder::new();
         builder
             .keep_alive(false)
@@ -323,7 +334,7 @@ where
         tokio::select! {
             biased;
             _ = stop.cancelled() => false,
-            _ = tokio::time::sleep_until(deadline.into()) => false,
+            _ = deadline.elapsed() => false,
             result = connection => result.is_ok(),
         }
     }
@@ -334,12 +345,12 @@ async fn handle(
     shared: Arc<Shared>,
     mut sdk: Sdk,
     slot: Arc<Mutex<Option<Arc<Admitted>>>>,
-    deadline: Instant,
+    deadline: Arc<RequestDeadline>,
 ) -> Result<Response<Body>, Infallible> {
-    let response = handle_inner(request, &shared, &mut sdk, &slot, deadline).await;
+    let response = handle_inner(request, &shared, &mut sdk, &slot, deadline.clone()).await;
     // CPU-bounded decoding/encoding may finish after the timer became ready.
     // Yield to the connection's deadline/stop branch without publishing bytes.
-    if Instant::now() >= deadline || shared.stop.is_cancelled() {
+    if Instant::now() >= deadline.get() || shared.stop.is_cancelled() {
         std::future::pending::<()>().await;
     }
     Ok(response)
@@ -349,7 +360,7 @@ async fn handle_inner(
     shared: &Arc<Shared>,
     sdk: &mut Sdk,
     slot: &Arc<Mutex<Option<Arc<Admitted>>>>,
-    deadline: Instant,
+    deadline: Arc<RequestDeadline>,
 ) -> Response<Body> {
     let headers = request.headers();
     if headers
@@ -530,7 +541,9 @@ async fn handle_inner(
         if decoded.as_deref() != name {
             return rpc(400, -32020, "Header mismatch", id, None);
         }
-        if !matches!(name, Some("haystack_read" | "haystack_query")) {
+        if !matches!(name, Some("haystack_read" | "haystack_query"))
+            && !(name == Some("haystack_history") && shared.application.history_service().is_some())
+        {
             return rpc(400, -32602, "Unknown tool", id, None);
         }
     }

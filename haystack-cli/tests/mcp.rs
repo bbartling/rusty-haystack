@@ -85,6 +85,111 @@ fn discovery_response_floor_rejects_rich_limits_before_dataset_access() {
     }
 }
 
+#[cfg(any(feature = "mcp", feature = "mcp-http"))]
+#[test]
+fn selected_history_launch_rejects_invalid_authority_floors_and_fixtures() {
+    use serde_json::json;
+    for (command, scope, diagnostic) in [
+        #[cfg(feature = "mcp")]
+        (
+            "stdio",
+            "principal = 'fixture'\nentity_ids = ['a']\nhistory_read = true\n",
+            "invalid MCP configuration",
+        ),
+        #[cfg(feature = "mcp-http")]
+        (
+            "http",
+            "listen = '127.0.0.1:0'\nissuer = 'https://issuer.example.test'\nrequired_scope = 'haystack:read'\n[[keys]]\nkid = 'fixture'\nalgorithm = 'RS256'\npublic_key_der_base64 = ''\n[[subjects]]\nsubject = 'fixture'\nentity_ids = ['a']\nhistory_read = true\n",
+            "invalid MCP HTTP configuration",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.toml");
+        let invoke = || {
+            let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
+                .args(["mcp", command, "--config"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(!error.contains("MCP HTTP ready:"));
+            assert!(!error.contains("private-fixture"));
+            error
+        };
+        // Both failures precede attempts to open either configured file.
+        for selection in [
+            "",
+            "history_file = 'private-fixture.json'\nmax_response_bytes = 2097151\n",
+        ] {
+            std::fs::write(&path, format!("version = 1\ndataset_file = 'private-fixture.trio'\ndataset_format = 'trio'\n{selection}{scope}")).unwrap();
+            assert!(invoke().contains(diagnostic));
+        }
+        std::fs::write(
+            directory.path().join("entities.trio"),
+            "id: @a\nhis\nkind: \"Bool\"\ntz: \"UTC\"\n",
+        )
+        .unwrap();
+        std::fs::write(&path, format!("version = 1\ndataset_file = 'entities.trio'\ndataset_format = 'trio'\nhistory_file = 'private-fixture.json'\n{scope}")).unwrap();
+        let row = json!({"id":{"kind":"ref","value":"a","display":null},"ts":{"kind":"dateTime","seconds":"1717200000","nanos":0,"offset":0,"timezone":"UTC"},"val":{"kind":"bool","value":true}});
+        let sample = json!({"version":1,"value":{"kind":"grid","meta":{},"cols":[{"name":"id","meta":{}},{"name":"ts","meta":{}},{"name":"val","meta":{}}],"rows":[row.clone()]}});
+        for change in [
+            "duplicate",
+            "descending",
+            "missing",
+            "display",
+            "null",
+            "int",
+            "timezone",
+            "columns",
+            "extra",
+            "meta",
+        ] {
+            let mut invalid = sample.clone();
+            match change {
+                "duplicate" => invalid["value"]["rows"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(row.clone()),
+                "descending" => {
+                    let mut earlier = row.clone();
+                    earlier["ts"]["seconds"] = json!("1717199999");
+                    invalid["value"]["rows"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(earlier);
+                }
+                "missing" => invalid["value"]["rows"][0]["id"]["value"] = json!("private-fixture"),
+                "display" => {
+                    invalid["value"]["rows"][0]["id"]["display"] = json!("private-fixture")
+                }
+                "null" => invalid["value"]["rows"][0]["val"] = json!({"kind":"null"}),
+                "int" => invalid["value"]["rows"][0]["val"] = json!({"kind":"int","value":"1"}),
+                "timezone" => invalid["value"]["rows"][0]["ts"]["offset"] = json!(3600),
+                "columns" => {
+                    invalid["value"]["cols"].as_array_mut().unwrap().swap(0, 1);
+                }
+                "extra" => {
+                    invalid["value"]["rows"][0]["extra"] = json!({"kind":"bool","value":true})
+                }
+                "meta" => {
+                    invalid["value"]["meta"]["private"] =
+                        json!({"kind":"str","value":"private-fixture"})
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                directory.path().join("private-fixture.json"),
+                invalid.to_string(),
+            )
+            .unwrap();
+            let error = invoke();
+            assert!(error.contains("history"), "{command}/{change}: {error}");
+        }
+    }
+}
+
 #[cfg(all(feature = "mcp", unix))]
 #[test]
 fn rich_launch_accepts_explicit_typed_payload_and_admitted_nominal_scope() {
@@ -130,7 +235,7 @@ fn fifo_config_and_dataset_without_a_writer_fail_promptly() {
         time::{Duration, Instant},
     };
     let mut blocked = Vec::new();
-    for config_fifo in [true, false] {
+    for source in ["config", "dataset", "history"] {
         let directory = tempfile::tempdir().unwrap();
         let fifo = directory.path().join("do-not-echo-this.fifo");
         assert!(
@@ -140,11 +245,21 @@ fn fifo_config_and_dataset_without_a_writer_fail_promptly() {
                 .unwrap()
                 .success()
         );
-        let config = if config_fifo {
+        let config = if source == "config" {
             fifo.clone()
         } else {
             let config = directory.path().join("mcp.toml");
-            std::fs::write(&config,"version = 1\ndataset_file = 'do-not-echo-this.fifo'\ndataset_format = 'trio'\nprincipal = 'fixture'\nentity_ids = ['a']\n").unwrap();
+            let selection = if source == "history" {
+                std::fs::write(
+                    directory.path().join("entities.trio"),
+                    "id: @a\nhis\nkind: \"Bool\"\ntz: \"UTC\"\n",
+                )
+                .unwrap();
+                "dataset_file = 'entities.trio'\nhistory_file = 'do-not-echo-this.fifo'\nhistory_read = true\n"
+            } else {
+                "dataset_file = 'do-not-echo-this.fifo'\n"
+            };
+            std::fs::write(&config,format!("version = 1\n{selection}dataset_format = 'trio'\nprincipal = 'fixture'\nentity_ids = ['a']\n")).unwrap();
             config
         };
         let mut child = Command::new(env!("CARGO_BIN_EXE_haystack"))
@@ -168,7 +283,7 @@ fn fifo_config_and_dataset_without_a_writer_fail_promptly() {
         };
         let output = child.wait_with_output().unwrap();
         if !prompt {
-            blocked.push(config_fifo);
+            blocked.push(source);
             continue;
         }
         assert!(!output.status.success());
@@ -179,7 +294,7 @@ fn fifo_config_and_dataset_without_a_writer_fail_promptly() {
     }
     assert!(
         blocked.is_empty(),
-        "FIFO launch blocked before regular-file validation (config_fifo): {blocked:?}"
+        "FIFO launch blocked before regular-file validation: {blocked:?}"
     );
 }
 

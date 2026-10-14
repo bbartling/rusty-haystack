@@ -23,6 +23,9 @@ pub use http_transport::{HttpConfig, serve_http};
 pub const OUTPUT_PROFILE: &str = "haystack-h4-json-v1";
 /// Exact contextual Jeto, with every scalar boxed and catalog provenance.
 pub const JETO_PROFILE: &str = "haystack-jeto-v1";
+/// Selected history reserves shared 128 KiB encoder headroom plus bounded
+/// parsed/text copies and JSON-RPC framing. Entity-only floors are unchanged.
+pub const HISTORY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Trusted launch choice. A tool call acknowledges this choice and cannot
 /// change its codec, boxing mode or catalog authority.
@@ -49,6 +52,13 @@ impl OutputProfile {
         match self {
             Self::H4 => 8 * 1024,
             Self::Jeto => 16 * 1024,
+        }
+    }
+    pub const fn selected_min_response_bytes(self, history: bool) -> usize {
+        if history {
+            HISTORY_RESPONSE_BYTES
+        } else {
+            self.min_response_bytes()
         }
     }
 
