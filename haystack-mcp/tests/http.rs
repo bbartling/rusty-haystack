@@ -449,7 +449,7 @@ impl Fixture {
                     projection: vec![],
                     page_size: 1,
                     cursor: None,
-                    profile: OutputProfile::H4(H4Codec::Json),
+                    profile: OutputProfile::Typed,
                 },
             )
             .await;
@@ -927,6 +927,14 @@ async fn disconnect_deadline_and_stop_retain_real_worker_until_joined() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn official_sdk_client_uses_modern_http_without_sessions() {
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        sdk_profile(profile).await;
+    }
+}
+async fn sdk_profile(profile: haystack_mcp::OutputProfile) {
     use rmcp::{
         model::{CallToolRequestParams, ClientConfig, ProtocolVersion},
         service::{ClientLifecycleMode, serve_client_with_lifecycle},
@@ -935,7 +943,19 @@ async fn official_sdk_client_uses_modern_http_without_sessions() {
             streamable_http_client::StreamableHttpClientTransportConfig,
         },
     };
-    let fixture = Fixture::start(|_| {}).await;
+    let fixture = Fixture::start(|config| config.output_profile = profile).await;
+    if profile == haystack_mcp::OutputProfile::Jeto {
+        let graph = fixture
+            .owner
+            .handle()
+            .read_service()
+            .native_graph()
+            .unwrap();
+        let mut row = graph.get("a").unwrap();
+        row.set("large", Kind::Int(i64::MIN));
+        row.set("buf", Kind::Buf(vec![0, 255, 251]));
+        graph.update("a", row).unwrap();
+    }
     let transport = StreamableHttpClientTransport::with_client(
         reqwest::Client::new(),
         StreamableHttpClientTransportConfig::with_uri(fixture.verifier.resource().to_owned())
@@ -959,19 +979,68 @@ async fn official_sdk_client_uses_modern_http_without_sessions() {
         );
         assert!(tool.output_schema.is_some());
     }
+    let mut arguments = json!({"ids":["a"]});
+    if profile == haystack_mcp::OutputProfile::Jeto {
+        arguments["profile"] = json!(haystack_mcp::JETO_PROFILE);
+    }
     let result = client
         .call_tool(
             CallToolRequestParams::new("haystack_read")
-                .with_arguments(json!({"ids":["a"]}).as_object().unwrap().clone()),
+                .with_arguments(arguments.as_object().unwrap().clone()),
         )
         .await
         .unwrap();
     let value = result.structured_content.unwrap();
     assert_eq!(value["ok"], true);
     assert_eq!(value["row_count"], 1);
+    if profile == haystack_mcp::OutputProfile::Jeto {
+        assert_eq!(
+            value["grid"]["rows"][0]["large"]["val"],
+            "-9223372036854775808"
+        );
+        assert_eq!(value["grid"]["rows"][0]["buf"]["val"], "AP_7");
+        assert_eq!(
+            value["catalog"]["revision"],
+            "873b922451d3ef4c0c9c08ef3daa542f352d69f3"
+        );
+    }
     client.cancel().await.unwrap();
     let report = fixture.close().await;
     assert_eq!(report.admitted, 3);
+}
+
+#[tokio::test]
+async fn rich_http_acknowledgment_precedes_read_admission() {
+    let fixture =
+        Fixture::start(|config| config.output_profile = haystack_mcp::OutputProfile::Jeto).await;
+    for arguments in [
+        json!({"ids":["a"]}),
+        json!({"ids":["a"],"profile":"haystack-h4-json-v1"}),
+        json!({"ids":["a"],"profile":null}),
+    ] {
+        let reply = fixture
+            .post(request(
+                "tools/call",
+                json!({"name":"haystack_read","arguments":arguments}),
+            ))
+            .await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.json()["error"]["code"], -32602);
+    }
+    assert_eq!(fixture.gate.entered.load(Ordering::SeqCst), 0);
+    let reply = fixture.post(request("tools/call", json!({"name":"haystack_query","arguments":{"filter":"site","profile":haystack_mcp::JETO_PROFILE}}))).await;
+    let response = reply.json();
+    let page = &response["result"]["structuredContent"];
+    assert_eq!(page["ok"], true);
+    assert_eq!(page["row_count"], 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *page
+    );
+    assert!(!page.to_string().contains("NEVER_DISCLOSE"));
+    assert!(!page.to_string().contains("denied"));
+    fixture.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

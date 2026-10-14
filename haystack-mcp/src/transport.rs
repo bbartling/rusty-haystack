@@ -1,5 +1,5 @@
 use crate::{
-    Limits, McpError, Report,
+    Limits, McpError, OutputProfile, Report,
     common::{depth_ok, encode},
     handler::{Invocation, Lease, Service},
 };
@@ -69,6 +69,7 @@ pub(crate) struct Shared {
     pub application: ApplicationHandle,
     pub principal: Principal,
     pub limits: Limits,
+    pub profile: OutputProfile,
     state: Mutex<State>,
     permits: Arc<Semaphore>,
     stop: CancellationToken,
@@ -517,6 +518,7 @@ pub async fn serve<R, W>(
     input: R,
     output: W,
     limits: Limits,
+    profile: OutputProfile,
     cancelled: CancellationToken,
 ) -> Result<Report, McpError>
 where
@@ -542,6 +544,7 @@ where
         #[cfg(test)]
         reader_pause: Mutex::new(None),
         limits,
+        profile,
     });
     let _cancel_on_drop = shared.stop.clone().drop_guard();
     let (sender, receiver) = mpsc::channel(shared.limits.max_pending_responses);
@@ -666,6 +669,7 @@ mod tests {
                     request_timeout: Duration::from_millis(100),
                     ..Limits::default()
                 },
+                profile: OutputProfile::H4,
                 state: Mutex::new(State {
                     requests: HashMap::new(),
                     error: None,

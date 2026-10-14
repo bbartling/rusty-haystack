@@ -73,6 +73,13 @@ errors. Unknown fields fail closed. No ambient credential or dataset lookup is
 performed. Subject scopes are immutable for this CLI lifetime; reload requires a
 new process. Hidden tags and denied references use the shared read policy.
 
+Output defaults to `haystack-h4-json-v1`. To select the
+[rich-value profile](mcp-rich-values.md), set the top-level
+`output_profile = "haystack-jeto-v1"`; any `nominal_specs` allowlist belongs inside
+the appropriate `[[subjects]]` table. Every rich tool call must acknowledge the
+profile. The installed HTTP fixture validates both profiles with independent
+schemas and a decoder for the selected rich values.
+
 ## Token and request authority
 
 The offline verifier selects a configured key by bounded `kid` and verifies an

@@ -277,6 +277,38 @@ def install(directory, features):
     return installation / "bin" / "haystack"
 
 
+def qualify_rich(binary, directory, issuer):
+    import rich
+    directory = directory / "rich-http"
+    directory.mkdir()
+    rich.write_dataset(directory)
+    config = directory / "http.toml"
+    config.write_text('version = 1\ndataset_file = "rich.json"\ndataset_format = "typed-payload-v1"\n'
+                      f'output_profile = "{rich.PROFILE}"\nlisten = "127.0.0.1:0"\nissuer = "{ISSUER}"\nrequired_scope = "{SCOPE}"\n'
+                      '[[keys]]\nkid = "fixture"\nalgorithm = "RS256"\n'
+                      f'public_key_der_base64 = "{issuer.public}"\n[[subjects]]\nsubject = "alice"\n'
+                      f'entity_ids = {json.dumps(rich.IDS)}\nhidden_tags = ["secret"]\nnominal_specs = ["sys::Version"]\n'
+                      '[[subjects]]\nsubject = "bob"\n'
+                      f'entity_ids = {json.dumps(rich.IDS)}\nhidden_tags = ["secret"]\n')
+    with Endpoint(binary, config, issuer) as endpoint:
+        status, _, inventory = endpoint.request(request("tools/list"))
+        require(status == 200, "rich HTTP discovery failed")
+        tools = {tool["name"]: tool for tool in inventory["result"]["tools"]}
+        def call(name, args):
+            status, _, response = endpoint.request(request("tools/call", {"name": name, "arguments": args}))
+            require(status == 200, "rich HTTP call failed")
+            return response
+        rich.qualify(tools, call)
+        bob = issuer.token(endpoint.resource, claims={"sub": "bob"})
+        page = tool_result(endpoint.request(request("tools/call", {"name": "haystack_read", "arguments": {"ids": ["a"], "profile": rich.PROFILE}}), token=bob), tools["haystack_read"]["outputSchema"])
+        require(page["ok"] and "nominal" not in page["grid"]["rows"][0], "HTTP nominal scope crossed subjects")
+        args = {"filter": "site", "page_size": 1, "profile": rich.PROFILE}
+        first = rich.page_result(call("haystack_query", args), tools["haystack_query"]["outputSchema"])
+        crossed = tool_result(endpoint.request(request("tools/call", {"name": "haystack_query", "arguments": {**args, "cursor": first["cursor"]}}), token=bob), tools["haystack_query"]["outputSchema"])
+        require(not crossed["ok"] and crossed["error"]["code"] == "stale_cursor", "rich cursor crossed authenticated callers")
+        endpoint.stop()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="Use an existing binary; this is not fresh-install evidence")
@@ -288,9 +320,11 @@ def main():
         binary = args.binary.resolve() if args.binary else install(directory, args.features)
         issuer = Issuer(directory)
         qualify(binary, directory, issuer)
+        qualify_rich(binary, directory, issuer)
         if args.features == "mcp,mcp-http":
-            from qualify import qualify as qualify_stdio
+            from qualify import qualify as qualify_stdio, qualify_rich as qualify_rich_stdio
             qualify_stdio(binary, directory)
+            qualify_rich_stdio(binary, directory)
     print("PASS fixture processes, sockets, keys and data removed" + ("; fresh temporary installation removed" if not args.binary else ""), flush=True)
 
 

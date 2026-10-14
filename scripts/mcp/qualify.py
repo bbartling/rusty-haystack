@@ -218,6 +218,58 @@ def install(directory):
     return installation / "bin" / "haystack"
 
 
+def qualify_rich(binary, directory):
+    import rich
+    directory = directory / "rich-stdio"
+    directory.mkdir()
+    rich.write_dataset(directory)
+    config = directory / "mcp.toml"
+    config.write_text('version = 1\ndataset_file = "rich.json"\ndataset_format = "typed-payload-v1"\n'
+                      f'output_profile = "{rich.PROFILE}"\nnominal_specs = ["sys::Version"]\n'
+                      f'principal = "fixture-reader"\nentity_ids = {json.dumps(rich.IDS)}\nhidden_tags = ["secret"]\n')
+    with Session(binary, config) as session:
+        session.read_output()
+        session.initialize()
+        session.send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = {tool["name"]: tool for tool in session.receive()["result"]["tools"]}
+        ident = 1
+        def call(name, args):
+            nonlocal ident
+            ident += 1
+            session.send({"jsonrpc": "2.0", "id": ident, "method": "tools/call", "params": {"name": name, "arguments": args}})
+            return session.receive()
+        rich.qualify(tools, call)
+        session.child.stdin.close()
+        session.finish()
+    original = config.read_text()
+    for nominal in ('"unknown::Scalar"', '"sys::Int"', '"sys::Version", "sys::Version"'):
+        config.write_text(original.replace('"sys::Version"', nominal))
+        with Session(binary, config) as session:
+            session.child.stdin.close()
+            session.finish(expected=1)
+            require(not session.child.stdout.read(), "invalid nominal scope wrote protocol data")
+    config.write_text(original.replace(rich.PROFILE, "haystack-h4-json-v1"))
+    with Session(binary, config) as session:
+        session.child.stdin.close()
+        session.finish(expected=1)
+    config.write_text(original.replace(f'output_profile = "{rich.PROFILE}"\nnominal_specs = ["sys::Version"]\n', ''))
+    with Session(binary, config) as session:
+        session.read_output()
+        session.initialize()
+        session.send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = {tool["name"]: tool for tool in session.receive()["result"]["tools"]}
+        require("profile" not in tools["haystack_read"]["inputSchema"]["properties"], "typed input implicitly selected rich output")
+        session.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "haystack_read", "arguments": {"ids": ["a"], "projection": ["id", "nominal"]}}})
+        page = result(session.receive(), tools["haystack_read"]["outputSchema"])
+        require(page["ok"] and "nominal" not in page["grid"]["rows"][0], "default H4 gained nominal visibility")
+        session.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "haystack_read", "arguments": {"ids": ["a"]}}})
+        page = result(session.receive(), tools["haystack_read"]["outputSchema"])
+        require(not page["ok"] and page["error"]["code"] == "projection", "default H4 coerced rich typed input")
+        session.child.stdin.close()
+        session.finish()
+    print("PASS installed CLI rejects unadmitted/duplicate/native nominal scope and H4 nominal authority", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="Use an explicit existing binary; omit for a real temporary Cargo install")
@@ -227,6 +279,7 @@ def main():
         directory = Path(scratch)
         binary = args.binary.resolve() if args.binary else install(directory)
         qualify(binary, directory)
+        qualify_rich(binary, directory)
     print("PASS task-owned processes, pipes and fixture data removed" + ("; temporary installation removed" if not args.binary else ""), flush=True)
 
 

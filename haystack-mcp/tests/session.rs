@@ -131,6 +131,14 @@ fn wire(
     limits: Limits,
     bytes: usize,
 ) -> (Wire, tokio::task::JoinHandle<Result<Report, McpError>>) {
+    wire_profile(owner, limits, bytes, haystack_mcp::OutputProfile::H4)
+}
+fn wire_profile(
+    owner: &ApplicationOwner,
+    limits: Limits,
+    bytes: usize,
+    profile: haystack_mcp::OutputProfile,
+) -> (Wire, tokio::task::JoinHandle<Result<Report, McpError>>) {
     let (client, server) = tokio::io::duplex(bytes);
     let (input, output) = tokio::io::split(server);
     let application = owner.handle();
@@ -140,6 +148,7 @@ fn wire(
         input,
         output,
         limits,
+        profile,
         CancellationToken::new(),
     ));
     let (input, output) = tokio::io::split(client);
@@ -150,6 +159,166 @@ fn wire(
         },
         task,
     )
+}
+
+#[tokio::test]
+async fn rich_profile_requires_acknowledgment_and_preserves_scope_and_exact_errors() {
+    let graph = graph();
+    let mut row = graph.get("a").unwrap();
+    row.set("large", Kind::Int(9_007_199_254_740_993));
+    row.set("buf", Kind::Buf(vec![0, 255, 251]));
+    row.set(
+        "nominal",
+        Kind::Nominal(
+            NominalScalar::new(
+                "sys::Version",
+                "https://github.com/Project-Haystack/xeto",
+                "873b922451d3ef4c0c9c08ef3daa542f352d69f3",
+                "1.2.3",
+            )
+            .unwrap(),
+        ),
+    );
+    graph.update("a", row).unwrap();
+    let (owner, _) = app(graph.clone(), ReadLimits::default()).await;
+    let (mut wire, task) = wire_profile(
+        &owner,
+        Limits::default(),
+        1024 * 1024,
+        haystack_mcp::OutputProfile::Jeto,
+    );
+    initialize(&mut wire).await;
+    wire.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await;
+    let inventory = wire.receive().await;
+    for tool in inventory["result"]["tools"].as_array().unwrap() {
+        assert_eq!(
+            tool["inputSchema"]["properties"]["profile"]["const"],
+            haystack_mcp::JETO_PROFILE
+        );
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("profile"))
+        );
+    }
+    for arguments in [
+        json!({"ids":["a"]}),
+        json!({"ids":["a"],"profile":"haystack-h4-json-v1"}),
+        json!({"ids":["a"],"profile":7}),
+    ] {
+        assert_eq!(
+            wire.call(2, "haystack_read", arguments).await["error"]["code"],
+            -32602
+        );
+    }
+    let response = wire
+        .call(
+            3,
+            "haystack_read",
+            json!({"ids":["a","denied","missing"],"profile":haystack_mcp::JETO_PROFILE}),
+        )
+        .await;
+    let result = &response["result"];
+    let page = &result["structuredContent"];
+    assert_eq!(
+        serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+        *page
+    );
+    assert_eq!(page["profile"], haystack_mcp::JETO_PROFILE);
+    assert_eq!(page["row_count"], 1);
+    assert_eq!(
+        page["grid"]["rows"][0]["large"],
+        json!({"spec":"sys::Int","val":"9007199254740993"})
+    );
+    assert_eq!(
+        page["grid"]["rows"][0]["buf"],
+        json!({"spec":"sys::Buf","val":"AP_7"})
+    );
+    for hidden in ["secret", "target", "nominal"] {
+        assert!(page["grid"]["rows"][0].get(hidden).is_none());
+    }
+    assert_eq!(
+        page["catalog"]["revision"],
+        "873b922451d3ef4c0c9c08ef3daa542f352d69f3"
+    );
+    let mut row = graph.get("a").unwrap();
+    row.set(
+        "unsupported",
+        Kind::Symbol(haystack_core::kinds::Symbol::new("demo")),
+    );
+    graph.update("a", row).unwrap();
+    let response = wire
+        .call(
+            4,
+            "haystack_query",
+            json!({"filter":"site","profile":haystack_mcp::JETO_PROFILE}),
+        )
+        .await;
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({"profile":haystack_mcp::JETO_PROFILE,"ok":false,"error":{"code":"projection"}})
+    );
+    finished(wire, task).await;
+    close(owner).await;
+}
+
+#[tokio::test]
+async fn released_sdk_client_reads_exact_rich_profile() {
+    let graph = graph();
+    let mut row = graph.get("a").unwrap();
+    row.set("large", Kind::Int(i64::MAX));
+    graph.update("a", row).unwrap();
+    let (owner, _) = app(graph, ReadLimits::default()).await;
+    let (client, server) = tokio::io::duplex(1024 * 1024);
+    let (input, output) = tokio::io::split(server);
+    let task = tokio::spawn(haystack_mcp::serve(
+        owner.handle(),
+        principal_for_test(),
+        input,
+        output,
+        Limits::default(),
+        haystack_mcp::OutputProfile::Jeto,
+        CancellationToken::new(),
+    ));
+    let client = serve_client_with_lifecycle(
+        ClientConfig::default(),
+        client,
+        ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+    )
+    .await
+    .unwrap();
+    let tools = client.list_tools(None).await.unwrap();
+    assert_eq!(tools.tools.len(), 2);
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("haystack_read").with_arguments(
+                json!({"ids":["a"],"profile":haystack_mcp::JETO_PROFILE})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let page = result.structured_content.unwrap();
+    assert_eq!(page["ok"], true);
+    assert_eq!(
+        page["grid"]["rows"][0]["large"]["val"],
+        "9223372036854775807"
+    );
+    client.cancel().await.unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.admitted, report.released);
+    close(owner).await;
 }
 async fn initialize(wire: &mut Wire) {
     wire.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"wire","version":"1"}}})).await;
@@ -188,6 +357,7 @@ async fn released_sdk_client_discovers_and_reads_modern_profile() {
         input,
         output,
         Limits::default(),
+        haystack_mcp::OutputProfile::H4,
         CancellationToken::new(),
     ));
     let client = serve_client_with_lifecycle(
@@ -624,6 +794,7 @@ fn gated_wire(
             max_in_flight: 1,
             ..Limits::default()
         },
+        haystack_mcp::OutputProfile::H4,
         cancelled,
     ));
     let (input, output) = tokio::io::split(client);

@@ -74,6 +74,7 @@ const METADATA: &str = "/.well-known/oauth-protected-resource/mcp";
 #[derive(Clone)]
 pub struct HttpConfig {
     pub limits: Limits,
+    pub output_profile: crate::OutputProfile,
     /// Must equal `http://<bound numeric address>/mcp`, also the token audience.
     pub resource: String,
     /// Exact origins; empty rejects all present Origin headers. Absence is allowed.
@@ -85,6 +86,7 @@ impl HttpConfig {
     pub fn local(address: std::net::SocketAddr) -> Self {
         Self {
             limits: Limits::default(),
+            output_profile: crate::OutputProfile::H4,
             resource: format!("http://{address}/mcp"),
             allowed_origins: Vec::new(),
             max_connections: 32,
@@ -215,6 +217,7 @@ pub async fn serve_http(
             Ok(Tools::new(
                 factory_shared.application.clone(),
                 factory_shared.config.limits.clone(),
+                factory_shared.config.output_profile,
                 true,
             )
             .with_lifetime(Arc::new(SdkRelease(Arc::downgrade(&factory_shared)))))

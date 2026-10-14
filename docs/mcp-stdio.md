@@ -42,7 +42,8 @@ max_response_bytes = 1048576
 ```
 
 `dataset_file` is relative to the configuration file, or absolute. Formats are
-`trio`, `zinc` and Haystack v4 `json`. Configuration is limited to 64 KiB and the
+`trio`, `zinc`, Haystack v4 `json`, and the explicit project-owned
+`typed-payload-v1` Grid. Configuration is limited to 64 KiB and the
 dataset to 4 MiB/10,000 rows. A conservative depth limit precedes dataset decoding
 and also counts delimiter characters inside strings. Both path metadata and the
 opened descriptor must identify regular UTF-8 files. The Unix open uses
@@ -56,6 +57,11 @@ The immutable policy permits entity reads for the explicit ID set, masks
 nonempty IDs and hidden tag names are accepted; individual names and the principal
 are limited to 256 bytes. An empty entity scope is rejected. File contents and
 entity values remain untrusted data even when returned to a model.
+
+Output defaults to `haystack-h4-json-v1`. The optional top-level
+`output_profile = "haystack-jeto-v1"` and `nominal_specs` select the
+[rich-value profile](mcp-rich-values.md), with fixed boxed schemas and a required
+profile acknowledgment on every tool call. Dataset format does not select output.
 
 Example host command array:
 
@@ -163,6 +169,8 @@ uv run --locked --project scripts/schema-client --python 3.12 python scripts/mcp
 
 The final command installs into a temporary consumer directory, uses the existing
 locked independent JSON Schema validator, and observes real pipe subprocesses.
+It also launches the opt-in rich profile and independently decodes its selected
+typed values; see [rich qualification](mcp-rich-values.md#qualification).
 It checks discovery, schemas, useful scoped reads, argument rejection, stdout
 purity, EOF, signals with stdin open, broken output, backpressure, non-pipe launch,
 sanitized configuration errors, FIFO launch rejection, and graceful EOF/signals

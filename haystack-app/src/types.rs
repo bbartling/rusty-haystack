@@ -125,6 +125,9 @@ impl H4Codec {
 pub enum OutputProfile {
     Typed,
     H4(H4Codec),
+    /// Exact contextual Jeto with every scalar boxed. The active catalog and
+    /// original read budget participate in the same graph transaction.
+    Jeto,
 }
 #[derive(Debug, Clone)]
 pub struct ReadRequest {
@@ -149,7 +152,22 @@ impl ReadRequest {
 #[derive(Debug)]
 pub enum ReadOutput {
     Typed(HGrid),
-    H4 { body: Vec<u8>, codec: H4Codec },
+    H4 {
+        body: Vec<u8>,
+        codec: H4Codec,
+    },
+    Jeto {
+        body: Vec<u8>,
+        provenance: ReadProvenance,
+    },
+}
+/// Identity of the immutable admitted context used to encode this read. The
+/// selection digest is distinct from both upstream revision and graph epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadProvenance {
+    pub repository: String,
+    pub revision: String,
+    pub selection: String,
 }
 #[derive(Debug)]
 pub struct ReadPage {
