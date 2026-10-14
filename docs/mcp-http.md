@@ -147,8 +147,11 @@ continuation and application errors are the same as the
 Defaults are 32 accepted connections, 16 admitted MCP requests, 16 KiB HTTP parser
 buffer, 64 headers, 64 KiB body, JSON depth 32, 128 bytes per string request ID,
 1 MiB full response and a 10-second absolute accept-to-delivery deadline. The CLI
-allows 1–128 connections/in-flight requests, 8 KiB–16 MiB responses and
-10–60,000 ms deadlines. Embeddings can also configure the bounded parser/body/
+allows 1–128 connections/in-flight requests, 8 KiB–16 MiB responses for H4 or
+16 KiB–16 MiB for Jeto, and 10–60,000 ms deadlines. The profile-specific response
+minimum allows both discovery schemas and a maximally escaped 128-byte request
+ID; smaller configurations fail before serving. Embeddings enforce the same
+response minimum and can also configure the bounded parser/body/
 depth limits. The adapter requests 16 KiB kernel send/receive buffers (the OS may
 round or double them) and caps each write to 16 KiB. Excess connections close;
 excess valid requests receive 503. Input collection and response materialization

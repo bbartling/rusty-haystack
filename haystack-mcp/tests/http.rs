@@ -1043,6 +1043,62 @@ async fn rich_http_acknowledgment_precedes_read_admission() {
     fixture.close().await;
 }
 
+#[tokio::test]
+async fn discovery_response_floor_rejects_rich_limits_before_serving() {
+    for max_response_bytes in [8192, 16 * 1024 - 1] {
+        let owner = ApplicationBuilder::new(
+            SharedGraph::new(EntityGraph::new()),
+            Arc::new(AllowAll),
+            ReadLimits::default(),
+        )
+        .unwrap()
+        .start(&tokio::runtime::Handle::current())
+        .unwrap();
+        owner.ready().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = HttpConfig::local(address);
+        config.output_profile = haystack_mcp::OutputProfile::Jeto;
+        config.limits.max_response_bytes = max_response_bytes;
+        let verifier = verifier(&config.resource);
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let result =
+            haystack_mcp::serve_http(owner.handle(), listener, config, verifier, stop).await;
+        owner.close().await.unwrap();
+        assert!(owner.terminated().await.cleanup_errors.is_empty());
+        assert!(TcpListener::bind(address).await.is_ok());
+        assert!(
+            matches!(result, Err(haystack_mcp::McpError::Configuration)),
+            "rich limit {max_response_bytes} was accepted: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_response_floor_fits_both_tools_and_maximally_escaped_id() {
+    for (profile, max_response_bytes) in [
+        (haystack_mcp::OutputProfile::H4, 8192),
+        (haystack_mcp::OutputProfile::Jeto, 16 * 1024),
+    ] {
+        let fixture = Fixture::start(|config| {
+            config.output_profile = profile;
+            config.limits.max_response_bytes = max_response_bytes;
+        })
+        .await;
+        let id = "\u{1}".repeat(128);
+        let mut message = request("tools/list", json!({}));
+        message["id"] = json!(id);
+        let response = fixture.post(message).await;
+        assert_eq!(response.status, 200);
+        assert!(response.body.len() <= max_response_bytes);
+        let document = response.json();
+        assert_eq!(document["id"], id);
+        assert_eq!(document["result"]["tools"].as_array().unwrap().len(), 2);
+        fixture.close().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_headers_body_and_connection_admission_have_absolute_bounds() {
     for partial_body in [false, true] {

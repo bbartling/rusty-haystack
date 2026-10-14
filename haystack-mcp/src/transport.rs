@@ -525,7 +525,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    limits.validate()?;
+    limits.validate(profile)?;
     application
         .ready()
         .await

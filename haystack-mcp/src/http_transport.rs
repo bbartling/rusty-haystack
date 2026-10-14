@@ -169,7 +169,7 @@ pub async fn serve_http(
     verifier: Arc<JwtVerifier>,
     stop: CancellationToken,
 ) -> Result<Report, McpError> {
-    config.limits.validate()?;
+    config.limits.validate(config.output_profile)?;
     let address = listener.local_addr().map_err(|_| McpError::Io)?;
     if !address.ip().is_loopback()
         || config.resource != format!("http://{address}/mcp")

@@ -79,8 +79,9 @@ def config_file(directory, issuer, *, large=False, timeout=2500):
 
 
 class Endpoint:
-    def __init__(self, binary, config, issuer):
+    def __init__(self, binary, config, issuer, *, response_limit=1024 * 1024):
         self.issuer = issuer
+        self.response_limit = response_limit
         self.child = subprocess.Popen([str(binary), "mcp", "http", "--config", str(config)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             require(select.select([self.child.stderr], [], [], 10)[0], "HTTP readiness timed out")
@@ -113,8 +114,8 @@ class Endpoint:
                 connection.putheader(key, val)
             connection.endheaders(body)
             response = connection.getresponse()
-            output = response.read(1024 * 1024 + 1)
-            require(len(output) <= 1024 * 1024, "unbounded HTTP response")
+            output = response.read(self.response_limit + 1)
+            require(len(output) <= self.response_limit, "unbounded HTTP response")
             require(b"DO_NOT_DISCLOSE" not in output and b"Denied Entity" not in output and b"Denied display" not in output, "private entity content disclosed")
             return response.status, dict(response.getheaders()), json.loads(output) if output else None
         finally:
@@ -309,6 +310,26 @@ def qualify_rich(binary, directory, issuer):
         endpoint.stop()
 
 
+def qualify_discovery_floor(binary, directory, issuer):
+    directory = directory / "discovery-floor-http"
+    directory.mkdir()
+    config = config_file(directory, issuer)
+    base = config.read_text()
+    for profile, limit in (("haystack-h4-json-v1", 8192), ("haystack-jeto-v1", 16384)):
+        config.write_text(f'output_profile = "{profile}"\n' + base.replace("max_response_bytes = 16777216", f"max_response_bytes = {limit}"))
+        with Endpoint(binary, config, issuer, response_limit=limit) as endpoint:
+            ident = "\u0001" * 128
+            status, _, reply = endpoint.request(request("tools/list", ident=ident))
+            require(status == 200 and reply["id"] == ident and {tool["name"] for tool in reply["result"]["tools"]} == {"haystack_read", "haystack_query"}, "HTTP discovery floor lost request identity or tools")
+            endpoint.stop()
+    for limit in (8192, 16383):
+        config.write_text('output_profile = "haystack-jeto-v1"\n' + base.replace("max_response_bytes = 16777216", f"max_response_bytes = {limit}"))
+        result = subprocess.run([str(binary), "mcp", "http", "--config", str(config)], capture_output=True, timeout=5)
+        require(result.returncode != 0 and not result.stdout and b"invalid MCP HTTP configuration" in result.stderr
+                and b"MCP HTTP ready:" not in result.stderr, "undersized rich HTTP launch was not rejected before readiness")
+    print("PASS installed HTTP H4/Jeto discovery floors with maximally escaped request IDs and fail-fast rich launch rejection", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="Use an existing binary; this is not fresh-install evidence")
@@ -321,10 +342,12 @@ def main():
         issuer = Issuer(directory)
         qualify(binary, directory, issuer)
         qualify_rich(binary, directory, issuer)
+        qualify_discovery_floor(binary, directory, issuer)
         if args.features == "mcp,mcp-http":
-            from qualify import qualify as qualify_stdio, qualify_rich as qualify_rich_stdio
+            from qualify import qualify as qualify_stdio, qualify_rich as qualify_rich_stdio, qualify_discovery_floor as qualify_discovery_floor_stdio
             qualify_stdio(binary, directory)
             qualify_rich_stdio(binary, directory)
+            qualify_discovery_floor_stdio(binary, directory)
     print("PASS fixture processes, sockets, keys and data removed" + ("; fresh temporary installation removed" if not args.binary else ""), flush=True)
 
 
