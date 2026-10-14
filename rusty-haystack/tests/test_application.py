@@ -383,3 +383,4 @@ asyncio.run(main())
     result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=8)
     assert result.returncode == 0, result.stderr
     assert "panicked" not in result.stderr and "Fatal Python error" not in result.stderr
+    assert result.stderr == "", result.stderr
