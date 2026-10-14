@@ -9,3 +9,10 @@ See [the MCP pipe profile](../docs/mcp-stdio.md) for launch configuration, schem
 lifecycle guarantees, protocol versions and qualification commands. Standalone
 consumers install `rusty-haystack-cli` with its `mcp` feature and launch
 `haystack mcp stdio --config FILE` with Unix pipe stdin/stdout.
+
+Select `http` for the authenticated local Streamable HTTP profile and
+`serve_http`, `HttpConfig`, `JwtVerifier`, `JwtConfig` and `VerificationKey`.
+The CLI selects this with `mcp-http` and runs `haystack mcp http --config FILE`.
+See [the HTTP profile](../docs/mcp-http.md) for explicit loopback authority,
+offline issuer/key/scope configuration, protocol bounds and joined cleanup.
+Both features may be selected together; neither is enabled by default.

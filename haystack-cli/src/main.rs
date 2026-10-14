@@ -11,7 +11,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Serve read-only MCP tools (requires a build with --features mcp)
+    /// Serve read-only MCP tools (requires the mcp or mcp-http build feature)
     Mcp {
         #[command(subcommand)]
         action: commands::mcp::Action,

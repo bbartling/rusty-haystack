@@ -1,4 +1,8 @@
-use crate::handler::Service;
+use crate::{
+    Limits, McpError, Report,
+    common::{depth_ok, encode},
+    handler::{Invocation, Lease, Service},
+};
 use haystack_app::{ApplicationHandle, CancellationToken, Principal, WorkGuard};
 use parking_lot::Mutex;
 use rmcp::{
@@ -9,88 +13,22 @@ use rmcp::{
     },
     transport::Transport,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::HashMap,
-    io,
     sync::{Arc, Weak},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
 };
 
-#[derive(Debug, Clone)]
-pub struct Limits {
-    pub max_frame_bytes: usize,
-    pub max_json_depth: usize,
-    pub max_response_bytes: usize,
-    pub max_in_flight: usize,
-    pub max_pending_responses: usize,
-    pub request_timeout: Duration,
-}
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_frame_bytes: 65_536,
-            max_json_depth: 32,
-            max_response_bytes: 1024 * 1024,
-            max_in_flight: 16,
-            max_pending_responses: 16,
-            request_timeout: Duration::from_secs(10),
-        }
-    }
-}
-impl Limits {
-    fn validate(&self) -> Result<(), McpError> {
-        if !(1024..=1024 * 1024).contains(&self.max_frame_bytes)
-            || !(4..=64).contains(&self.max_json_depth)
-            || !(8192..=16 * 1024 * 1024).contains(&self.max_response_bytes)
-            || !(1..=128).contains(&self.max_in_flight)
-            || !(1..=128).contains(&self.max_pending_responses)
-            || self.request_timeout.is_zero()
-            || self.request_timeout > Duration::from_secs(60)
-        {
-            return Err(McpError::Configuration);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum McpError {
-    #[error("invalid MCP transport configuration")]
-    Configuration,
-    #[error("MCP input framing limit or framing contract failed")]
-    Framing,
-    #[error("MCP output capacity exhausted")]
-    Capacity,
-    #[error("MCP response exceeds the transport limit")]
-    Output,
-    #[error("MCP request or response delivery deadline exceeded")]
-    Deadline,
-    #[error("MCP response delivery cancelled after it began")]
-    CancelledDelivery,
-    #[error("MCP pipe I/O failed")]
-    Io,
-    #[error("MCP protocol session failed")]
-    Protocol,
-    #[error("MCP owned task failed")]
-    Task,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Report {
-    pub admitted: usize,
-    pub released: usize,
-    pub peak_in_flight: usize,
-    pub delivered: usize,
-    pub suppressed: usize,
-}
-
 pub(crate) struct Request {
     pub id: RequestId,
+    principal: Principal,
     pub deadline: Instant,
     pub cancellation: CancellationToken,
     _permit: OwnedSemaphorePermit,
@@ -107,8 +45,20 @@ impl Drop for Release {
         }
     }
 }
-#[derive(Clone)]
-pub(crate) struct Lease(pub Arc<Request>);
+impl Invocation for Request {
+    fn principal(&self) -> &Principal {
+        &self.principal
+    }
+    fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+    fn work(&self) -> WorkGuard {
+        self.work.child()
+    }
+}
 
 struct State {
     requests: HashMap<RequestId, Arc<Request>>,
@@ -163,6 +113,7 @@ impl Shared {
         let work = self.application.admit().map_err(|_| "closed")?;
         let request = Arc::new(Request {
             id: id.clone(),
+            principal: self.principal.clone(),
             deadline: started + self.limits.request_timeout,
             cancellation: self.stop.child_token(),
             _permit: permit,
@@ -204,33 +155,6 @@ impl Shared {
             .chain(started.map(|time| time + self.limits.request_timeout))
             .min()
     }
-}
-
-/// Bounded serializer used before queueing, including JSON escaping and both
-/// structured and text content. The vector never grows beyond the selected cap.
-pub(crate) fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, McpError> {
-    struct Bounded {
-        bytes: Vec<u8>,
-        max: usize,
-    }
-    impl io::Write for Bounded {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
-                return Err(io::Error::other("bounded JSON output"));
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut output = Bounded {
-        bytes: Vec::new(),
-        max,
-    };
-    serde_json::to_writer(&mut output, value).map_err(|_| McpError::Output)?;
-    Ok(output.bytes)
 }
 
 struct Output {
@@ -389,34 +313,6 @@ async fn writer<W: AsyncWrite + Unpin>(
     while input.try_recv().is_ok() {}
     // No unbounded flush/shutdown on a blocked peer. All selected writes are
     // cancellable; dropping the pipe releases the descriptor after task join.
-}
-
-fn depth_ok(bytes: &[u8], max: usize) -> bool {
-    let (mut depth, mut string, mut escape) = (0usize, false, false);
-    for byte in bytes {
-        if string {
-            if escape {
-                escape = false;
-            } else if *byte == b'\\' {
-                escape = true;
-            } else if *byte == b'"' {
-                string = false;
-            }
-        } else {
-            match byte {
-                b'"' => string = true,
-                b'{' | b'[' => {
-                    depth += 1;
-                    if depth > max {
-                        return false;
-                    }
-                }
-                b'}' | b']' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-    }
-    true
 }
 
 // The SDK's untagged message decoder can otherwise consume a request with
