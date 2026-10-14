@@ -118,7 +118,10 @@ The default adapter limits are 64 KiB per input frame, JSON depth 32, 128 bytes 
 string request ID, 16 admitted requests, 16 pending responses, 1 MiB per complete
 JSON-RPC output frame and a 10-second absolute request deadline. Trusted embedding
 can select finite limits within validated maxima; the CLI exposes response bytes
-and timeout (10–60,000 ms). Shared read budgets independently bound query parsing,
+and timeout (10–60,000 ms). The response range is 8 KiB–16 MiB for H4 and
+16 KiB–16 MiB for Jeto. The profile-specific minimum allows both discovery schemas
+and a maximally escaped 128-byte request ID; smaller configurations fail before
+serving. Shared read budgets independently bound query parsing,
 IDs, rows, graph work, retained bytes, values, cursor storage and duration. Its
 default duration is five seconds, which may be tighter than transport delivery.
 

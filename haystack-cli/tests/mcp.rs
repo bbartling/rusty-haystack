@@ -46,6 +46,45 @@ fn mcp_rejects_unknown_config_without_echoing_parser_input() {
     assert!(!diagnostic.contains("do-not-echo-this"));
 }
 
+#[cfg(any(feature = "mcp", feature = "mcp-http"))]
+#[test]
+fn discovery_response_floor_rejects_rich_limits_before_dataset_access() {
+    for (command, scope, diagnostic) in [
+        #[cfg(feature = "mcp")]
+        (
+            "stdio",
+            "principal = 'fixture'\nentity_ids = ['a']\n",
+            "invalid MCP configuration",
+        ),
+        #[cfg(feature = "mcp-http")]
+        (
+            "http",
+            "listen = '127.0.0.1:0'\nissuer = 'https://issuer.example.test'\nrequired_scope = 'haystack:read'\n[[keys]]\nkid = 'fixture'\nalgorithm = 'RS256'\npublic_key_der_base64 = ''\n[[subjects]]\nsubject = 'fixture'\nentity_ids = ['a']\n",
+            "invalid MCP HTTP configuration",
+        ),
+    ] {
+        for max_response_bytes in [8192, 16 * 1024 - 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("mcp.toml");
+            std::fs::write(&path, format!("version = 1\ndataset_file = 'absent-private-dataset'\ndataset_format = 'trio'\noutput_profile = 'haystack-jeto-v1'\nmax_response_bytes = {max_response_bytes}\n{scope}")).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
+                .args(["mcp", command, "--config"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                error.contains(diagnostic),
+                "response floor did not fail before dataset access: {error}"
+            );
+            assert!(!error.contains("absent-private-dataset"));
+            assert!(!error.contains("MCP HTTP ready:"));
+        }
+    }
+}
+
 #[cfg(all(feature = "mcp", unix))]
 #[test]
 fn rich_launch_accepts_explicit_typed_payload_and_admitted_nominal_scope() {

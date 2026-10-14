@@ -38,20 +38,21 @@ def fixture(directory, *, large=False, timeout=2000):
 
 
 class Session:
-    def __init__(self, binary, config):
+    def __init__(self, binary, config, *, response_limit=1024 * 1024):
         self.child = subprocess.Popen([str(binary), "mcp", "stdio", "--config", str(config)],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.messages = queue.Queue(maxsize=32)
         self.reader = None
+        self.response_limit = response_limit
 
     def read_output(self):
         def read():
             try:
                 while True:
-                    line = self.child.stdout.readline(1024 * 1024 + 1)
+                    line = self.child.stdout.readline(self.response_limit + 1)
                     if not line:
                         return
-                    require(len(line) <= 1024 * 1024 and line.endswith(b"\n"), "unbounded protocol output")
+                    require(len(line) <= self.response_limit and line.endswith(b"\n"), "unbounded protocol output")
                     self.messages.put(json.loads(line), timeout=3)
             except BaseException as error:
                 self.messages.put(error, timeout=3)
@@ -270,6 +271,31 @@ def qualify_rich(binary, directory):
     print("PASS installed CLI rejects unadmitted/duplicate/native nominal scope and H4 nominal authority", flush=True)
 
 
+def qualify_discovery_floor(binary, directory):
+    directory = directory / "discovery-floor-stdio"
+    directory.mkdir()
+    config = fixture(directory)
+    base = config.read_text()
+    for profile, limit in (("haystack-h4-json-v1", 8192), ("haystack-jeto-v1", 16384)):
+        config.write_text(base + f'output_profile = "{profile}"\nmax_response_bytes = {limit}\n')
+        with Session(binary, config, response_limit=limit) as session:
+            session.read_output()
+            session.initialize()
+            ident = "\u0001" * 128
+            session.send({"jsonrpc": "2.0", "id": ident, "method": "tools/list"})
+            reply = session.receive()
+            require(reply["id"] == ident and {tool["name"] for tool in reply["result"]["tools"]} == {"haystack_read", "haystack_query"}, "discovery floor lost request identity or tools")
+            session.child.stdin.close()
+            session.finish()
+    for limit in (8192, 16383):
+        config.write_text(base + f'output_profile = "haystack-jeto-v1"\nmax_response_bytes = {limit}\n')
+        with Session(binary, config) as session:
+            # Stdin remains open: failure must precede protocol serving.
+            diagnostic = session.finish(expected=1)
+            require(b"invalid MCP configuration" in diagnostic and not session.child.stdout.read(), "undersized rich launch was not rejected before serving")
+    print("PASS installed stdio H4/Jeto discovery floors with maximally escaped request IDs and fail-fast rich launch rejection", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="Use an explicit existing binary; omit for a real temporary Cargo install")
@@ -280,6 +306,7 @@ def main():
         binary = args.binary.resolve() if args.binary else install(directory)
         qualify(binary, directory)
         qualify_rich(binary, directory)
+        qualify_discovery_floor(binary, directory)
     print("PASS task-owned processes, pipes and fixture data removed" + ("; temporary installation removed" if not args.binary else ""), flush=True)
 
 

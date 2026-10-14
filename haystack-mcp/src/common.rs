@@ -22,10 +22,10 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    pub(crate) fn validate(&self) -> Result<(), McpError> {
+    pub(crate) fn validate(&self, profile: crate::OutputProfile) -> Result<(), McpError> {
         if !(1024..=1024 * 1024).contains(&self.max_frame_bytes)
             || !(4..=64).contains(&self.max_json_depth)
-            || !(8192..=16 * 1024 * 1024).contains(&self.max_response_bytes)
+            || !(profile.min_response_bytes()..=16 * 1024 * 1024).contains(&self.max_response_bytes)
             || !(1..=128).contains(&self.max_in_flight)
             || !(1..=128).contains(&self.max_pending_responses)
             || self.request_timeout.is_zero()

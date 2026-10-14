@@ -347,6 +347,71 @@ async fn finished(wire: Wire, task: tokio::task::JoinHandle<Result<Report, McpEr
 }
 
 #[tokio::test]
+async fn discovery_response_floor_rejects_rich_limits_before_serving() {
+    let (owner, _) = app(graph(), ReadLimits::default()).await;
+    for max_response_bytes in [8192, 16 * 1024 - 1] {
+        let result = haystack_mcp::serve(
+            owner.handle(),
+            principal_for_test(),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Limits {
+                max_response_bytes,
+                ..Default::default()
+            },
+            haystack_mcp::OutputProfile::Jeto,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(McpError::Configuration)),
+            "rich limit {max_response_bytes} was accepted: {result:?}"
+        );
+    }
+    close(owner).await;
+}
+
+#[tokio::test]
+async fn discovery_response_floor_fits_both_tools_and_maximally_escaped_id() {
+    let (owner, _) = app(graph(), ReadLimits::default()).await;
+    for (profile, max_response_bytes) in [
+        (haystack_mcp::OutputProfile::H4, 8192),
+        (haystack_mcp::OutputProfile::Jeto, 16 * 1024),
+    ] {
+        let (mut wire, task) = wire_profile(
+            &owner,
+            Limits {
+                max_response_bytes,
+                ..Default::default()
+            },
+            64 * 1024,
+            profile,
+        );
+        initialize(&mut wire).await;
+        let id = "\u{1}".repeat(128);
+        wire.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/list"}))
+            .await;
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), wire.input.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            line.len() <= max_response_bytes,
+            "discovery exceeded the selected frame cap"
+        );
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], id);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 2);
+        finished(wire, task).await;
+    }
+    close(owner).await;
+}
+
+#[tokio::test]
 async fn released_sdk_client_discovers_and_reads_modern_profile() {
     let (owner, _) = app(graph(), ReadLimits::default()).await;
     let (client, server) = tokio::io::duplex(1024 * 1024);

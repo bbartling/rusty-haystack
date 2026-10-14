@@ -42,6 +42,16 @@ pub enum OutputProfile {
     Jeto,
 }
 impl OutputProfile {
+    /// Minimum response budget for the fixed tool inventory, including the
+    /// full request-ID allowance and JSON escaping. This does not guarantee
+    /// that arbitrary tool results fit the selected response budget.
+    pub const fn min_response_bytes(self) -> usize {
+        match self {
+            Self::H4 => 8 * 1024,
+            Self::Jeto => 16 * 1024,
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::H4 => OUTPUT_PROFILE,

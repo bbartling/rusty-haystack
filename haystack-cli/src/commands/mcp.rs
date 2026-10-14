@@ -259,7 +259,8 @@ mod selected {
                 .iter()
                 .any(|tag| tag.is_empty() || tag.len() > 256)
             || !(10..=60_000).contains(&config.request_timeout_ms)
-            || !(8192..=16 * 1024 * 1024).contains(&config.max_response_bytes)
+            || !(config.output_profile.min_response_bytes()..=16 * 1024 * 1024)
+                .contains(&config.max_response_bytes)
         {
             return Err("invalid MCP configuration".into());
         }

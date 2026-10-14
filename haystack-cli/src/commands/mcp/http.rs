@@ -89,7 +89,8 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
         || !(1..=512).contains(&config.subjects.len())
         || !(1..=16).contains(&config.keys.len())
         || !(10..=60_000).contains(&config.request_timeout_ms)
-        || !(8192..=16 * 1024 * 1024).contains(&config.max_response_bytes)
+        || !(config.output_profile.min_response_bytes()..=16 * 1024 * 1024)
+            .contains(&config.max_response_bytes)
         || !(1..=128).contains(&config.max_connections)
         || !(1..=128).contains(&config.max_in_flight)
     {

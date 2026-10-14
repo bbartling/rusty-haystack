@@ -113,6 +113,11 @@ Grid column consistency; clients must validate those semantics too.
 
 All preexisting application work/value/depth/retained/output budgets, transport
 frame limits, cancellation, absolute deadlines and worker-release ownership apply.
+Both rich transports require at least 16 KiB of `max_response_bytes`, enforced
+before serving by the library and both CLI launchers. This floor accommodates the
+fixed pair of discovery schemas with the full 128-byte request-ID allowance,
+including JSON escaping. The H4 minimum remains 8 KiB and both defaults remain
+1 MiB; a permitted budget can still reject a tool result that exceeds its bounds.
 Encoding consumes the original cumulative budget before cursor publication. Text
 content and structured content contain the same envelope, with the original
 bounded error codes and `isError` behavior. History, resources, writes, commands,
