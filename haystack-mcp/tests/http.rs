@@ -1141,13 +1141,19 @@ async fn history_http_policy_change_withholds_previously_collected_samples() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_deadline_and_stop_retain_real_worker_until_joined() {
     for event in ["disconnect", "deadline", "stop"] {
+        let request_timeout = if event == "disconnect" {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(600)
+        };
         let fixture = Fixture::start(|config| {
             config.limits.max_in_flight = 1;
-            config.limits.request_timeout = Duration::from_millis(600);
+            config.limits.request_timeout = request_timeout;
         })
         .await;
         fixture.gate.blocked.store(true, Ordering::SeqCst);
         let _unblock = Unblock(fixture.gate.clone());
+        let request_started = Instant::now();
         let mut peer = TcpStream::connect(fixture.address).await.unwrap();
         let body = request(
             "tools/call",
@@ -1170,6 +1176,22 @@ async fn disconnect_deadline_and_stop_retain_real_worker_until_joined() {
         let saturated = fixture.post(request("tools/list", json!({}))).await;
         assert_eq!(saturated.status, 503);
         if event == "disconnect" {
+            // Send FIN while retaining the read half. SocketIo cancels the
+            // original invocation before exposing this EOF to Hyper, so the
+            // server's EOF is a causal witness before releasing the worker.
+            peer.shutdown().await.unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert!(
+                request_started.elapsed() < request_timeout,
+                "disconnect observation must precede the request deadline"
+            );
             drop(peer);
         } else if event == "stop" {
             fixture.stop.cancel();

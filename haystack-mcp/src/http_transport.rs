@@ -41,14 +41,31 @@ type Body = Full<Bytes>;
 type Sdk = StreamableHttpService<Tools, NeverSessionManager>;
 // Limit individual writes so a large JSON frame cannot bypass kernel
 // backpressure by being submitted as one oversized write/writev operation.
-struct SocketIo(tokio::net::TcpStream);
+struct SocketIo {
+    socket: tokio::net::TcpStream,
+    slot: Arc<Mutex<Option<Arc<Admitted>>>>,
+}
 impl tokio::io::AsyncRead for SocketIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        let remaining = buf.remaining();
+        let filled = buf.filled().len();
+        let result = Pin::new(&mut self.socket).poll_read(cx, buf);
+        let eof = remaining != 0
+            && matches!(&result, Poll::Ready(Ok(())))
+            && buf.filled().len() == filled;
+        if (eof || matches!(&result, Poll::Ready(Err(_))))
+            && let Some(request) = self.slot.lock().as_ref()
+        {
+            // Hyper may close its write half before ConnectionLease is dropped.
+            // Cancel this request before exposing a terminal read to Hyper, but
+            // retain the slot/permit until connection and worker cleanup join.
+            request.cancellation.cancel();
+        }
+        result
     }
 }
 impl tokio::io::AsyncWrite for SocketIo {
@@ -57,13 +74,13 @@ impl tokio::io::AsyncWrite for SocketIo {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, &bytes[..bytes.len().min(16_384)])
+        Pin::new(&mut self.socket).poll_write(cx, &bytes[..bytes.len().min(16_384)])
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        Pin::new(&mut self.socket).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        Pin::new(&mut self.socket).poll_shutdown(cx)
     }
 }
 const VERSION: &str = "2026-07-28";
@@ -257,7 +274,7 @@ pub async fn serve_http(
                 let guard=ConnectionLease(slot.clone());
                 let request_shared=shared.clone(); let request_slot=slot.clone();
                 let connection=accepted_connection(
-                    socket, deadline,
+                    socket, slot.clone(), deadline,
                     shared.config.max_header_bytes, shared.stop.clone(),
                     move |deadline| service_fn(move |request| handle(request,request_shared.clone(),sdk.clone(),request_slot.clone(),deadline.clone())),
                 );
@@ -304,6 +321,7 @@ pub async fn serve_http(
 // spawn. Its future may receive its first executor poll much later.
 fn accepted_connection<F, S>(
     socket: tokio::net::TcpStream,
+    slot: Arc<Mutex<Option<Arc<Admitted>>>>,
     deadline: Instant,
     max_header_bytes: usize,
     stop: CancellationToken,
@@ -334,7 +352,7 @@ where
             .half_close(false)
             .max_headers(64)
             .max_buf_size(max_header_bytes);
-        let connection = builder.serve_connection(TokioIo::new(SocketIo(socket)), service);
+        let connection = builder.serve_connection(TokioIo::new(SocketIo { socket, slot }), service);
         tokio::select! {
             biased;
             _ = stop.cancelled() => false,
@@ -745,8 +763,102 @@ fn valid_origin(origin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use haystack_app::{AllowAll, ApplicationBuilder, ReadLimits};
+    use haystack_core::graph::{EntityGraph, SharedGraph};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+
+    #[tokio::test]
+    async fn socket_read_eof_cancels_only_its_request_before_returning_without_releasing_quota() {
+        let owner = ApplicationBuilder::new(
+            SharedGraph::new(EntityGraph::new()),
+            Arc::new(AllowAll),
+            ReadLimits::default(),
+        )
+        .unwrap()
+        .start(&tokio::runtime::Handle::current())
+        .unwrap();
+        owner.ready().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let mut peer = peer.unwrap();
+        let (socket, _) = accepted.unwrap();
+        let parent = CancellationToken::new();
+        let sibling = parent.child_token();
+        let cancel = parent.child_token();
+        let quota = Arc::new(Semaphore::new(1));
+        let request = Arc::new(Admitted {
+            principal: Principal::Anonymous,
+            deadline: Arc::new(RequestDeadline::new(
+                Instant::now() + Duration::from_secs(30),
+            )),
+            cancellation: cancel.clone(),
+            _permit: quota.clone().try_acquire_owned().unwrap(),
+            work: owner.handle().admit().unwrap(),
+            _release: Release(Weak::new()),
+        });
+        let slot = Arc::new(Mutex::new(Some(request.clone())));
+        let guard = ConnectionLease(slot.clone());
+        let mut io = SocketIo {
+            socket,
+            slot: slot.clone(),
+        };
+        peer.write_all(b"x").await.unwrap();
+
+        // A successful zero-capacity read has no new bytes without being EOF.
+        let mut empty = ReadBuf::new(&mut []);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut io).poll_read(cx, &mut empty)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!cancel.is_cancelled());
+
+        // Compare the newly filled length, not whether the caller's buffer
+        // already contains bytes, and keep live requests admitted.
+        let mut storage = [0; 8];
+        let mut data = ReadBuf::new(&mut storage);
+        data.put_slice(b"old");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut io).poll_read(cx, &mut data)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.filled(), b"oldx");
+        assert!(!cancel.is_cancelled());
+        assert_eq!(quota.available_permits(), 0);
+
+        peer.shutdown().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut io).poll_read(cx, &mut data)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.filled(), b"oldx");
+        assert!(
+            cancel.is_cancelled(),
+            "observed EOF must cancel before Hyper can see it"
+        );
+        assert!(!parent.is_cancelled() && !sibling.is_cancelled());
+        assert!(slot.lock().is_some());
+        assert_eq!(quota.available_permits(), 0);
+        drop(io);
+        drop(guard);
+        // The independently held handler/worker lease still owns native quota.
+        assert_eq!(quota.available_permits(), 0);
+        drop(request);
+        assert_eq!(quota.available_permits(), 1);
+        owner.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn delayed_first_poll_cannot_renew_an_accepted_connection_budget() {
@@ -765,6 +877,7 @@ mod tests {
             // retain it locally so no executor can poll it before our schedule.
             let connection = accepted_connection(
                 socket,
+                Arc::new(Mutex::new(None)),
                 deadline,
                 16_384,
                 CancellationToken::new(),
