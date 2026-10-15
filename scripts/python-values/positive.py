@@ -2,12 +2,12 @@
 import datetime as dt
 import json
 from pathlib import Path
-from typing import Any, Coroutine, assert_type
+from typing import Any, AsyncIterator, Coroutine, assert_type
 
 import rusty_haystack as rh
 from rusty_haystack import Buf, CodecError, Coord, Float, HDateTime, HDict, HGrid, HList, Int, Nominal, NoneValue, Number
 from rusty_haystack.auth import generate_nonce
-from rusty_haystack.client import AsyncHaystackClient, HaystackClient, TlsConfig
+from rusty_haystack.client import AsyncHaystackClient, AsyncWatch, WatchControl, WatchDelivery, HaystackClient, TlsConfig
 from rusty_haystack.codecs import decode_typed_value, encode_typed_value
 from rusty_haystack.data import HCol
 from rusty_haystack.filter import CmpOp, Filter, Path as FilterPath
@@ -112,3 +112,42 @@ async def application_entry_types(application: ApplicationOwner) -> None:
     await task
 
 asyncio.run(application_surface())
+
+assert AsyncWatch is rh.AsyncWatch and WatchDelivery is rh.WatchDelivery and WatchControl is rh.WatchControl
+async def watch_surface(client: AsyncHaystackClient, ids: list[str]) -> None:
+    watch = client.watch(ids, key="consumer", lease_ms=5000, cleanup_timeout=2.0)
+    assert_type(watch, AsyncWatch)
+    assert_type(watch.__aiter__(), AsyncWatch)
+    iterator: AsyncIterator[WatchDelivery | WatchControl] = watch
+    assert_type(iterator, AsyncWatch)
+    assert_type(watch.ready(), asyncio.Future[WatchControl])
+    assert_type(watch.__anext__(), asyncio.Future[WatchDelivery | WatchControl])
+    assert_type(watch.resume(), asyncio.Future[WatchDelivery | WatchControl])
+    assert_type(watch.renew(5000), asyncio.Future[WatchControl])
+    assert_type(watch.aclose(), asyncio.Future[WatchControl])
+    assert_type(watch.pending, WatchDelivery | None)
+    entry = assert_type(watch.__aenter__(), Coroutine[Any, Any, AsyncWatch])
+    assert_type(await entry, AsyncWatch)
+    async with watch as entered:
+        assert_type(entered, AsyncWatch)
+        event = await anext(watch)
+        assert_type(event, WatchDelivery | WatchControl)
+        if isinstance(event, WatchDelivery):
+            assert_type(event.authority, str)
+            assert_type(event.token, str)
+            assert_type(event.scope_generation, int)
+            assert_type(event.from_revision, int)
+            assert_type(event.through, int)
+            assert_type(event.initial, bool)
+            assert_type(event.changed, tuple[HDict, ...])
+            assert_type(event.removed, tuple[str, ...])
+            for row in event.changed:
+                row.set("local", 1)
+            assert_type(await asyncio.ensure_future(watch.ack(event)), WatchControl)
+        else:
+            assert_type(event.reason, str | None)
+            assert_type(event.local_joined, bool)
+    async def one() -> WatchDelivery | WatchControl:
+        return await watch.next()
+    async with asyncio.TaskGroup() as group:
+        assert_type(group.create_task(one()), asyncio.Task[WatchDelivery | WatchControl])

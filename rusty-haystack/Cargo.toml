@@ -23,3 +23,4 @@ tokio-util = { workspace = true, features = ["rt"] }
 zeroize.workspace = true
 chrono.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+url.workspace = true

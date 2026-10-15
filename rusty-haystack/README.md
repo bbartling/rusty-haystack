@@ -168,7 +168,8 @@ streamed response sizes are checked. Responses exceeding the requested row limit
 are rejected, never truncated. At most 16 native operations, including their
 result-conversion guards, are admitted at once. Overload is rejected immediately;
 there is no unbounded pending-operation queue. This small API has no arbitrary raw
-operation, watches or complete H5 operation family.
+operation or complete H5 operation family. Bounded remote watches use the separate
+owned surface below and share this client's admission/runtime/session.
 
 `state` reports `new`, `connecting`, `open`, `closing` or `closed`; `closed` is true
 only after actual teardown. Close seals admission immediately, cancels requests,
@@ -205,6 +206,135 @@ The selected runtime evidence is CPython 3.12 on macOS arm64; installed stub che
 target Python 3.11. Broader platform and free-threaded qualification is separate.
 The independent TLS tests require an OpenSSL CLI and generate temporary seven-day
 certificates so platform certificate policies and stale fixtures are respected.
+
+## Bounded remote async watches
+
+A connected `AsyncHaystackClient` has at most 32 creation-key reservations,
+counting both live children and locally closed children whose remote cleanup is
+unconfirmed. `watch()` returns a handle synchronously, before any watch I/O, and
+reserves its key to one logical owner in that parent's session. Duplicate keys
+raise `ClientError` before registration or dispatch, including after ACK or a
+locally joined Unknown cleanup. Dropping that handle or waiting out its lease
+locally does not release the reservation. Capacity is bounded and unconfirmed
+keys are never evicted to admit more work.
+
+A reservation is reusable after no Create was dispatched or after confirmed
+remote close/terminal release and local join. Parent session disposal clears its
+remaining reservations. The server may still retain a closed-key tombstone, so
+reusing a released local key can return `closed`; use a new key for a fresh
+observation. Every handle retains the exact caller-supplied ID order/duplicates
+and finite lease. The server
+must advertise the first-party `state-subscription-v1` extension and negotiate
+`haystack.state-subscription.v1` for WebSocket requests. This is distinct from
+legacy synchronous `WsClient` watches and from Haystack 5 transport support.
+The controlled embedded Python application does not install a watch provider.
+
+```python
+from rusty_haystack import AsyncHaystackClient, WatchDelivery
+
+async def receive_one(url: str, username: str, password: str):
+    async with AsyncHaystackClient(url, username, password) as client:
+        watch = client.watch(["zone-temp", "zone-setpoint"], key="zone-view",
+                             lease_ms=60_000, cleanup_timeout=2.0)
+        async with watch:
+            async for event in watch:
+                if isinstance(event, WatchDelivery):
+                    # Initial delivery contains the complete authorized records;
+                    # later deliveries contain complete changed records/removals.
+                    result = (event.changed, event.removed)
+                    await watch.ack(event)
+                    return result
+                raise RuntimeError(f"watch control: {event.kind}/{event.reason}")
+```
+
+Use `async with` or await `watch.aclose()` in `finally`: ordinary `async for`
+`break` does not close a custom iterator. Entry is a **Coroutine** adapter that
+retains cleanup ownership through Task handoff; `ready`, `next`, `__anext__`,
+`ack`, `resume`, `renew` and `aclose` return asyncio **Futures**. For a TaskGroup
+or `create_task`, wrap those Future-returning methods in an `async def`, as for
+client reads. `__aiter__` returns the same handle. Directly awaiting the handle
+is not supported. Each child inherits its parent's exact loop/thread affinity
+and caller context. Deadlines use the same absolute loop clock and constructor
+budget as client reads. A deadline reached before dispatch raises `TimeoutError`;
+a lost/timed-out dispatched operation can instead return `kind="unknown"`,
+because the remote result may already have committed.
+
+There is one native pending delivery and at most one unfinished operation per
+child, including Python result conversion. Overlapping operations and
+next-before-ACK fail locally without dispatch. There is no background polling
+queue; `next()` polls only while the caller awaits it. `pending` exposes the
+retained snapshot. A delivery's authority/watch/key, dataset/incarnation,
+catalog/scope generations, token, integer `from_revision`/`through`, `initial`
+and tuple containers are read-only. Each access to `changed` returns fresh,
+mutable `HDict` copies, including independent nested values; caller edits cannot
+change the retained native snapshot or ACK intent. `removed` contains ID strings.
+Updates represent coalesced current state, not every intermediate write. Treat
+changed rows as full replacements so deleted tags do not survive in local state.
+
+ACK is always explicit: `await watch.ack(delivery)` must identify this child's
+exact pending delivery. Yield, cancellation, early exit and mutable record edits
+do not acknowledge anything. After a lost ACK response, `pending` and the exact
+ACK intent remain retained. `await watch.resume()` reconciles that same ACK,
+or otherwise resumes from the last acknowledged position. It may replay the
+pending delivery. Recovery reuses the original authenticated session; logging in
+again with the same username is a new session. An uncertain handle rejects
+ordinary `ready`/`next` until explicit recovery. `await watch.renew(lease_ms)` is
+the only renewal action. There is no automatic renewal, reconnect or resubscribe.
+
+`WatchControl.kind` distinguishes `ready`, `authority`, `idle`, `acknowledged`,
+`renewed`, `closed`, `rejected`, `resync`, `unknown`, `not_created` and `stopped`.
+Rejected reasons preserve `invalid`, `forbidden`, `conflict`, `capacity`, `limit`
+and `pending`. Resync preserves `authority`, `session_expired`, `revoked`,
+`lease_expired`, `gap`, `incarnation`, `catalog`, `policy`, `scope_changed`,
+`shutdown`, `overflow` and `unknown`. Gap, overflow, lease expiry or another
+terminal resync is yielded once, then the old iterator ends. Start a fresh watch
+with a new key explicitly when a new observation is appropriate. Unknown is not
+an empty delivery or successful exhaustion. `state` reports `new`, `open`,
+`uncertain`, `terminal`, `closing` or `closed`.
+
+Create and cleanup use the parent's retained HTTP session. Poll/Resume/ACK/Renew
+use a same-authority WebSocket with that same private bearer session. Failed WS
+attachment after successful Create retains cleanup ownership. HTTPS uses the
+client's configured HTTP trust; the current WSS attachment uses verified system
+roots and does not inherit custom HTTP CA or mutual-TLS identity configuration.
+There is no insecure verification fallback.
+
+`aclose()` eagerly seals admission, even if its returned Future is immediately
+cancelled or its valid observation deadline has expired. Repeated calls observe
+the same supervised cleanup. One cleanup budget (default 2 seconds, positive and
+at most 30 seconds) and a maximum of six requests cover all reconciliation and
+Unsubscribe attempts. Cleanup can spend at most five requests on identity
+reconciliation: the final request is reserved for Unsubscribe. It never sends a
+possibly allocating Create with only one request slot left. An already-dispatched finite Create remains supervised.
+If its response is missing, cleanup may retry **the exact original Create under
+the same key/session** only to obtain its identity and immediately Unsubscribe.
+If the first request never committed, this narrow cleanup step may perform that
+original creation for the first time. Both a correlated Delivery and a legal
+Create Idle retain the returned identity for immediate Unsubscribe. Idle is not
+remote-release proof. Startup can accept such an Idle and continue from its
+scope/acknowledged position without inventing a delivery. Cleanup never changes
+key/IDs/lease, starts a replacement login, sends ACK/Renew, or logs out the parent
+to close one child.
+
+The close report's `local_joined=True` and `watch.closed` mean the child's native
+work, socket and conversion ownership have drained. A `closed` response confirms
+remote Unsubscribe; `not_created` means no Create was dispatched. An Unknown or
+rejected cleanup, or resync with unknown authority/identity, remains unconfirmed;
+the finite server lease is a separate bound. These reports retain the key
+reservation. Context exit raises `ClientError` for any result without explicit
+release proof, including Idle; it cannot make an unconfirmed result successful.
+If the body already raised, its exception is preserved with a cleanup note when
+possible; a repeated `aclose()` still exposes the report.
+Other resync reasons retain the server's explicit terminal reason. Closing a
+child preserves sibling watches and parent reads. Parent close drains all
+children before attempting session logout and destroying its runtime; a failed
+logout does not turn an unknown child report into confirmed release. The server
+reclaims inactive-session bindings on its maintenance tick after logout.
+
+Normal-exit and closed-loop tests cover selected CPython 3.12/macOS cases with
+unawaited Create/receive work and with explicit close. Process exit or socket EOF
+alone does not prove remote Unsubscribe or graceful native join. The interpreter
+shutdown and platform limitations in the async-client section still apply.
 
 ## Controlled embedded applications
 
