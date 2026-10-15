@@ -69,12 +69,12 @@ class Session:
             raise value
         return value
 
-    def initialize(self):
+    def initialize(self, *, resources=False):
         self.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
             "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "independent-wire", "version": "1"}}})
         response = self.receive()
         require(response["result"]["protocolVersion"] == "2025-11-25", "wrong legacy negotiation")
-        require(response["result"]["capabilities"] == {"tools": {}}, "unexpected capabilities")
+        require(response["result"]["capabilities"] == ({"tools": {}, "resources": {}} if resources else {"tools": {}}), "unexpected capabilities")
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def finish(self, expected=0):
@@ -309,6 +309,8 @@ def main():
         qualify_discovery_floor(binary, directory)
         from history import qualify_stdio as qualify_history
         qualify_history(binary, directory)
+        from semantics import qualify_stdio as qualify_semantics
+        qualify_semantics(binary, directory)
     print("PASS task-owned processes, pipes and fixture data removed" + ("; temporary installation removed" if not args.binary else ""), flush=True)
 
 

@@ -1,5 +1,6 @@
 use super::selected::{
-    Scope, bounded, initialize_profile, load_graph, nominal_scope, response_bytes, select_history,
+    Scope, SemanticProfile, bounded, initialize_profile, load_graph, nominal_scope, response_bytes,
+    select_history, semantic_namespace, semantic_scope,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use haystack_app::*;
@@ -22,6 +23,8 @@ struct Config {
     dataset_format: String,
     #[serde(default)]
     output_profile: haystack_mcp::OutputProfile,
+    #[serde(default)]
+    semantic_resources: Option<SemanticProfile>,
     #[serde(default)]
     history_file: Option<PathBuf>,
     listen: SocketAddr,
@@ -69,6 +72,10 @@ struct Subject {
     nominal_specs: Vec<String>,
     #[serde(default)]
     history_read: bool,
+    #[serde(default)]
+    h4_libraries: Vec<String>,
+    #[serde(default)]
+    h4_definitions: Vec<String>,
 }
 struct Policy(BTreeMap<String, Arc<Scope>>);
 impl ReadPolicy for Policy {
@@ -95,20 +102,35 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
         || !(1..=512).contains(&config.subjects.len())
         || !(1..=16).contains(&config.keys.len())
         || !(10..=60_000).contains(&config.request_timeout_ms)
-        || !(config
-            .output_profile
-            .selected_min_response_bytes(config.history_file.is_some())
-            ..=16 * 1024 * 1024)
+        || !(config.output_profile.resource_min_response_bytes(
+            config.history_file.is_some(),
+            config.semantic_resources.is_some(),
+        )..=16 * 1024 * 1024)
             .contains(&max_response_bytes)
         || !(1..=128).contains(&config.max_connections)
         || !(1..=128).contains(&config.max_in_flight)
     {
         return Err("invalid MCP HTTP configuration".into());
     }
+    let namespace = semantic_namespace(config.semantic_resources)?;
+    let semantic_scopes = config
+        .subjects
+        .iter()
+        .map(|subject| {
+            semantic_scope(
+                namespace.as_ref(),
+                &subject.h4_libraries,
+                &subject.h4_definitions,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
+    if let Some(namespace) = namespace {
+        graph.set_namespace(namespace);
+    }
     let observation = initialize_profile(&mut graph, config.output_profile)?;
     let mut scopes = BTreeMap::new();
-    for subject in &config.subjects {
+    for (subject, semantics) in config.subjects.iter().zip(semantic_scopes) {
         if subject.subject.is_empty()
             || subject.subject.len() > 256
             || subject.entity_ids.is_empty()
@@ -131,6 +153,7 @@ pub(super) fn run(path: &Path) -> Result<(), String> {
             hidden: subject.hidden_tags.iter().cloned().collect(),
             types: nominal_scope(observation.as_ref(), &subject.nominal_specs)?,
             history: subject.history_read,
+            semantics,
         });
         if scopes.insert(subject.subject.clone(), scope).is_some() {
             return Err("duplicate MCP HTTP subject".into());
@@ -183,6 +206,7 @@ async fn session(
     );
     http.allowed_origins = config.allowed_origins;
     http.output_profile = config.output_profile;
+    http.semantic_resources = config.semantic_resources.is_some();
     http.max_connections = config.max_connections;
     http.limits.max_in_flight = config.max_in_flight;
     http.limits.request_timeout = Duration::from_millis(config.request_timeout_ms);

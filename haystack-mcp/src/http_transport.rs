@@ -75,6 +75,7 @@ const METADATA: &str = "/.well-known/oauth-protected-resource/mcp";
 pub struct HttpConfig {
     pub limits: Limits,
     pub output_profile: crate::OutputProfile,
+    pub semantic_resources: bool,
     /// Must equal `http://<bound numeric address>/mcp`, also the token audience.
     pub resource: String,
     /// Exact origins; empty rejects all present Origin headers. Absence is allowed.
@@ -87,6 +88,7 @@ impl HttpConfig {
         Self {
             limits: Limits::default(),
             output_profile: crate::OutputProfile::H4,
+            semantic_resources: false,
             resource: format!("http://{address}/mcp"),
             allowed_origins: Vec::new(),
             max_connections: 32,
@@ -174,9 +176,10 @@ pub async fn serve_http(
 ) -> Result<Report, McpError> {
     config.limits.validate(config.output_profile)?;
     if config.limits.max_response_bytes
-        < config
-            .output_profile
-            .selected_min_response_bytes(application.history_service().is_some())
+        < config.output_profile.resource_min_response_bytes(
+            application.history_service().is_some(),
+            config.semantic_resources,
+        )
     {
         return Err(McpError::Configuration);
     }
@@ -228,6 +231,7 @@ pub async fn serve_http(
                 factory_shared.application.clone(),
                 factory_shared.config.limits.clone(),
                 factory_shared.config.output_profile,
+                factory_shared.config.semantic_resources,
                 true,
             )
             .with_lifetime(Arc::new(SdkRelease(Arc::downgrade(&factory_shared)))))
@@ -528,12 +532,26 @@ async fn handle_inner(
     }
     if !matches!(
         method,
-        "server/discover" | "ping" | "tools/list" | "tools/call"
+        "server/discover"
+            | "ping"
+            | "tools/list"
+            | "tools/call"
+            | "resources/list"
+            | "resources/read"
+            | "resources/templates/list"
     ) {
         return rpc(404, -32601, "Method is not available", id, None);
     }
-    if method == "tools/call" {
-        let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
+    if method.starts_with("resources/") && !shared.config.semantic_resources {
+        return rpc(404, -32601, "Method is not available", id, None);
+    }
+    if method == "tools/call" || method == "resources/read" {
+        let field = if method == "tools/call" {
+            "name"
+        } else {
+            "uri"
+        };
+        let name = params.and_then(|p| p.get(field)).and_then(Value::as_str);
         if name.is_none() {
             return rpc(400, -32602, "Invalid tool parameters", id, None);
         }
@@ -541,7 +559,8 @@ async fn handle_inner(
         if decoded.as_deref() != name {
             return rpc(400, -32020, "Header mismatch", id, None);
         }
-        if !matches!(name, Some("haystack_read" | "haystack_query"))
+        if method == "tools/call"
+            && !matches!(name, Some("haystack_read" | "haystack_query"))
             && !(name == Some("haystack_history") && shared.application.history_service().is_some())
         {
             return rpc(400, -32602, "Unknown tool", id, None);

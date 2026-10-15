@@ -63,6 +63,7 @@ pub use lifecycle::{
 pub use policy::{AllowAll, PolicySnapshot, ReadPolicy};
 pub use service::{
     ApplicationPackageError, CatalogActivation, CatalogActivationError, CatalogActivationLimits,
+    H4_RESOURCE_PROFILE, H4_RESOURCE_URI_BYTES, H4Resource, H4ResourceContent, H4ResourcePage,
     HistoryReadOptions, HistoryReadOutput, PackagePreparationLimits, PreparedPackageAdmission,
     ReadAdmission, ReadLoad, ReadService,
 };

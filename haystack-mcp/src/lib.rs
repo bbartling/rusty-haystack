@@ -10,7 +10,7 @@ pub use common::{Limits, McpError, Report};
 #[cfg(feature = "stdio")]
 mod transport;
 #[cfg(feature = "stdio")]
-pub use transport::serve;
+pub use transport::{StdioConfig, serve};
 #[cfg(feature = "http")]
 mod auth;
 #[cfg(feature = "http")]
@@ -23,6 +23,9 @@ pub use http_transport::{HttpConfig, serve_http};
 pub const OUTPUT_PROFILE: &str = "haystack-h4-json-v1";
 /// Exact contextual Jeto, with every scalar boxed and catalog provenance.
 pub const JETO_PROFILE: &str = "haystack-jeto-v1";
+/// Selected H4 semantic resources reserve up to 8 bounded descriptors, URI/name
+/// escaping, fixed provenance and useful one-row content within full framing.
+pub const SEMANTIC_RESPONSE_BYTES: usize = 128 * 1024;
 /// Selected history reserves shared 128 KiB encoder headroom plus bounded
 /// parsed/text copies and JSON-RPC framing. Entity-only floors are unchanged.
 pub const HISTORY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -59,6 +62,15 @@ impl OutputProfile {
             HISTORY_RESPONSE_BYTES
         } else {
             self.min_response_bytes()
+        }
+    }
+
+    pub const fn resource_min_response_bytes(self, history: bool, resources: bool) -> usize {
+        let current = self.selected_min_response_bytes(history);
+        if resources && current < SEMANTIC_RESPONSE_BYTES {
+            SEMANTIC_RESPONSE_BYTES
+        } else {
+            current
         }
     }
 

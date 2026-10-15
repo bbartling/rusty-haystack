@@ -77,6 +77,7 @@ pub(crate) struct Shared {
     pub principal: Principal,
     pub limits: Limits,
     pub profile: OutputProfile,
+    pub semantic_resources: bool,
     state: Mutex<State>,
     permits: Arc<Semaphore>,
     stop: CancellationToken,
@@ -516,6 +517,15 @@ impl Transport<RoleServer> for BoundedTransport {
 }
 
 /// Serve one bounded MCP connection, borrowing the application and runtime.
+/// Explicit stdio transport bounds and selected presentation/capabilities.
+#[derive(Debug, Clone, Default)]
+pub struct StdioConfig {
+    pub limits: Limits,
+    pub output_profile: OutputProfile,
+    /// Explicitly expose policy-filtered H4 definition/library resources.
+    pub semantic_resources: bool,
+}
+
 /// Cancellation/EOF stops only this connection. Success proves its reader,
 /// writer and request leases were released; an SDK quit reason alone does not.
 /// The supplied I/O must itself be cancellation safe (the CLI selects Unix pipes).
@@ -524,17 +534,24 @@ pub async fn serve<R, W>(
     principal: Principal,
     input: R,
     output: W,
-    limits: Limits,
-    profile: OutputProfile,
+    config: StdioConfig,
     cancelled: CancellationToken,
 ) -> Result<Report, McpError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let StdioConfig {
+        limits,
+        output_profile: profile,
+        semantic_resources,
+    } = config;
     limits.validate(profile)?;
     if limits.max_response_bytes
-        < profile.selected_min_response_bytes(application.history_service().is_some())
+        < profile.resource_min_response_bytes(
+            application.history_service().is_some(),
+            semantic_resources,
+        )
     {
         return Err(McpError::Configuration);
     }
@@ -557,6 +574,7 @@ where
         reader_pause: Mutex::new(None),
         limits,
         profile,
+        semantic_resources,
     });
     let _cancel_on_drop = shared.stop.clone().drop_guard();
     let (sender, receiver) = mpsc::channel(shared.limits.max_pending_responses);
@@ -684,6 +702,7 @@ mod tests {
                     ..Limits::default()
                 },
                 profile: OutputProfile::H4,
+                semantic_resources: false,
                 state: Mutex::new(State {
                     requests: HashMap::new(),
                     error: None,

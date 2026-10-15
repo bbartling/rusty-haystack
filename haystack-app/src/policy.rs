@@ -19,6 +19,12 @@ pub trait PolicySnapshot: Send + Sync + 'static {
     fn reference(&self, target: &str) -> bool;
     fn reference_display(&self, target: &str) -> bool;
     fn catalog(&self, kind: CatalogKind, name: &str) -> bool;
+    /// Narrow semantic-resource visibility independently of nominal type use.
+    /// Resources also require the ordinary operation and catalog permissions;
+    /// this hook can only restrict them. Include changes in `scope_key`.
+    fn semantic_resource(&self, kind: CatalogKind, name: &str) -> bool {
+        self.catalog(kind, name)
+    }
     fn nominal_provenance(&self, value: &NominalScalar) -> bool;
 }
 /// Explicit unrestricted policy for trusted embedding or compatibility use.
