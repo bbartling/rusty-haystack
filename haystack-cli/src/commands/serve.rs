@@ -36,6 +36,15 @@ pub fn run(cfg: ServeConfig<'_>) {
 }
 
 async fn serve(cfg: ServeConfig<'_>) -> Result<(), String> {
+    serve_with_ready(cfg, |address| println!("Listening on {address}")).await
+}
+
+// Keep readiness notification on the coordinator: returning from this callback
+// is the boundary before the shutdown wait may first be polled.
+async fn serve_with_ready(
+    cfg: ServeConfig<'_>,
+    announce_ready: impl FnOnce(std::net::SocketAddr),
+) -> Result<(), String> {
     #[cfg(not(feature = "postgres"))]
     if cfg.postgres_config.is_some() {
         return Err("PostgreSQL support is not installed; rebuild rusty-haystack-cli with --features postgres".into());
@@ -58,6 +67,9 @@ async fn serve(cfg: ServeConfig<'_>) -> Result<(), String> {
     } else {
         CorsPolicy::Allow(cfg.cors_origins.clone())
     };
+    // Own both Unix handlers before a listener can bind or readiness can escape.
+    // Constructing an async ctrl_c future alone would still register lazily.
+    let mut shutdown = ShutdownSignals::register().map_err(|error| error.to_string())?;
     let owner = start(&cfg, auth, cors).await?;
     let ready = match owner.ready().await {
         Ok(ready) => ready,
@@ -66,9 +78,9 @@ async fn serve(cfg: ServeConfig<'_>) -> Result<(), String> {
             return Err(error.to_string());
         }
     };
-    println!("Listening on {}", ready.listeners[0].address);
+    announce_ready(ready.listeners[0].address);
     let signal = tokio::select! {
-        result = shutdown_signal() => result,
+        result = shutdown.wait() => result,
         report = owner.terminated() => return terminated(report),
     };
     let closed = owner.close().await;
@@ -138,16 +150,221 @@ async fn start(
         .map_err(|error| error.to_string())
 }
 
-async fn shutdown_signal() -> std::io::Result<()> {
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+impl ShutdownSignals {
+    fn register() -> std::io::Result<Self> {
+        #[cfg(unix)]
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+        Ok(Self {
+            #[cfg(unix)]
+            interrupt: signal(SignalKind::interrupt())?,
+            #[cfg(unix)]
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+    async fn wait(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => {},
+                _ = self.terminate.recv() => {},
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::{Child, Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+    const CHILD_MARKER: &str = "HAYSTACK_TEST_HELD_SERVE";
+    const CHILD_TEST: &str = "commands::serve::tests::held_serve_child";
+
+    struct HeldChild {
+        child: Child,
+        control: BufReader<UnixStream>,
+    }
+    impl Drop for HeldChild {
+        fn drop(&mut self) {
+            // Kill and reap only this test's child, including assertion failures
+            // and a stalled control exchange. Never leave a detached waiter.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
+    impl HeldChild {
+        fn spawn() -> Self {
+            let (parent, child) = UnixStream::pair().expect("private control socket");
+            for socket in [&parent, &child] {
+                socket.set_read_timeout(Some(CONTROL_TIMEOUT)).unwrap();
+                socket.set_write_timeout(Some(CONTROL_TIMEOUT)).unwrap();
+            }
+            let process = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .stdin(Stdio::from(OwnedFd::from(child.try_clone().unwrap())))
+                .stdout(Stdio::from(OwnedFd::from(child)))
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn private serve child");
+            Self {
+                child: process,
+                control: BufReader::new(parent),
+            }
+        }
+        fn held_address(&mut self) -> SocketAddr {
+            let deadline = Instant::now() + CONTROL_TIMEOUT;
+            for _ in 0..32 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "child did not reach held readiness");
+                self.control
+                    .get_ref()
+                    .set_read_timeout(Some(remaining))
+                    .unwrap();
+                let mut line = String::new();
+                assert_ne!(
+                    self.control
+                        .by_ref()
+                        .take(4097)
+                        .read_line(&mut line)
+                        .expect("read held readiness"),
+                    0,
+                    "child exited before held readiness"
+                );
+                assert!(line.len() <= 4096, "unexpected child output size");
+                if let Some(address) = line.trim().strip_prefix("HELD ") {
+                    return address.parse().expect("child-owned bound address");
+                }
+            }
+            panic!("child did not publish its bound address");
+        }
+        fn release_and_join(&mut self) -> std::process::ExitStatus {
+            // A signal-terminated old implementation may have already closed
+            // the socket. Preserve its exit status as the causal failure.
+            let _ = self.control.get_mut().write_all(b"R");
+            self.control
+                .get_ref()
+                .set_read_timeout(Some(CONTROL_TIMEOUT))
+                .unwrap();
+            let mut output = String::new();
+            self.control
+                .by_ref()
+                .take(65536)
+                .read_to_string(&mut output)
+                .expect("bounded child completion");
+            assert!(
+                output.len() < 65536,
+                "unexpected child completion output size"
+            );
+            // The fixture keeps stdout open through runtime destruction. EOF
+            // precedes this wait only when that child has exited.
+            let status = self.child.wait().expect("reap completed serve child");
+            let mut stderr = String::new();
+            self.child
+                .stderr
+                .take()
+                .unwrap()
+                .take(16384)
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert!(
+                status.success(),
+                "signal caused abrupt exit while coordinator held: {status}; {stderr}"
+            );
+            assert!(
+                output.lines().any(|line| line == "DRAINED"),
+                "no owned-runtime completion receipt: {output}"
+            );
+            status
+        }
+    }
+
+    fn held_coordinator_signal(signal: &str) {
+        let mut child = HeldChild::spawn();
+        let address = child.held_address();
+        assert!(address.ip().is_loopback() && address.port() != 0);
+        // The coordinator is blocked inside its readiness callback, before any
+        // shutdown-wait poll. Real HTTP must run on the other runtime workers.
+        let mut http = TcpStream::connect_timeout(&address, CONTROL_TIMEOUT).unwrap();
+        http.set_read_timeout(Some(CONTROL_TIMEOUT)).unwrap();
+        http.set_write_timeout(Some(CONTROL_TIMEOUT)).unwrap();
+        let body = "ver:\"3.0\"\nfilter\n\"site\"\n";
+        write!(http, "POST /api/read HTTP/1.1\r\nHost: {address}\r\nContent-Type: text/zinc\r\nAccept: text/zinc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        http.take(16384).read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "real held-coordinator HTTP failed: {response}"
+        );
+        assert!(
+            Command::new("kill")
+                .args([signal, &child.child.id().to_string()])
+                .status()
+                .expect("signal exact test-owned child")
+                .success()
+        );
+        assert!(child.release_and_join().success());
+        let rebound = TcpListener::bind(address).expect("owned shutdown released exact listener");
+        assert_eq!(rebound.local_addr().unwrap(), address);
+    }
+
+    #[test]
+    fn interrupt_while_ready_coordinator_is_held_drains_owned_runtime() {
+        held_coordinator_signal("-INT");
+    }
+    #[test]
+    fn terminate_while_ready_coordinator_is_held_drains_owned_runtime() {
+        held_coordinator_signal("-TERM");
+    }
+    #[test]
+    #[ignore = "private subprocess fixture, invoked by the two held-coordinator tests"]
+    fn held_serve_child() {
+        assert_eq!(std::env::var(CHILD_MARKER).as_deref(), Ok("1"));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(serve_with_ready(
+            ServeConfig {
+                port: 0,
+                file: None,
+                users_file: None,
+                host: Some("127.0.0.1"),
+                demo: false,
+                cors_origins: vec![],
+                postgres_config: None,
+            },
+            |address| {
+                // The parent alone can release this callback. No signal future
+                // has been polled, even though the real listener is ready.
+                println!("\nHELD {address}");
+                std::io::stdout().flush().unwrap();
+                let mut release = [0];
+                std::io::stdin()
+                    .read_exact(&mut release)
+                    .expect("bounded coordinator release");
+                assert_eq!(release, [b'R']);
+            },
+        ));
+        drop(runtime);
+        assert!(result.is_ok(), "serve cleanup failed: {result:?}");
+        println!("DRAINED");
+    }
 }
