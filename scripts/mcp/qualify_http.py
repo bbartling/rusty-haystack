@@ -101,8 +101,10 @@ class Endpoint:
         headers = {"Host": f"{self.address[0]}:{self.address[1]}", "Authorization": "Bearer " + (self.token if token is None else token),
                    "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": VERSION,
                    "Mcp-Method": value.get("method", "ping") if isinstance(value, dict) else "ping", "Content-Length": str(len(body))}
-        if isinstance(value, dict) and isinstance(value.get("params"), dict) and "name" in value["params"]:
-            headers["Mcp-Name"] = value["params"]["name"]
+        if isinstance(value, dict) and isinstance(value.get("params"), dict):
+            key = "uri" if value.get("method") == "resources/read" else "name"
+            if key in value["params"]:
+                headers["Mcp-Name"] = value["params"][key]
         for key, val in (replace or {}).items():
             headers.pop(key, None)
             if val is not None:
@@ -345,6 +347,8 @@ def main():
         qualify_discovery_floor(binary, directory, issuer)
         from history import qualify_http as qualify_history_http
         qualify_history_http(binary, directory, issuer)
+        from semantics import qualify_http as qualify_semantics_http
+        qualify_semantics_http(binary, directory, issuer)
         if args.features == "mcp,mcp-http":
             from qualify import qualify as qualify_stdio, qualify_rich as qualify_rich_stdio, qualify_discovery_floor as qualify_discovery_floor_stdio
             qualify_stdio(binary, directory)
@@ -352,6 +356,8 @@ def main():
             qualify_discovery_floor_stdio(binary, directory)
             from history import qualify_stdio as qualify_history_stdio
             qualify_history_stdio(binary, directory)
+            from semantics import qualify_stdio as qualify_semantics_stdio
+            qualify_semantics_stdio(binary, directory)
     print("PASS fixture processes, sockets, keys and data removed" + ("; fresh temporary installation removed" if not args.binary else ""), flush=True)
 
 

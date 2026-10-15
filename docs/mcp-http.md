@@ -7,6 +7,9 @@ stdio, PostgreSQL, Python bindings, tasks, or new read/write capabilities. Selec
 `mcp,mcp-http` to install both independent CLI commands.
 An explicitly selected history service adds [`haystack_history`](mcp-history.md)
 under the same authenticated transport and each subject's History permission.
+Explicit [H4 semantic resources](mcp-semantic-resources.md) use the same transport
+with separate per-subject library and definition grants and a fixed H4 content
+profile beside either entity-tool output profile.
 
 This is a **numeric loopback HTTP/1 deployment profile for a trusted local
 embedding**. It uses one POST per connection and bounded JSON responses. Clients
@@ -139,7 +142,8 @@ URIs are rejected. The same authority policy protects metadata.
 Each request has matching `MCP-Protocol-Version`/`Mcp-Method` headers and
 `params._meta` containing `io.modelcontextprotocol/protocolVersion` and
 `io.modelcontextprotocol/clientCapabilities`. Tool calls also require matching
-`Mcp-Name`, including the specified Base64 representation when used. Duplicate
+`Mcp-Name`, including the specified Base64 representation when used. Selected
+`resources/read` requests require that header to equal `params.uri`. Duplicate
 singleton headers, missing or mismatched metadata, invalid JSON-RPC IDs, batches,
 client result/error envelopes, unavailable methods and malformed selected
 requests are rejected before application-work admission. Unsupported methods use

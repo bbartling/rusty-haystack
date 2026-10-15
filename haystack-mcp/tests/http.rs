@@ -1,5 +1,6 @@
 #![cfg(feature = "http")]
 mod history_support;
+mod resource_support;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use haystack_app::*;
 use haystack_core::{
@@ -282,6 +283,7 @@ async fn legal_media_negotiation_reaches_sdk_without_losing_header_semantics() {
     assert_eq!(fixture.close().await.admitted, 4);
 }
 struct Gate {
+    semantics: AtomicBool,
     history: AtomicBool,
     blocked: AtomicBool,
     entered: AtomicUsize,
@@ -298,6 +300,7 @@ impl Gate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             history: AtomicBool::new(false),
+            semantics: AtomicBool::new(false),
             blocked: AtomicBool::new(false),
             entered: AtomicUsize::new(0),
             epoch: AtomicUsize::new(0),
@@ -354,6 +357,11 @@ impl PolicySnapshot for Scope {
     }
     fn operation(&self, operation: ReadOperation) -> bool {
         operation == ReadOperation::Read
+            || (self.gate.semantics.load(Ordering::SeqCst)
+                && matches!(
+                    operation,
+                    ReadOperation::Definitions | ReadOperation::Libraries
+                ))
             || (operation == ReadOperation::History && self.gate.history.load(Ordering::SeqCst))
     }
     fn entity(&self, id: &str) -> bool {
@@ -369,8 +377,8 @@ impl PolicySnapshot for Scope {
     fn reference_display(&self, _: &str) -> bool {
         false
     }
-    fn catalog(&self, _: CatalogKind, _: &str) -> bool {
-        false
+    fn catalog(&self, _: CatalogKind, name: &str) -> bool {
+        self.gate.semantics.load(Ordering::SeqCst) && !name.starts_with("hidden")
     }
     fn nominal_provenance(&self, _: &NominalScalar) -> bool {
         false
@@ -439,6 +447,10 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let mut config = HttpConfig::local(address);
         configure(&mut config);
+        if config.semantic_resources {
+            gate.semantics.store(true, Ordering::SeqCst);
+            graph.set_namespace(resource_support::namespace());
+        }
         let verifier = verifier(&config.resource);
         let stop = CancellationToken::new();
         let task = tokio::spawn(haystack_mcp::serve_http(
@@ -560,7 +572,10 @@ fn wire(
         ("Mcp-Method", value["method"].as_str().unwrap_or("ping")),
         ("Content-Length", length.as_str()),
     ];
-    if let Some(name) = value["params"]["name"].as_str() {
+    if let Some(name) = value["params"]["name"]
+        .as_str()
+        .or_else(|| value["params"]["uri"].as_str())
+    {
         headers.push(("Mcp-Name", name));
     }
     for (name, value) in replace {
@@ -1126,13 +1141,19 @@ async fn history_http_policy_change_withholds_previously_collected_samples() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_deadline_and_stop_retain_real_worker_until_joined() {
     for event in ["disconnect", "deadline", "stop"] {
+        let request_timeout = if event == "disconnect" {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(600)
+        };
         let fixture = Fixture::start(|config| {
             config.limits.max_in_flight = 1;
-            config.limits.request_timeout = Duration::from_millis(600);
+            config.limits.request_timeout = request_timeout;
         })
         .await;
         fixture.gate.blocked.store(true, Ordering::SeqCst);
         let _unblock = Unblock(fixture.gate.clone());
+        let request_started = Instant::now();
         let mut peer = TcpStream::connect(fixture.address).await.unwrap();
         let body = request(
             "tools/call",
@@ -1155,6 +1176,22 @@ async fn disconnect_deadline_and_stop_retain_real_worker_until_joined() {
         let saturated = fixture.post(request("tools/list", json!({}))).await;
         assert_eq!(saturated.status, 503);
         if event == "disconnect" {
+            // Send FIN while retaining the read half. SocketIo cancels the
+            // original invocation before exposing this EOF to Hyper, so the
+            // server's EOF is a causal witness before releasing the worker.
+            peer.shutdown().await.unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert!(
+                request_started.elapsed() < request_timeout,
+                "disconnect observation must precede the request deadline"
+            );
             drop(peer);
         } else if event == "stop" {
             fixture.stop.cancel();
@@ -1695,4 +1732,244 @@ async fn concurrent_callers_with_the_same_wire_id_keep_independent_authority() {
     let report = fixture.close().await;
     assert_eq!(report.admitted, 2);
     assert_eq!(report.peak_in_flight, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_resources_http_headers_floor_pagination_and_revocation_are_exact() {
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        let fixture = Fixture::start(|config| {
+            config.semantic_resources = true;
+            config.output_profile = profile;
+            config.limits.max_response_bytes = haystack_mcp::SEMANTIC_RESPONSE_BYTES;
+        })
+        .await;
+        let discovery = fixture
+            .post(request("server/discover", json!({})))
+            .await
+            .json();
+        assert_eq!(
+            discovery["result"]["capabilities"],
+            json!({"tools":{},"resources":{}})
+        );
+        let mut resources = Vec::new();
+        let mut cursor = None;
+        let id = "\u{0001}".repeat(128);
+        loop {
+            let params = match cursor.take() {
+                Some(cursor) => json!({"cursor":cursor}),
+                None => json!({}),
+            };
+            let mut call = request("resources/list", params);
+            call["id"] = json!(id);
+            let reply = fixture.post(call).await;
+            assert_eq!(reply.status, 200);
+            assert!(reply.body.len() <= haystack_mcp::SEMANTIC_RESPONSE_BYTES);
+            let response = reply.json();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"]["ttlMs"], 0);
+            assert_eq!(response["result"]["cacheScope"], "private");
+            resources.extend(
+                response["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+            cursor = response["result"]["nextCursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(resources.len(), 13);
+        let uris = resources
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(uris.len(), 13);
+        let mut saved = None;
+        for resource in resources {
+            let uri = resource["uri"].as_str().unwrap();
+            let (kind, name) = resource["name"].as_str().unwrap().split_once(':').unwrap();
+            let library = if kind == "library" {
+                name.to_owned()
+            } else if name == "known" {
+                "phDemo".into()
+            } else {
+                "l".repeat(256)
+            };
+            let mut call = request("resources/read", json!({"uri":uri}));
+            call["id"] = json!(id);
+            let reply = fixture.post(call.clone()).await;
+            assert_eq!(reply.status, 200);
+            assert!(reply.body.len() <= haystack_mcp::SEMANTIC_RESPONSE_BYTES);
+            resource_support::check_content(
+                &reply.json()["result"],
+                uri,
+                name,
+                &library,
+                kind == "definition",
+            );
+            if name == "known" {
+                saved = Some((uri.to_owned(), call));
+            }
+        }
+        let (uri, call) = saved.unwrap();
+        let encoded = format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(&uri)
+        );
+        assert_eq!(
+            fixture
+                .raw(
+                    "POST",
+                    "/mcp",
+                    &fixture.token(),
+                    &call.to_string(),
+                    &[("Mcp-Name", &encoded)],
+                    &[]
+                )
+                .await
+                .status,
+            200
+        );
+        for name in ["", "haystack://wrong", "=?base64?invalid!?="] {
+            let reply = fixture
+                .raw(
+                    "POST",
+                    "/mcp",
+                    &fixture.token(),
+                    &call.to_string(),
+                    &[("Mcp-Name", name)],
+                    &[],
+                )
+                .await;
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.json()["error"]["code"], -32020);
+        }
+        let mut bob = claims(fixture.verifier.resource());
+        bob["sub"] = json!("bob");
+        let rejected = fixture
+            .raw("POST", "/mcp", &token(&bob), &call.to_string(), &[], &[])
+            .await
+            .json();
+        assert_eq!(rejected["error"]["code"], -32602);
+        let missing = fixture
+            .post(request(
+                "resources/read",
+                json!({"uri":"file:///private/unavailable"}),
+            ))
+            .await
+            .json();
+        assert_eq!(missing["error"], rejected["error"]);
+        assert_eq!(
+            fixture
+                .post(request("resources/templates/list", json!({})))
+                .await
+                .json()["result"]["resourceTemplates"],
+            json!([])
+        );
+        fixture.gate.epoch.store(1, Ordering::SeqCst);
+        assert_eq!(
+            fixture.post(call.clone()).await.json()["error"],
+            rejected["error"]
+        );
+        fixture
+            .owner
+            .handle()
+            .read_service()
+            .native_graph()
+            .unwrap()
+            .set_namespace(resource_support::namespace());
+        assert_eq!(fixture.post(call).await.json()["error"], rejected["error"]);
+        for method in ["resources/subscribe", "completion/complete", "prompts/list"] {
+            let reply = fixture.post(request(method, json!({"uri":uri}))).await;
+            assert_eq!(reply.json()["error"]["code"], -32601);
+        }
+        fixture.close().await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unselected_http_resources_are_not_exposed_and_selected_floor_fails_before_serving() {
+    let fixture = Fixture::start(|_| {}).await;
+    assert!(
+        fixture
+            .post(request("server/discover", json!({})))
+            .await
+            .json()["result"]["capabilities"]
+            .get("resources")
+            .is_none()
+    );
+    for method in [
+        "resources/list",
+        "resources/read",
+        "resources/templates/list",
+    ] {
+        assert_eq!(
+            fixture
+                .post(request(method, json!({"uri":"haystack://x"})))
+                .await
+                .json()["error"]["code"],
+            -32601
+        );
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = HttpConfig::local(listener.local_addr().unwrap());
+    config.semantic_resources = true;
+    config.limits.max_response_bytes = haystack_mcp::SEMANTIC_RESPONSE_BYTES - 1;
+    let result = haystack_mcp::serve_http(
+        fixture.owner.handle(),
+        listener,
+        config.clone(),
+        verifier(&config.resource),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(haystack_mcp::McpError::Configuration)));
+    fixture.close().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_http_deadline_keeps_the_original_worker_until_actual_policy_exit() {
+    let fixture = Fixture::start(|config| {
+        config.semantic_resources = true;
+        config.limits.max_in_flight = 1;
+        config.limits.request_timeout = Duration::from_millis(80);
+    })
+    .await;
+    let _unblock = Unblock(fixture.gate.clone());
+    fixture.gate.blocked.store(true, Ordering::SeqCst);
+    let mut peer = TcpStream::connect(fixture.address).await.unwrap();
+    peer.write_all(&wire(
+        fixture.address,
+        "POST",
+        "/mcp",
+        &fixture.token(),
+        &request("resources/list", json!({})).to_string(),
+        &[],
+        &[],
+    ))
+    .await
+    .unwrap();
+    wait_for(|| fixture.gate.entered.load(Ordering::SeqCst) == 1).await;
+    let mut byte = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(fixture.owner.handle().read_service().load().admitted, 1);
+    assert!(fixture.owner.handle().outstanding_tasks() > 0);
+    fixture.gate.blocked.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.owner.handle().read_service().load().admitted != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.close().await;
 }

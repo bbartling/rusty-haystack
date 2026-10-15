@@ -149,7 +149,7 @@ impl DefNamespace {
     ///
     /// Loads ph, phScience, phIoT, and phIct libraries from the bundled
     /// `defs.trio` file.
-    pub fn load_standard() -> Result<Self, OntologyError> {
+    pub fn load_bundled_h4() -> Result<Self, OntologyError> {
         let source = include_str!("../../data/defs.trio");
         let mut ns = Self::new();
         let libs = load_trio(source)?;
@@ -159,6 +159,13 @@ impl DefNamespace {
             ns.set_lib_source(&lib_name, LibSource::Bundled);
         }
 
+        Ok(ns)
+    }
+
+    /// Load bundled H4 definitions and the historical best-effort Xeto overlay.
+    /// Use [`Self::load_bundled_h4`] when selecting only H4 semantic resources.
+    pub fn load_standard() -> Result<Self, OntologyError> {
+        let mut ns = Self::load_bundled_h4()?;
         // Load bundled Xeto libraries (best-effort).
         // Libraries are returned in dependency order so sequential loading works.
         for bundled in crate::xeto::bundled::bundled_libs() {

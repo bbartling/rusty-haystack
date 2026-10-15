@@ -1,5 +1,6 @@
 #![cfg(feature = "stdio")]
 mod history_support;
+mod resource_support;
 use haystack_app::*;
 use haystack_core::{
     data::HDict,
@@ -500,11 +501,15 @@ async fn close(owner: ApplicationOwner) {
     assert_eq!(owner.handle().outstanding_tasks(), 0);
 }
 struct Wire {
+    modern: bool,
     input: BufReader<ReadHalf<DuplexStream>>,
     output: WriteHalf<DuplexStream>,
 }
 impl Wire {
-    async fn send(&mut self, value: Value) {
+    async fn send(&mut self, mut value: Value) {
+        if self.modern && value.get("id").is_some() {
+            value["params"]["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}});
+        }
         self.output
             .write_all(format!("{value}\n").as_bytes())
             .await
@@ -539,6 +544,15 @@ fn wire_profile(
     bytes: usize,
     profile: haystack_mcp::OutputProfile,
 ) -> (Wire, tokio::task::JoinHandle<Result<Report, McpError>>) {
+    wire_selection(owner, limits, bytes, profile, false)
+}
+fn wire_selection(
+    owner: &ApplicationOwner,
+    limits: Limits,
+    bytes: usize,
+    profile: haystack_mcp::OutputProfile,
+    semantic_resources: bool,
+) -> (Wire, tokio::task::JoinHandle<Result<Report, McpError>>) {
     let (client, server) = tokio::io::duplex(bytes);
     let (input, output) = tokio::io::split(server);
     let application = owner.handle();
@@ -547,13 +561,17 @@ fn wire_profile(
         principal_for_test(),
         input,
         output,
-        limits,
-        profile,
+        haystack_mcp::StdioConfig {
+            limits,
+            output_profile: profile,
+            semantic_resources,
+        },
         CancellationToken::new(),
     ));
     let (input, output) = tokio::io::split(client);
     (
         Wire {
+            modern: false,
             input: BufReader::new(input),
             output,
         },
@@ -679,8 +697,10 @@ async fn released_sdk_client_reads_exact_rich_profile() {
         principal_for_test(),
         input,
         output,
-        Limits::default(),
-        haystack_mcp::OutputProfile::Jeto,
+        haystack_mcp::StdioConfig {
+            output_profile: haystack_mcp::OutputProfile::Jeto,
+            ..Default::default()
+        },
         CancellationToken::new(),
     ));
     let client = serve_client_with_lifecycle(
@@ -755,11 +775,14 @@ async fn discovery_response_floor_rejects_rich_limits_before_serving() {
             principal_for_test(),
             tokio::io::empty(),
             tokio::io::sink(),
-            Limits {
-                max_response_bytes,
-                ..Default::default()
+            haystack_mcp::StdioConfig {
+                limits: Limits {
+                    max_response_bytes,
+                    ..Default::default()
+                },
+                output_profile: haystack_mcp::OutputProfile::Jeto,
+                semantic_resources: false,
             },
-            haystack_mcp::OutputProfile::Jeto,
             CancellationToken::new(),
         )
         .await;
@@ -821,8 +844,7 @@ async fn released_sdk_client_discovers_and_reads_modern_profile() {
         principal_for_test(),
         input,
         output,
-        Limits::default(),
-        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::StdioConfig::default(),
         CancellationToken::new(),
     ));
     let client = serve_client_with_lifecycle(
@@ -1244,6 +1266,18 @@ fn gated_wire(
     Arc<WriteGate>,
     tokio::task::JoinHandle<Result<Report, McpError>>,
 ) {
+    gated_wire_selection(owner, cancelled, false, Duration::from_secs(10))
+}
+fn gated_wire_selection(
+    owner: &ApplicationOwner,
+    cancelled: CancellationToken,
+    semantic_resources: bool,
+    timeout: Duration,
+) -> (
+    Wire,
+    Arc<WriteGate>,
+    tokio::task::JoinHandle<Result<Report, McpError>>,
+) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (input, output) = tokio::io::split(server);
     let gate = Arc::new(WriteGate::default());
@@ -1255,16 +1289,21 @@ fn gated_wire(
             inner: output,
             gate: gate.clone(),
         },
-        Limits {
-            max_in_flight: 1,
-            ..Limits::default()
+        haystack_mcp::StdioConfig {
+            limits: Limits {
+                max_in_flight: 1,
+                request_timeout: timeout,
+                ..Limits::default()
+            },
+            semantic_resources,
+            ..Default::default()
         },
-        haystack_mcp::OutputProfile::H4,
         cancelled,
     ));
     let (input, output) = tokio::io::split(client);
     (
         Wire {
+            modern: false,
             input: BufReader::new(input),
             output,
         },
@@ -1556,6 +1595,373 @@ async fn unidentified_errors_omit_ids_before_and_after_each_selected_lifecycle()
         assert_eq!(recovered["id"], "after-error");
         assert_eq!(envelope(&recovered)["row_count"], 1);
         finished(wire, task).await;
+        close(owner).await;
+    }
+}
+
+async fn semantic_app() -> (ApplicationOwner, Arc<AtomicUsize>, SharedGraph) {
+    #[derive(Clone)]
+    struct ResourcePolicy(Arc<AtomicUsize>);
+    struct ResourceScope(String);
+    impl ReadPolicy for ResourcePolicy {
+        fn snapshot(&self, _: &Principal) -> Result<Arc<dyn PolicySnapshot>, ReadError> {
+            Ok(Arc::new(ResourceScope(format!(
+                "resources-{}",
+                self.0.load(Ordering::SeqCst)
+            ))))
+        }
+    }
+    impl PolicySnapshot for ResourceScope {
+        fn scope_key(&self) -> &str {
+            &self.0
+        }
+        fn function(&self, _: &FunctionIdentity) -> bool {
+            false
+        }
+        fn operation(&self, _: ReadOperation) -> bool {
+            true
+        }
+        fn entity(&self, _: &str) -> bool {
+            true
+        }
+        fn tag(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        fn reference(&self, _: &str) -> bool {
+            true
+        }
+        fn reference_display(&self, _: &str) -> bool {
+            true
+        }
+        fn catalog(&self, _: CatalogKind, name: &str) -> bool {
+            !name.starts_with("hidden")
+        }
+        fn nominal_provenance(&self, _: &NominalScalar) -> bool {
+            false
+        }
+    }
+    let graph = SharedGraph::new(EntityGraph::with_namespace(resource_support::namespace()));
+    let epoch = Arc::new(AtomicUsize::new(0));
+    let owner = ApplicationBuilder::new(
+        graph.clone(),
+        Arc::new(ResourcePolicy(epoch.clone())),
+        ReadLimits::default(),
+    )
+    .unwrap()
+    .start(&tokio::runtime::Handle::current())
+    .unwrap();
+    owner.ready().await.unwrap();
+    (owner, epoch, graph)
+}
+async fn initialize_semantics(wire: &mut Wire, modern: bool) {
+    wire.modern = modern;
+    if modern {
+        wire.send(json!({"jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})).await;
+    } else {
+        wire.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"wire","version":"1"}}})).await;
+    }
+    let result = wire.receive().await;
+    assert_eq!(
+        result["result"]["capabilities"],
+        json!({"tools":{},"resources":{}})
+    );
+    if !modern {
+        wire.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+    }
+}
+#[tokio::test]
+async fn semantic_resources_floor_canonical_reads_and_cache_hints_coexist_with_both_tool_profiles()
+{
+    for profile in [
+        haystack_mcp::OutputProfile::H4,
+        haystack_mcp::OutputProfile::Jeto,
+    ] {
+        for modern in [false, true] {
+            let (owner, epoch, graph) = semantic_app().await;
+            let floor = haystack_mcp::SEMANTIC_RESPONSE_BYTES;
+            let (mut wire, task) = wire_selection(
+                &owner,
+                Limits {
+                    max_response_bytes: floor,
+                    ..Default::default()
+                },
+                floor * 2,
+                profile,
+                true,
+            );
+            initialize_semantics(&mut wire, modern).await;
+            let id = "\u{0001}".repeat(128);
+            let mut cursor = None;
+            let mut resources = Vec::new();
+            loop {
+                let params = match cursor.take() {
+                    Some(cursor) => json!({"cursor":cursor}),
+                    None => json!({}),
+                };
+                wire.send(
+                    json!({"jsonrpc":"2.0","id":id,"method":"resources/list","params":params}),
+                )
+                .await;
+                let response = wire.receive().await;
+                assert_eq!(response["id"], id);
+                assert!(serde_json::to_vec(&response).unwrap().len() < floor);
+                if modern {
+                    assert_eq!(response["result"]["ttlMs"], 0);
+                    assert_eq!(response["result"]["cacheScope"], "private");
+                    assert_eq!(response["result"]["resultType"], "complete");
+                } else {
+                    assert!(response["result"].get("resultType").is_none());
+                }
+                let page = response["result"]["resources"].as_array().unwrap();
+                assert!(!page.is_empty());
+                resources.extend(page.iter().cloned());
+                cursor = response["result"]["nextCursor"].as_str().map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(resources.len(), 13);
+            let unique = resources
+                .iter()
+                .map(|r| r["uri"].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), resources.len());
+            assert!(
+                !serde_json::to_string(&resources)
+                    .unwrap()
+                    .contains("hiddenDef")
+            );
+            let mut saved = None;
+            for resource in &resources {
+                let uri = resource["uri"].as_str().unwrap();
+                let label = resource["name"].as_str().unwrap();
+                let (kind, name) = label.split_once(':').unwrap();
+                let library = if kind == "library" {
+                    name.to_owned()
+                } else if name == "known" {
+                    "phDemo".into()
+                } else {
+                    "l".repeat(256)
+                };
+                wire.send(
+                    json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":{"uri":uri}}),
+                )
+                .await;
+                let response = wire.receive().await;
+                assert!(serde_json::to_vec(&response).unwrap().len() < floor);
+                resource_support::check_content(
+                    &response["result"],
+                    uri,
+                    name,
+                    &library,
+                    kind == "definition",
+                );
+                if name == "known" {
+                    saved = Some(uri.to_owned());
+                }
+            }
+            let saved = saved.unwrap();
+            wire.send(json!({"jsonrpc":"2.0","id":id,"method":"resources/templates/list"}))
+                .await;
+            assert_eq!(
+                wire.receive().await["result"]["resourceTemplates"],
+                json!([])
+            );
+            for method in ["resources/subscribe", "completion/complete", "prompts/list"] {
+                wire.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":{"uri":saved}}))
+                    .await;
+                assert_eq!(wire.receive().await["error"]["code"], -32601);
+            }
+            epoch.store(1, Ordering::SeqCst);
+            wire.send(
+                json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":{"uri":saved}}),
+            )
+            .await;
+            let denied = wire.receive().await;
+            assert_eq!(denied["error"]["code"], -32602);
+            assert_eq!(
+                denied["error"]["message"],
+                "Resource unavailable or stale; rediscover"
+            );
+            graph.set_namespace(resource_support::namespace());
+            wire.send(
+                json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":{"uri":saved}}),
+            )
+            .await;
+            assert_eq!(wire.receive().await["error"], denied["error"]);
+            finished(wire, task).await;
+            close(owner).await;
+        }
+    }
+}
+#[tokio::test]
+async fn selected_semantic_floor_rejects_before_reading_stdio_and_unselected_inventory_is_absent() {
+    let (owner, _, _) = semantic_app().await;
+    let result = haystack_mcp::serve(
+        owner.handle(),
+        principal_for_test(),
+        tokio::io::empty(),
+        tokio::io::sink(),
+        haystack_mcp::StdioConfig {
+            limits: Limits {
+                max_response_bytes: haystack_mcp::SEMANTIC_RESPONSE_BYTES - 1,
+                ..Default::default()
+            },
+            semantic_resources: true,
+            ..Default::default()
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(McpError::Configuration)));
+    let (mut wire, task) = wire(&owner, Limits::default(), 64 * 1024);
+    initialize(&mut wire).await;
+    for method in [
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+    ] {
+        wire.send(json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"uri":"haystack://unavailable"}})).await;
+        assert_eq!(wire.receive().await["error"]["code"], -32601);
+    }
+    finished(wire, task).await;
+    close(owner).await;
+}
+#[tokio::test]
+async fn released_sdk_discovers_and_reads_resources_and_raw_requests_reject_stale_cache_entries() {
+    use rmcp::model::{
+        ClientRequest, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResponse,
+    };
+    let (owner, epoch, _) = semantic_app().await;
+    let (client, server) = tokio::io::duplex(256 * 1024);
+    let (input, output) = tokio::io::split(server);
+    let task = tokio::spawn(haystack_mcp::serve(
+        owner.handle(),
+        principal_for_test(),
+        input,
+        output,
+        haystack_mcp::StdioConfig {
+            semantic_resources: true,
+            ..Default::default()
+        },
+        CancellationToken::new(),
+    ));
+    let client = serve_client_with_lifecycle(
+        ClientConfig::default(),
+        client,
+        ClientLifecycleMode::Discover {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        },
+    )
+    .await
+    .unwrap();
+    let resources = client.list_all_resources().await.unwrap();
+    let uri = resources
+        .iter()
+        .find(|r| r.name == "definition:known")
+        .unwrap()
+        .uri
+        .clone();
+    let ReadResourceResponse::Complete(result) = client
+        .read_resource_once(ReadResourceRequestParams::new(&uri))
+        .await
+        .unwrap()
+    else {
+        panic!("unexpected multi-round response")
+    };
+    resource_support::check_content(
+        &serde_json::to_value(result).unwrap(),
+        &uri,
+        "known",
+        "phDemo",
+        true,
+    );
+    assert!(
+        client
+            .list_resource_templates(None)
+            .await
+            .unwrap()
+            .resource_templates
+            .is_empty()
+    );
+    epoch.store(1, Ordering::SeqCst);
+    // send_request bypasses read_resource_once's deliberate stale-on-error cache.
+    let error = client
+        .send_request(ClientRequest::ReadResourceRequest(
+            ReadResourceRequest::new(ReadResourceRequestParams::new(&uri)),
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Resource unavailable or stale"));
+    client.cancel().await.unwrap();
+    let report = task.await.unwrap().unwrap();
+    assert_eq!(report.admitted, report.released);
+    close(owner).await;
+}
+
+#[tokio::test]
+async fn semantic_slow_output_obeys_cancel_deadline_and_stop_without_leaking_capacity() {
+    for event in ["cancel", "deadline", "stop"] {
+        let (owner, _, _) = semantic_app().await;
+        let stop = CancellationToken::new();
+        let (mut wire, gate, task) = gated_wire_selection(
+            &owner,
+            stop.clone(),
+            true,
+            if event == "deadline" {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_secs(5)
+            },
+        );
+        initialize_semantics(&mut wire, false).await;
+        gate.blocked.store(true, Ordering::SeqCst);
+        wire.send(json!({"jsonrpc":"2.0","id":7,"method":"resources/list"}))
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), gate.polled.notified())
+            .await
+            .unwrap();
+        assert!(owner.handle().outstanding_tasks() > 0);
+        if event == "cancel" {
+            wire.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}})).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while owner.handle().outstanding_tasks() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            gate.release();
+            wire.send(json!({"jsonrpc":"2.0","id":7,"method":"resources/list"}))
+                .await;
+            assert_eq!(
+                wire.receive().await["result"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                8
+            );
+            let report = finished(wire, task).await;
+            assert_eq!(report.suppressed, 1);
+        } else {
+            if event == "stop" {
+                stop.cancel();
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if event == "deadline" {
+                assert_eq!(outcome.unwrap_err(), McpError::Deadline);
+            } else {
+                let report = outcome.unwrap();
+                assert_eq!(report.admitted, report.released);
+            }
+            gate.release();
+            drop(wire);
+        }
+        assert_eq!(owner.handle().read_service().load().admitted, 0);
         close(owner).await;
     }
 }

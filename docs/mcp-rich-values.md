@@ -1,8 +1,10 @@
 # Rich values in read-only MCP tools
 
 Both transports default to `haystack-h4-json-v1`. A trusted launch may instead
-select `output_profile = "haystack-jeto-v1"`. That process still exposes only
-`haystack_read` and `haystack_query`, with schemas fixed for its lifetime. Every
+select `output_profile = "haystack-jeto-v1"`. Its entity tools remain
+`haystack_read` and `haystack_query`, with schemas fixed for its lifetime. Separately
+selected history and [H4 semantic resources](mcp-semantic-resources.md) retain
+their own authority; resource content stays in the fixed H4 semantic profile. Every
 call to the rich profile must acknowledge `"profile":"haystack-jeto-v1"` in its
 arguments. Missing or mismatched acknowledgments fail with JSON-RPC `-32602`
 before application read admission. H4 calls and schemas retain their original

@@ -12,8 +12,10 @@ its server support selected in production. It supports exactly MCP `2026-07-28`
 discovery and `2025-11-25` initialization. Client metadata negotiates protocol
 behavior; it cannot select a principal, scope, dataset, path, URL or command.
 Explicitly selecting a history service adds the bounded
-[`haystack_history` tool](mcp-history.md). No mutation, command, resource, prompt,
-sampling, elicitation or task capability is exposed.
+[`haystack_history` tool](mcp-history.md). Explicit semantic selection adds
+[H4 definition/library resources](mcp-semantic-resources.md), independently of
+tool output presentation. No mutation, command, prompt, sampling, elicitation
+or task capability is exposed.
 
 ## Standalone launch
 
@@ -133,6 +135,8 @@ Selecting history raises the default and minimum full response budget to 2 MiB
 for either output profile; the maximum remains 16 MiB. This covers the selected
 three-tool inventory and shared history encoding headroom. Per-call history
 data limits and diagnostic limits are described in [the history profile](mcp-history.md).
+Selecting semantic resources adds a 128 KiB floor, detailed in the
+[resource profile](mcp-semantic-resources.md); a larger history floor still applies.
 
 Frame collection is bounded before JSON materialization. The reader independently
 processes cancellation while execution or output is busy. Admission and response
@@ -154,7 +158,9 @@ permitted only after release. The shared `ReadAdmission::read_joined` seam waits
 for the worker's actual permit and registration release after cancellation. The
 existing prompt-cancellation `read` API retains its original behavior.
 
-`haystack_mcp::serve` borrows an `ApplicationHandle` and caller runtime. Awaiting
+`haystack_mcp::serve` accepts an explicit `StdioConfig` containing limits,
+output profile and semantic-resource selection, and borrows an `ApplicationHandle`
+and caller runtime. Awaiting
 its result joins reader/writer tasks and all request leases; closing the adapter
 leaves the application available to other adapters. The supplied I/O must be
 cancellation safe, and trusted application callbacks must honor the shared

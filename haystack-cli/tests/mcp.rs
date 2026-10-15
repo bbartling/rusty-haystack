@@ -341,3 +341,78 @@ fn mcp_http_invalid_configuration_is_sanitized() {
     assert!(error.contains("invalid MCP HTTP configuration"));
     assert!(!error.contains("do-not-echo-this"));
 }
+
+#[cfg(any(feature = "mcp", feature = "mcp-http"))]
+#[test]
+fn semantic_selection_and_grants_fail_before_dataset_or_listener_work() {
+    for (command, prefix, scope, invalid_config) in [
+        #[cfg(feature = "mcp")]
+        (
+            "stdio",
+            "",
+            "principal = 'fixture'\nentity_ids = ['a']\n",
+            "invalid MCP configuration",
+        ),
+        #[cfg(feature = "mcp-http")]
+        (
+            "http",
+            "listen = '127.0.0.1:0'\nissuer = 'https://issuer.example.test'\nrequired_scope = 'haystack:read'\n[[keys]]\nkid = 'fixture'\nalgorithm = 'RS256'\npublic_key_der_base64 = ''\n",
+            "[[subjects]]\nsubject = 'fixture'\nentity_ids = ['a']\n",
+            "invalid MCP HTTP configuration",
+        ),
+    ] {
+        for (selection, grants, diagnostic) in [
+            (
+                "",
+                "h4_libraries = ['phIoT']\n",
+                "require semantic_resources",
+            ),
+            (
+                "semantic_resources = 'haystack-h4-semantics-v1'\n",
+                "h4_libraries = ['phIoT']\nh4_definitions = ['notReal']\n",
+                "H4 grants must name",
+            ),
+            (
+                "semantic_resources = 'haystack-h4-semantics-v1'\n",
+                "h4_libraries = ['ph']\nh4_definitions = ['ahu']\n",
+                "H4 grants must name",
+            ),
+            (
+                "semantic_resources = 'haystack-h4-semantics-v1'\n",
+                "h4_libraries = ['sys']\n",
+                "H4 grants must name",
+            ),
+            (
+                "semantic_resources = 'haystack-h4-semantics-v1'\n",
+                "h4_libraries = ['phIoT', 'phIoT']\n",
+                "H4 grants must name",
+            ),
+            (
+                "semantic_resources = 'haystack-h4-semantics-v1'\nmax_response_bytes = 131071\n",
+                "h4_libraries = ['phIoT']\n",
+                invalid_config,
+            ),
+            (
+                "semantic_resources = 'unselected-xeto'\n",
+                "",
+                invalid_config,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("semantics.toml");
+            std::fs::write(&path, format!("version = 1\ndataset_file = 'private-absent-dataset'\ndataset_format = 'trio'\n{selection}{prefix}{scope}{grants}")).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_haystack"))
+                .args(["mcp", command, "--config"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(error.contains(diagnostic), "{command}: {error}");
+            assert!(
+                !error.contains("private-absent-dataset") && !error.contains("MCP HTTP ready:")
+            );
+        }
+    }
+}

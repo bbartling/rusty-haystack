@@ -53,6 +53,7 @@ mod http;
 #[cfg(any(feature = "mcp", feature = "mcp-http"))]
 mod selected {
     mod history;
+    mod semantics;
     use haystack_app::*;
     #[cfg(feature = "mcp")]
     use haystack_core::graph::SharedGraph;
@@ -62,6 +63,9 @@ mod selected {
         xeto::catalog::{ActivatedCatalog, Catalog},
     };
     pub(super) use history::select_history;
+    pub(super) use semantics::{
+        SemanticProfile, SemanticScope, semantic_namespace, semantic_scope,
+    };
     #[cfg(feature = "mcp")]
     use serde::Deserialize;
     use std::{collections::BTreeSet, io::Read, path::Path, sync::Arc};
@@ -77,6 +81,12 @@ mod selected {
         dataset_format: String,
         #[serde(default)]
         output_profile: haystack_mcp::OutputProfile,
+        #[serde(default)]
+        semantic_resources: Option<SemanticProfile>,
+        #[serde(default)]
+        h4_libraries: Vec<String>,
+        #[serde(default)]
+        h4_definitions: Vec<String>,
         #[serde(default)]
         nominal_specs: Vec<String>,
         #[serde(default)]
@@ -110,6 +120,7 @@ mod selected {
         pub(super) hidden: BTreeSet<String>,
         pub(super) types: Option<Arc<NominalScope>>,
         pub(super) history: bool,
+        pub(super) semantics: Option<Arc<SemanticScope>>,
     }
     pub(super) struct NominalScope {
         names: BTreeSet<String>,
@@ -183,6 +194,11 @@ mod selected {
         fn operation(&self, operation: ReadOperation) -> bool {
             operation == ReadOperation::Read
                 || (self.history && operation == ReadOperation::History)
+                || (self.semantics.is_some()
+                    && matches!(
+                        operation,
+                        ReadOperation::Definitions | ReadOperation::Libraries
+                    ))
         }
         fn entity(&self, id: &str) -> bool {
             self.ids.contains(id)
@@ -197,15 +213,23 @@ mod selected {
             self.ids.contains(target)
         }
         fn catalog(&self, kind: CatalogKind, name: &str) -> bool {
-            self.types.as_ref().is_some_and(|scope| match kind {
-                CatalogKind::Spec => scope.names.contains(name),
-                CatalogKind::Library => scope.names.iter().any(|qname| {
-                    qname
-                        .split_once("::")
-                        .is_some_and(|(library, _)| library == name)
-                }),
-                _ => false,
-            })
+            self.semantics
+                .as_ref()
+                .is_some_and(|scope| scope.allows(kind, name))
+                || self.types.as_ref().is_some_and(|scope| match kind {
+                    CatalogKind::Spec => scope.names.contains(name),
+                    CatalogKind::Library => scope.names.iter().any(|qname| {
+                        qname
+                            .split_once("::")
+                            .is_some_and(|(library, _)| library == name)
+                    }),
+                    _ => false,
+                })
+        }
+        fn semantic_resource(&self, kind: CatalogKind, name: &str) -> bool {
+            self.semantics
+                .as_ref()
+                .is_some_and(|scope| scope.allows(kind, name))
         }
         fn nominal_provenance(&self, value: &NominalScalar) -> bool {
             self.types.as_ref().is_some_and(|scope| {
@@ -273,15 +297,24 @@ mod selected {
                 .iter()
                 .any(|tag| tag.is_empty() || tag.len() > 256)
             || !(10..=60_000).contains(&config.request_timeout_ms)
-            || !(config
-                .output_profile
-                .selected_min_response_bytes(config.history_file.is_some())
-                ..=16 * 1024 * 1024)
+            || !(config.output_profile.resource_min_response_bytes(
+                config.history_file.is_some(),
+                config.semantic_resources.is_some(),
+            )..=16 * 1024 * 1024)
                 .contains(&max_response_bytes)
         {
             return Err("invalid MCP configuration".into());
         }
+        let namespace = semantic_namespace(config.semantic_resources)?;
+        let semantics = semantic_scope(
+            namespace.as_ref(),
+            &config.h4_libraries,
+            &config.h4_definitions,
+        )?;
         let mut graph = load_graph(path, &config.dataset_file, &config.dataset_format)?;
+        if let Some(namespace) = namespace {
+            graph.set_namespace(namespace);
+        }
         let observation = initialize_profile(&mut graph, config.output_profile)?;
         let principal = Principal::TrustedEmbedding {
             subject: config.principal,
@@ -292,6 +325,7 @@ mod selected {
             hidden: config.hidden_tags.into_iter().collect(),
             types: nominal_scope(observation.as_ref(), &config.nominal_specs)?,
             history: config.history_read,
+            semantics,
         });
         let limits = haystack_mcp::Limits {
             request_timeout: Duration::from_millis(config.request_timeout_ms),
@@ -308,7 +342,13 @@ mod selected {
             .enable_all()
             .build()
             .map_err(|_| "cannot create MCP runtime")?;
-        let result = runtime.block_on(session(builder, principal, limits, config.output_profile));
+        let result = runtime.block_on(session(
+            builder,
+            principal,
+            limits,
+            config.output_profile,
+            config.semantic_resources.is_some(),
+        ));
         drop(runtime);
         result
     }
@@ -377,6 +417,7 @@ mod selected {
         principal: Principal,
         limits: haystack_mcp::Limits,
         profile: haystack_mcp::OutputProfile,
+        semantic_resources: bool,
     ) -> Result<(), String> {
         use std::os::fd::AsFd;
         use tokio::{
@@ -410,8 +451,11 @@ mod selected {
             principal,
             input,
             output,
-            limits,
-            profile,
+            haystack_mcp::StdioConfig {
+                limits,
+                output_profile: profile,
+                semantic_resources,
+            },
             stop.clone(),
         );
         tokio::pin!(serving);
@@ -438,6 +482,7 @@ mod selected {
         _: Principal,
         _: haystack_mcp::Limits,
         _: haystack_mcp::OutputProfile,
+        _: bool,
     ) -> Result<(), String> {
         Err("MCP stdio requires the Unix pipe platform profile".into())
     }

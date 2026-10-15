@@ -4,6 +4,10 @@ mod packages;
 pub(crate) mod postgres_snapshot;
 pub use packages::{ApplicationPackageError, PackagePreparationLimits, PreparedPackageAdmission};
 mod history_read;
+mod semantic_resources;
+pub use semantic_resources::{
+    H4_RESOURCE_PROFILE, H4_RESOURCE_URI_BYTES, H4Resource, H4ResourceContent, H4ResourcePage,
+};
 mod nav;
 mod system;
 mod typed_command;
