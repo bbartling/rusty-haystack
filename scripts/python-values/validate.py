@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--python", type=Path, required=True)
     parser.add_argument("--pyright", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
+    parser.add_argument("--watch-fixture", type=Path, required=True)
     args = parser.parse_args()
     work = args.work.resolve()
     if work.is_relative_to(REPO):
@@ -60,10 +61,13 @@ def main():
     manifest.write_text(json.dumps(artifacts.typing_sources(REPO), sort_keys=True))
     version = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     installed = json.loads(run([str(python), "-I", str(REPO / "scripts/release/consumer.py"), "--prefix", str(venv), "--version", version, "--typing-manifest", str(manifest)], work, "installed-layout", cwd=scratch))
-    for name in ("positive.py", "negative.py", "async-runtime.py", "application-runtime.py"):
+    for name in ("positive.py", "negative.py", "async-runtime.py", "application-runtime.py", "watch-runtime.py"):
         shutil.copyfile(Path(__file__).with_name(name), scratch / name)
     shutil.copyfile(REPO / "rusty-haystack/tests/async_peer.py", scratch / "async_peer.py")
     shutil.copyfile(REPO / "rusty-haystack/tests/application_fixture.py", scratch / "application_fixture.py")
+    shutil.copyfile(REPO / "rusty-haystack/tests/watch_fixture.py", scratch / "watch_fixture.py")
+    watch_fixture = scratch / args.watch_fixture.name
+    shutil.copy2(args.watch_fixture.resolve(), watch_fixture)
     shutil.copyfile(REPO / "haystack-core/tests/fixtures/typed-v1-entity.json", scratch / "typed-v1-entity.json")
     (scratch / "pyrightconfig.json").write_text(json.dumps({"typeCheckingMode": "strict", "pythonVersion": "3.11", "extraPaths": []}))
     run([str(python), "-I", str(scratch / "positive.py")], work, "positive-runtime", cwd=scratch)
@@ -72,6 +76,16 @@ def main():
     expected_helper = REPO / "rusty-haystack/rusty_haystack/_application.py"
     if application_runtime["entry_helper_sha256"] != hashlib.sha256(expected_helper.read_bytes()).hexdigest():
         raise AssertionError("installed application entry helper differs from source")
+    watch_runtime = json.loads(run([str(python), "-I", str(scratch / "watch-runtime.py"), "--fixture", str(watch_fixture)], work, "watch-runtime", cwd=scratch))
+    expected_watch_helper = REPO / "rusty-haystack/rusty_haystack/_watch.py"
+    if watch_runtime["entry_helper_sha256"] != artifacts.digest(expected_watch_helper):
+        raise AssertionError("installed watch entry helper differs from source")
+    if watch_runtime["fixture_sha256"] != artifacts.digest(args.watch_fixture.resolve()):
+        raise AssertionError("copied first-party watch executable differs from input")
+    watch_inputs = {str(path.relative_to(REPO)): artifacts.digest(path) for path in (
+        expected_watch_helper, REPO / "rusty-haystack/tests/watch_fixture.py",
+        REPO / "scripts/python-values/watch-runtime.py", REPO / "haystack-server/examples/python_watch_fixture.rs",
+    )}
     command = [checker, "--pythonpath", str(python), "--outputjson"]
     positive = json.loads(run(command + ["positive.py"], work, "positive-static", cwd=scratch))
     # PyO3 registers these modules in sys.modules; no Python source file exists
@@ -90,7 +104,7 @@ def main():
     actual_lines = {item["range"]["start"]["line"] for item in diagnostics if item["severity"] == "error" and Path(item["file"]).resolve() == scratch / "negative.py"}
     if actual_lines != expected_lines or any(item["severity"] != "error" or Path(item["file"]).resolve() != scratch / "negative.py" for item in diagnostics):
         raise AssertionError("negative static diagnostics did not match the marked consumer lines")
-    result = {"wheel": str(wheel), "wheel_sha256": artifacts.digest(wheel), "checker": CHECKER, "static_python_floor": "3.11", "positive_errors": 0, "native_submodule_source_warnings": source_warnings, "negative_lines_rejected": len(expected_lines), "installed": installed, "async_runtime": async_runtime, "application_runtime": application_runtime}
+    result = {"wheel": str(wheel), "wheel_sha256": artifacts.digest(wheel), "checker": CHECKER, "static_python_floor": "3.11", "positive_errors": 0, "native_submodule_source_warnings": source_warnings, "negative_lines_rejected": len(expected_lines), "installed": installed, "async_runtime": async_runtime, "application_runtime": application_runtime, "watch_runtime": watch_runtime, "watch_inputs": watch_inputs}
     (work / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, sort_keys=True))
 

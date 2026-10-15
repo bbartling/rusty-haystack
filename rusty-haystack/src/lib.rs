@@ -1,6 +1,7 @@
 mod application;
 mod async_bridge;
 mod async_client;
+mod async_watch;
 mod auth;
 mod client;
 mod codecs;
@@ -15,6 +16,7 @@ mod ontology;
 mod rich_kinds;
 mod server;
 mod units;
+mod watch_owner;
 
 use pyo3::prelude::*;
 
@@ -66,6 +68,9 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ontology::PyDefNamespace>()?;
 
     m.add_class::<async_client::PyAsyncHaystackClient>()?;
+    m.add_class::<async_watch::PyAsyncWatch>()?;
+    m.add_class::<async_watch::PyWatchDelivery>()?;
+    m.add_class::<async_watch::PyWatchControl>()?;
     m.add_class::<application::PyApplicationBuilder>()?;
     m.add_class::<application::PyApplicationOwner>()?;
     m.add_class::<application::PyApplicationHandle>()?;
@@ -182,6 +187,9 @@ fn rusty_haystack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Submodule: client ──
     add_submodule(m, "client", |sub| {
         sub.add_class::<async_client::PyAsyncHaystackClient>()?;
+        sub.add_class::<async_watch::PyAsyncWatch>()?;
+        sub.add_class::<async_watch::PyWatchDelivery>()?;
+        sub.add_class::<async_watch::PyWatchControl>()?;
         sub.add_class::<client::PyHaystackClient>()?;
         sub.add_class::<client::PyWsClient>()?;
         sub.add_class::<client::PyTlsConfig>()?;

@@ -3,6 +3,7 @@
 //! Dropping a request does not join Hyper's connection tasks or an already
 //! running DNS/SCRAM blocking job. The owner thread destroys its runtime before
 //! it returns; the independent reaper then joins that thread and drains tickets.
+use crate::watch_owner;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -48,7 +49,11 @@ pub(crate) struct Settings {
 struct Control {
     phase: Phase,
     settings: Option<Settings>,
-    commands: Option<mpsc::Sender<Read>>,
+    commands: Option<mpsc::Sender<Command>>,
+    // Retain bounded logical key ownership even after locally joined Unknown
+    // cleanup or after Python drops its handle. Inner has no back-reference to
+    // Owner; only an admitted operation's temporary ticket holds the parent.
+    watches: Vec<Arc<watch_owner::Inner>>,
     thread: Option<JoinHandle<()>>,
     starting: bool,
     active: usize,
@@ -64,9 +69,9 @@ pub(crate) struct Owner(Arc<Inner>);
 
 /// Shared by the native task and Python-result conversion. Admission is released
 /// only when BOTH legs have finished, including cancellation/late conversion.
-struct Ticket {
+pub(crate) struct Ticket {
     owner: Owner,
-    cancel: CancellationToken,
+    pub(crate) cancel: CancellationToken,
 }
 impl Drop for Ticket {
     fn drop(&mut self) {
@@ -120,6 +125,10 @@ impl Cancellation {
         }
     }
 }
+enum Command {
+    Read(Read),
+    Watch(watch_owner::Registration),
+}
 struct Read {
     filter: String,
     limit: usize,
@@ -135,6 +144,7 @@ impl Owner {
                 phase: Phase::New,
                 settings: Some(settings),
                 commands: None,
+                watches: Vec::new(),
                 thread: None,
                 starting: false,
                 active: 0,
@@ -227,6 +237,65 @@ impl Owner {
         })
     }
 
+    pub(crate) fn admit(&self) -> Result<Arc<Ticket>, ClientError> {
+        {
+            let mut control = self.0.control.lock();
+            if control.phase != Phase::Open {
+                return Err(ClientError::ConnectionClosed);
+            }
+            if control.active >= MAX_IN_FLIGHT {
+                return Err(ClientError::TooManyRequests);
+            }
+            control.active += 1;
+        }
+        Ok(Arc::new(Ticket {
+            owner: self.clone(),
+            cancel: CancellationToken::new(),
+        }))
+    }
+
+    pub(crate) fn watch(
+        &self,
+        ids: Vec<String>,
+        key: String,
+        lease_ms: u64,
+        cleanup: Duration,
+    ) -> Result<watch_owner::Handle, ClientError> {
+        let (handle, registration) =
+            watch_owner::Handle::new(self.clone(), ids, key, lease_ms, cleanup)?;
+        let mut control = self.0.control.lock();
+        if control.phase != Phase::Open {
+            return Err(ClientError::ConnectionClosed);
+        }
+        control.watches.retain(|watch| !watch.release_confirmed());
+        if control
+            .watches
+            .iter()
+            .any(|watch| watch.key() == handle.key())
+        {
+            return Err(ClientError::Connection(
+                "watch creation key is already reserved by this session".into(),
+            ));
+        }
+        if control.watches.len() >= watch_owner::MAX_WATCH_RESERVATIONS {
+            return Err(ClientError::TooManyRequests);
+        }
+        // Reserve before registration while the same parent lock serializes
+        // every constructor. Roll back only if no native registration occurred.
+        control.watches.push(handle.inner.clone());
+        if control
+            .commands
+            .as_ref()
+            .expect("open commands")
+            .try_send(Command::Watch(registration))
+            .is_err()
+        {
+            control.watches.pop();
+            return Err(ClientError::TooManyRequests);
+        }
+        Ok(handle)
+    }
+
     pub(crate) fn read(
         &self,
         filter: String,
@@ -263,7 +332,7 @@ impl Owner {
         // Admission above linearizes before close. If close wins after it, this
         // accepted operation is cancelled; the ticket still joins both legs.
         commands
-            .try_send(command)
+            .try_send(Command::Read(command))
             .map_err(|_| ClientError::ConnectionClosed)?;
         Ok(Operation {
             response: receiver,
@@ -279,7 +348,7 @@ impl Owner {
         deadline: Instant,
         ticket: Arc<Ticket>,
         response: oneshot::Sender<Result<Option<HGrid>, ClientError>>,
-        mut commands: mpsc::Receiver<Read>,
+        mut commands: mpsc::Receiver<Command>,
     ) {
         // A newly registered Tokio timer may be pending until its driver ticks,
         // even when its deadline is already past. Check before polling any I/O.
@@ -294,6 +363,15 @@ impl Owner {
                 result = HaystackClient::connect_with_config(&settings.url, &settings.username, &settings.password, &settings.config) => result,
             }
         };
+        let ws_url = url::Url::parse(&settings.url)
+            .ok()
+            .map(|mut url| {
+                let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+                let _ = url.set_scheme(scheme);
+                url.set_path(&format!("{}/ws", url.path().trim_end_matches('/')));
+                url.to_string()
+            })
+            .unwrap_or_default();
         drop(settings);
         let client = match connected {
             Ok(client) => {
@@ -315,13 +393,24 @@ impl Owner {
         let _ = response.send(Ok(None));
         drop(ticket);
         let mut tasks = tokio::task::JoinSet::new();
+        let mut watches = tokio::task::JoinSet::new();
+        let mut had_watches = false;
         loop {
             tokio::select! {
                 biased;
                 _ = self.0.stop.cancelled() => break,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                Some(_) = watches.join_next(), if !watches.is_empty() => {},
                 command = commands.recv() => {
                     let Some(command) = command else { break };
+                    let command = match command {
+                        Command::Watch(watch) => {
+                            had_watches = true;
+                            watches.spawn(watch.run(client.clone(), ws_url.clone()));
+                            continue;
+                        }
+                        Command::Read(read) => read,
+                    };
                     let client = client.clone();
                     let stop = self.0.stop.clone();
                     tasks.spawn(async move {
@@ -340,8 +429,23 @@ impl Owner {
         }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        // Dropping queued commands releases their replies and native ticket leg.
-        drop(commands);
+        // Every admitted child, including one still in the registration queue,
+        // cleans up under this original session before its runtime is destroyed.
+        commands.close();
+        while let Some(command) = commands.recv().await {
+            if let Command::Watch(watch) = command {
+                had_watches = true;
+                watch.inner.begin_close();
+                watches.spawn(watch.run(client.clone(), ws_url.clone()));
+            }
+        }
+        while watches.join_next().await.is_some() {}
+        // Owned Python sessions dispose their auth authority after their children;
+        // generic HttpTransport::close remains unchanged. A lost logout response
+        // does not change an individual child's remote cleanup receipt.
+        if had_watches {
+            let _ = tokio::time::timeout(Duration::from_secs(2), client.close_session()).await;
+        }
         drop(client);
     }
 
@@ -362,6 +466,10 @@ impl Owner {
                 }
             }
         };
+        let watches = self.0.control.lock().watches.clone();
+        for watch in watches {
+            watch.begin_close();
+        }
         self.0.stop.cancel();
         self.0.changed.send_replace(());
         if reap {
@@ -398,6 +506,9 @@ impl Owner {
             {
                 let mut control = self.0.control.lock();
                 if control.active == 0 {
+                    // The owned session/runtime is disposed, and no conversion
+                    // leg can still refer to an admitted remote operation.
+                    control.watches.clear();
                     control.phase = Phase::Closed;
                     break;
                 }

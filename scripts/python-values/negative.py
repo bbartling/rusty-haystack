@@ -47,3 +47,27 @@ async def bad_report() -> None:
     report = await application.terminated()
     report.close_error = None  # reject
     report.cleanup_errors = ()  # reject
+
+watch = async_client.watch(["a"], key="negative")
+async_client.watch("a", key="bad")  # reject
+async_client.watch([1], key="bad")  # reject
+async_client.watch(["a"], key=1)  # reject
+async_client.watch(["a"], key="bad", lease_ms="long")  # reject
+async_client.watch(["a"], key="bad", cleanup_timeout="long")  # reject
+watch.next(deadline="later")  # reject
+watch.ack(object())  # reject
+watch.renew("long")  # reject
+watch.key = "changed"  # reject
+watch.pending = None  # reject
+watch.closed = True  # reject
+asyncio.create_task(watch.next())  # reject
+watch.__aenter__().cancel()  # reject
+async def bad_watch(delivery: rh.WatchDelivery, control: rh.WatchControl) -> None:
+    await watch  # reject
+    delivery.token = "changed"  # reject
+    delivery.scope_generation = 0  # reject
+    delivery.through = 0  # reject
+    delivery.changed = ()  # reject
+    delivery.removed = ()  # reject
+    control.kind = "closed"  # reject
+    control.local_joined = True  # reject

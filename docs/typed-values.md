@@ -224,6 +224,7 @@ python scripts/python-values/validate.py \
   --wheel /absolute/path/rusty_haystack-<version>-cp312-cp312-<platform>.whl \
   --python /absolute/path/python3.12 \
   --pyright /absolute/path/pyright \
+  --watch-fixture /absolute/path/python_watch_fixture \
   --work /absolute/path/fresh-consumer-directory
 ```
 
@@ -235,7 +236,14 @@ installed sample requires zero type errors and retains ten exact
 imports: these modules are registered by the extension and have no Python source
 files. Other diagnostics fail validation. The negative sample must reject every
 marked misuse. Source-stub analysis is separate and can be warning-free. The
-consumer performs no network installation. Binding-internal Rust tests additionally exercise
+consumer performs no network installation. Build the first-party watch fixture with
+`cargo build --locked -p rusty-haystack-server --example python_watch_fixture`.
+Validation copies that executable and the watch consumer into external scratch,
+checks their hashes and the installed private entry helper, and exercises real
+HTTP Create/cleanup plus same-session WS delivery/ACK/recovery. Independent known
+values, prepared server identities, full replacements/removals, terminal controls,
+request sequences and cleanup counts each have rejecting mutation controls.
+Binding-internal Rust tests additionally exercise
 unrepresentable core values with an explicitly linked trusted CPython library;
 rebuilt-extension pytest remains separate evidence. These selected checks do not
 establish every platform, free-threaded Python, H5 or release qualification.

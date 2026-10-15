@@ -1,5 +1,5 @@
 //! Small asyncio API over a resource-owning HTTP client.
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use haystack_client::{ClientConfig, ClientError};
 use parking_lot::Mutex;
@@ -24,6 +24,10 @@ struct Affinity {
 #[pyclass(name = "AsyncHaystackClient", module = "rusty_haystack.client", frozen)]
 pub(crate) struct PyAsyncHaystackClient {
     owner: Owner,
+    pub(crate) context: Arc<ClientContext>,
+}
+
+pub(crate) struct ClientContext {
     affinity: Mutex<Option<Affinity>>,
     timeout: Duration,
 }
@@ -42,17 +46,21 @@ impl CancelOperation {
     }
 }
 
-fn native_error(error: ClientError) -> PyErr {
+pub(crate) fn native_error(error: ClientError) -> PyErr {
     match error {
         ClientError::Timeout(_) => PyTimeoutError::new_err("async client deadline expired"),
         error => crate::exceptions::ClientError::new_err(error.to_string()),
     }
 }
 
-impl PyAsyncHaystackClient {
+impl ClientContext {
     /// All Python calls happen outside the affinity mutex. Identity comparisons
     /// themselves use pointer equality, never user-overridable Python methods.
-    fn context(&self, py: Python<'_>, deadline: Option<f64>) -> PyResult<(TaskLocals, Instant)> {
+    pub(crate) fn context(
+        &self,
+        py: Python<'_>,
+        deadline: Option<f64>,
+    ) -> PyResult<(TaskLocals, Instant)> {
         let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
         let thread = std::thread::current().id();
         {
@@ -97,14 +105,15 @@ impl PyAsyncHaystackClient {
             .ok_or_else(|| PyValueError::new_err("deadline is out of range"))?;
         Ok((TaskLocals::new(event_loop).copy_context(py)?, deadline))
     }
-
+}
+impl PyAsyncHaystackClient {
     fn start_connect<'py>(
         &self,
         py: Python<'py>,
         deadline: Option<f64>,
         value: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (locals, deadline) = self.context(py, deadline)?;
+        let (locals, deadline) = self.context.context(py, deadline)?;
         // Initialize the shared bridge before starting a native owner, so its
         // reaper can always run even when Future creation or notification fails.
         let _ = async_bridge::runtime();
@@ -167,8 +176,10 @@ impl PyAsyncHaystackClient {
                 password: Zeroizing::new(password),
                 config,
             }),
-            affinity: Mutex::new(None),
-            timeout,
+            context: Arc::new(ClientContext {
+                affinity: Mutex::new(None),
+                timeout,
+            }),
         })
     }
 
@@ -194,7 +205,7 @@ impl PyAsyncHaystackClient {
         limit: usize,
         deadline: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (locals, deadline) = self.context(py, deadline)?;
+        let (locals, deadline) = self.context.context(py, deadline)?;
         if !(1..=1000).contains(&limit) {
             return Err(PyValueError::new_err("limit must be between 1 and 1000"));
         }
@@ -222,9 +233,34 @@ impl PyAsyncHaystackClient {
         Ok(future)
     }
 
+    #[pyo3(signature = (ids, *, key, lease_ms=60_000, cleanup_timeout=2.0))]
+    fn watch(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        key: String,
+        lease_ms: u64,
+        cleanup_timeout: f64,
+    ) -> PyResult<crate::async_watch::PyAsyncWatch> {
+        let _ = self.context.context(py, None)?;
+        if !cleanup_timeout.is_finite() || cleanup_timeout <= 0.0 || cleanup_timeout > 30.0 {
+            return Err(PyValueError::new_err(
+                "cleanup_timeout must be finite and between 0 and 30 seconds",
+            ));
+        }
+        let handle = self
+            .owner
+            .watch(ids, key, lease_ms, Duration::from_secs_f64(cleanup_timeout))
+            .map_err(native_error)?;
+        Ok(crate::async_watch::PyAsyncWatch {
+            handle,
+            context: self.context.clone(),
+        })
+    }
+
     #[pyo3(signature = (*, deadline=None))]
     fn close<'py>(&self, py: Python<'py>, deadline: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
-        let (locals, deadline) = self.context(py, deadline)?;
+        let (locals, deadline) = self.context.context(py, deadline)?;
         let expired = deadline <= Instant::now() && self.owner.phase() != Phase::Closed;
         self.owner.begin_close(); // Even a valid already-expired budget seals admission.
         let owner = self.owner.clone();
@@ -249,7 +285,7 @@ impl PyAsyncHaystackClient {
         exc_value: Option<Py<PyAny>>,
         _traceback: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (locals, deadline) = self.context(py, None)?;
+        let (locals, deadline) = self.context.context(py, None)?;
         self.owner.begin_close();
         let owner = self.owner.clone();
         async_bridge::future(py, locals, async move {
