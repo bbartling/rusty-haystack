@@ -433,7 +433,7 @@ client = rh.HaystackClient.connect(
     "s3cret",
 )
 
-# Lab HTTPS with a self-signed certificate (e.g. local FIN Stack / BlackPAC):
+# Lab HTTPS with a self-signed certificate (e.g. local FIN Stack):
 # client = rh.HaystackClient.connect(
 #     "https://127.0.0.1/api/demo",
 #     "su",

@@ -97,7 +97,7 @@ impl PyHaystackClient {
     /// Connect to a Haystack server over HTTP with SCRAM auth.
     ///
     /// Set ``tls_verify=False`` for lab hosts with self-signed certificates
-    /// (for example local FIN Stack / BlackPAC HTTPS). Disables certificate
+    /// (for example local FIN Stack HTTPS). Disables certificate
     /// and hostname verification — development use only.
     #[staticmethod]
     #[pyo3(signature = (url, username, password, *, tls_verify=true))]

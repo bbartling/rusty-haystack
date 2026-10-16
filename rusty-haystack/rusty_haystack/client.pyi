@@ -41,7 +41,7 @@ class HaystackClient:
         """Connect to a Haystack server over HTTP with SCRAM auth.
 
         Pass ``tls_verify=False`` for lab HTTPS with a self-signed certificate
-        (FIN Stack / BlackPAC, etc.). Development use only.
+        (FIN Stack lab hosts, etc.). Development use only.
         """
         ...
     @staticmethod
