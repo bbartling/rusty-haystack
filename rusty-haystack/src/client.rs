@@ -4,9 +4,9 @@
 
 use pyo3::prelude::*;
 
+use haystack_client::ClientConfig;
 use haystack_client::client::HaystackClient;
 use haystack_client::tls::TlsConfig;
-use haystack_client::ClientConfig;
 use haystack_client::transport::http::HttpTransport;
 use haystack_client::transport::ws::WsTransport;
 
