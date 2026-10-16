@@ -31,8 +31,18 @@ class HaystackClient:
         client.close()
     """
     @staticmethod
-    def connect(url: str, username: str, password: str) -> HaystackClient:
-        """Connect to a Haystack server over HTTP with SCRAM auth."""
+    def connect(
+        url: str,
+        username: str,
+        password: str,
+        *,
+        tls_verify: bool = True,
+    ) -> HaystackClient:
+        """Connect to a Haystack server over HTTP with SCRAM auth.
+
+        Pass ``tls_verify=False`` for lab HTTPS with a self-signed certificate
+        (FIN Stack / BlackPAC, etc.). Development use only.
+        """
         ...
     @staticmethod
     def connect_tls(
@@ -177,7 +187,16 @@ class AsyncHaystackClient:
     Watch keys reserve one logical owner per session, with at most 32 live or
     unconfirmed reservations. Local Unknown cleanup does not free a key.
     """
-    def __init__(self, url: str, username: str, password: str, *, tls: TlsConfig | None = None, timeout: float = 30.0) -> None: ...
+    def __init__(
+        self,
+        url: str,
+        username: str,
+        password: str,
+        *,
+        tls: TlsConfig | None = None,
+        timeout: float = 30.0,
+        tls_verify: bool = True,
+    ) -> None: ...
     @property
     def state(self) -> Literal["new", "connecting", "open", "closing", "closed"]: ...
     @property

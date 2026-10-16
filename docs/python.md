@@ -433,6 +433,14 @@ client = rh.HaystackClient.connect(
     "s3cret",
 )
 
+# Lab HTTPS with a self-signed certificate (e.g. local FIN Stack / BlackPAC):
+# client = rh.HaystackClient.connect(
+#     "https://127.0.0.1/api/demo",
+#     "su",
+#     "s3cret",
+#     tls_verify=False,  # development only
+# )
+
 # Server info
 about = client.about()       # -> HGrid
 ops = client.ops()           # -> HGrid

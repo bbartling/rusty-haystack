@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 
 use haystack_client::client::HaystackClient;
 use haystack_client::tls::TlsConfig;
+use haystack_client::ClientConfig;
 use haystack_client::transport::http::HttpTransport;
 use haystack_client::transport::ws::WsTransport;
 
@@ -94,14 +95,34 @@ pub struct PyHaystackClient {
 #[pymethods]
 impl PyHaystackClient {
     /// Connect to a Haystack server over HTTP with SCRAM auth.
+    ///
+    /// Set ``tls_verify=False`` for lab hosts with self-signed certificates
+    /// (for example local FIN Stack / BlackPAC HTTPS). Disables certificate
+    /// and hostname verification — development use only.
     #[staticmethod]
-    fn connect(py: Python<'_>, url: &str, username: &str, password: &str) -> PyResult<Self> {
+    #[pyo3(signature = (url, username, password, *, tls_verify=true))]
+    fn connect(
+        py: Python<'_>,
+        url: &str,
+        username: &str,
+        password: &str,
+        tls_verify: bool,
+    ) -> PyResult<Self> {
         let rt = get_runtime()?;
         let url = url.to_string();
         let username = username.to_string();
         let password = password.to_string();
+        let config = if tls_verify {
+            ClientConfig::default()
+        } else {
+            ClientConfig::scram_insecure_tls()
+        };
         let client = py
-            .detach(|| rt.block_on(HaystackClient::connect(&url, &username, &password)))
+            .detach(|| {
+                rt.block_on(HaystackClient::connect_with_config(
+                    &url, &username, &password, &config,
+                ))
+            })
             .map_err(client_err)?;
         Ok(Self { inner: client })
     }
