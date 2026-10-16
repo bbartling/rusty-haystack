@@ -96,9 +96,12 @@ pub struct PyHaystackClient {
 impl PyHaystackClient {
     /// Connect to a Haystack server over HTTP with SCRAM auth.
     ///
-    /// Set ``tls_verify=False`` for lab hosts with self-signed certificates
-    /// (for example local FIN Stack HTTPS). Disables certificate
-    /// and hostname verification — development use only.
+    /// ``tls_verify`` defaults to true (certificate chain + hostname).
+    /// Set ``tls_verify=False`` only for controlled lab/development HTTPS
+    /// (for example local FIN Stack with a self-signed cert). That opt-out
+    /// disables certificate-chain **and** hostname verification for SCRAM
+    /// and subsequent HTTPS ops; it does not configure WebSocket TLS or
+    /// enable redirects. Prefer ``connect_tls`` / a custom CA when practical.
     #[staticmethod]
     #[pyo3(signature = (url, username, password, *, tls_verify=true))]
     fn connect(
