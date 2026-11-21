@@ -204,8 +204,12 @@ jobs:
   # covers it. Without this job the Python suite rots unnoticed — 11 of its tests
   # spent four months failing against APIs removed in v0.8.0.
   python:
-    name: Python Bindings
+    name: Python Bindings (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -221,7 +225,7 @@ jobs:
       # Pinned rather than inherited from the runner image, so the interpreter
       # the extension is built against does not drift. pyo3 is configured
       # without abi3, making every build interpreter-specific.
-      - run: uv venv --python 3.12
+      - run: uv venv --python ${{ matrix.python-version }}
       - run: uv pip install maturin==1.16.0 pytest
       # The Clippy job above excludes this crate because `cargo clippy --locked --workspace`
       # needs an interpreter to resolve the pyo3 build script. This job has one, so
