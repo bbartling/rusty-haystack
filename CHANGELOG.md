@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Security
+
+- Bump `rmcp` from 3.5.1 to 3.8.0 for
+  [GHSA-4432-vg92-fqh6](https://github.com/advisories/GHSA-4432-vg92-fqh6) (high): the
+  SDK's `StreamableHttpService` cached tool schemas without bound, so a remote client
+  could exhaust memory. `haystack-mcp`'s HTTP transport uses that service on MCP
+  `2026-07-28`, the affected configuration; exposure was already limited by the
+  loopback-only listener and bearer auth ahead of the SDK. Fixed upstream in 3.6.0
+  (rust-sdk#1349). The `rmcp` `auth` feature stays disabled, so the OAuth-client
+  advisory GHSA-5p52 does not apply. Behaviour changes that come with the bump:
+  - A JSON-RPC request ID written in integral float form (`"id":1.0`) is now accepted
+    and answered as the integer `1` on both stdio and HTTP, instead of being rejected
+    as an invalid ID (rust-sdk#1346). Non-integral (`1.5`) and out-of-range numeric IDs
+    are still rejected.
+  - On `2026-07-28` the SDK refuses to send server-to-client requests (rust-sdk#1326),
+    and its stateless HTTP path answers client Response/Error POSTs with 400. Neither
+    changes what `haystack-mcp` does: it never issues server-to-client requests, and
+    its HTTP wrapper already rejects client result/error envelopes with
+    400/`-32600` before the SDK sees them.
+
 ### Added
 
 - `haystack serve --cors-origin <ORIGIN>` (repeatable) and `HaystackServer::with_cors`,
@@ -12,13 +32,116 @@
   auth is header-based and it sets no cookies. There is no wildcard: `*` is refused with
   a warning rather than forwarded, since `tower-http` panics if one reaches
   `AllowOrigin::list` and an explicit list is the point of the policy.
+- `rusty-haystack-analytics`, a new library crate that exports one completed remote
+  `bounded-history-v1` read (`HaystackClient::his_read_stream`) into bounded Arrow batches
+  and an immutable local Parquet dataset, and reopens it with validated bounded readback.
+  Values keep their exact kind, binary64 bits, unit spelling, NA and timestamp offset; the
+  remote header and its observations are retained in a versioned manifest. Nothing is
+  published unless the source ends `Complete`. Publication is a no-replace hard link of a
+  synced manifest; a failure after that link is `PublishedUncertain`, distinct from a
+  precommit failure, because the dataset is already committed. `Dataset::open` verifies
+  hashes and physical layout, including page level and payload framing, before upstream
+  decodes anything; reading re-hashes each part's in-memory bytes before decoding them,
+  and `Dataset::manifest_sha256` identifies the dataset. Only a fully consumed reader
+  reports semantic completeness. Captures are owner-only (`0o700`/`0o600`) on Unix. There
+  is no atomic source snapshot, power-loss qualification, overwrite/append/resume, object
+  store, CLI, Python, MCP or DataFusion surface, and Windows durability is not qualified.
+  `arrow-array`, `arrow-schema` and `parquet` are new dependencies, pinned exactly. See
+  `docs/parquet-history.md`.
+- Snapshot SQL: the optional `sql` feature of `rusty-haystack-analytics` adds
+  `haystack_analytics::sql`, bounded read-only DataFusion SQL over Parquet history
+  captures. `SqlEngine::builder().register(name, dir)` drains and validates a capture to
+  semantic completion, then seals it in memory; queries never touch the filesystem and
+  `QueryOutput.sources` reports each scanned snapshot's export id and manifest SHA-256.
+  A fixed schema maps NA to NULL with `present = false`, keeps NaN/±Infinity bits, and
+  carries `ts` (UTC), `ts_local` (stored offset applied) and the exact timestamp
+  components; a `snapshots` table carries provenance. Queries run on an engine-owned
+  runtime (32 MiB thread stacks) with process-wide admission, a per-query memory pool
+  with spill disabled, a timeout and output caps. Before planning, the SQL text is
+  bounded in bytes and in tokens (by an iterative tokenizer, so a long left-deep chain
+  such as `1+1+…` is `Error::Limit` rather than a stack overflow), and the parsed
+  statement in relations, joins, set operations and CTEs, with CTE references expanded;
+  only queries are accepted, and `CUBE`, `ROLLUP`, `GROUPING SETS`, `TABLESAMPLE` and
+  locking clauses are refused. During execution, window input is reserved from the pool,
+  and per-batch bytes, bytes over the whole plan and join output rows are capped; every
+  scan yields before each batch, so a join that loops without output still stops at its
+  deadline. Scalar,
+  aggregate and window functions and binary operators are allowlisted: string building
+  (`||`, `concat`, `replace`, `regexp_replace`, `overlay`, `lpad`/`rpad`/`repeat` and
+  similar) and `arrow_cast` are not available in SQL, so concatenate after the query.
+  Nothing regex-backed is available either: `regexp_like`, `regexp_count`,
+  `regexp_instr`, `regexp_match`, `~`, `~*`, `!~`, `!~*`, `SIMILAR TO`, `LIKE`, `ILIKE`
+  and `~~` are rejected, because compiling and matching a pattern allocates outside the
+  pool; use `starts_with`, `ends_with`, `contains` and `strpos`. `approx_percentile_cont`
+  (whose literal centroid count aborted the process), its `_with_weight` form,
+  `array_agg`, `string_agg`, the `nth_value` aggregate and `grouping` are not
+  available; every window expression must have a fixed-width type, and the columns a
+  window adds are reserved from the pool. `substr`/`substring` are not available (use
+  `left`, `right` or `substr_index`). Joins inside parentheses count toward the join
+  bound. DDL, DML,
+  statements, table functions, URL tables, cross and non-equi joins and recursive queries
+  are refused. `Error` gains `Sql` and `Query`, and the `Cancelled`, `Deadline`, `Limit`,
+  `Capacity`, `Runtime` and `Worker` messages no longer say "capture". The timeout is best-effort:
+  planning and work within one poll cannot be cancelled, and a stuck query keeps its
+  process-wide permit. Expression temporaries are not reserved from the pool. See
+  `docs/sql-snapshots.md`.
+- `haystack_core::codecs::history::result_header_grid` encodes a validated
+  `HistoryReadHeader` as the result envelope without collecting its sample rows;
+  `result_grid` now builds on it.
 
 ### Changed
+
+- The Arrow/Parquet pins move from 59.3.0 to 59.3.2 to share one family with DataFusion
+  55.2.0, and `deny.toml` ignores three `zstd` advisories (RUSTSEC-2026-0391, -0398,
+  -0403) that arrive only through `arrow-ipc` under the `sql` feature and are unreachable
+  from it; tracked in #131 for removal with Arrow 60.
+- The optional SQLite profile is re-baselined from SQLite 3.53.2 to **3.54.1**:
+  `rusqlite` `=0.40.2` → `=0.41.1` (bundled `libsqlite3-sys` 0.38.2 → 0.39.1). 3.54.1 is
+  the 3.54.0 feature release plus a 32-bit heap-buffer-overflow fix and other upstream
+  fixes; nothing in either release changes WAL, `synchronous`, journal, checkpoint, busy
+  or progress-handler behaviour. Durability verification now rejects engines older than
+  3.54.1, and native qualification pins the 3.54.1 version and source ID. (#125)
 
 - Salts, nonces and the server secret are generated directly instead of by overwriting a
   zeroed buffer. Behaviour is identical; the old shape tripped a CodeQL
   `hard-coded-cryptographic-value` alert on the salt in `hash_password`, which was a false
   positive — the buffer was overwritten on the next line. (#55)
+- Python bindings build on PyO3 0.30.1 and pyo3-async-runtimes 0.30.0 (from 0.29.3 and
+  0.29.0), and with Maturin 1.16.0 (from 1.15.0), which `pyproject.toml` now requires as
+  the build backend. No binding source changed and the Python API is the same: every
+  `#[pyclass]` that Python values are extracted into already opted in with
+  `from_py_object`, so PyO3 0.30 no longer deriving `FromPyObject` by default removes
+  nothing. The module still declares itself free-threading compatible, the default
+  since PyO3 0.28. The supported Python range (3.11+) is unchanged; PyO3 0.30 drops only
+  3.8. (#124)
+- `roaring` 0.11.5 → 0.12.0 for the tag bitmap index. Behaviour is unchanged; 0.12 adds
+  stable-Rust SIMD kernels through two new dependencies, `fearless_simd` (MIT/Apache-2.0)
+  and `libm` (MIT). (#124)
+
+### Fixed
+
+- The Zinc parser panicked on input with a non-ASCII char where it expected a fixed-width
+  ASCII field — `2024-06-01T00:00:00+0é:00`, for example — because it advanced its byte
+  offset by a fixed count and then sliced the string inside a multi-byte char. The server
+  decodes untrusted request bodies with this parser and has no catch-panic layer, so the
+  panic was reachable from a single request; Trio values, filter literals and the client's
+  history decoder reach the same parser. The UTC offset, the time after `T` and time
+  seconds now check their bytes are ASCII digits before advancing; `\uXXXX` escapes and the
+  date slice with `str::get`, which refuses a range that ends inside a char; `C(lat,lng)`
+  scans by char rather than by byte; `ZincParser::new_at` clamps its starting position to
+  the input and moves it back to a char boundary; and the parser's position accessors fail
+  closed on a misaligned offset. Such input is now a parse error.
+- Some malformed Zinc that used to decode is now an error. Time fields were taken as
+  fixed-width slices without digit checks, and chrono tolerates leading whitespace, so
+  `12:30: 5`, `2024-06-01T 0:00:00Z` and `2024-06-01T00:00:0 Z` — with a space, tab, `\n` or
+  `\r` at any time or UTC-offset digit — parsed; reading one value from `12:30:\t2024-06-01`
+  decoded `Time(12:30:02)` and left the rest unread. An XStr whose `(` is not followed by a
+  quote swallowed one arbitrary character: `Bin( text/plain")` decoded as
+  `Bin("ext/plain")` and `Bin(:text/plain")` as `Bin("text/plain")`. In Trio such a value
+  now falls back to a plain string, `Str("Bin( text/plain\")")`, as other unparseable Trio
+  values do. `"\u+041"` decoded as `"A"` because the hex parse accepted a leading `+`; a
+  `\u` escape now requires four hex digits. `C(lat,lng)` trimmed any Unicode whitespace
+  around its numbers, such as U+00A0; it now trims ASCII whitespace only.
 
 ## 0.9.0
 
